@@ -1,0 +1,34 @@
+# --- Data: never commit ---
+datasets/
+# gsplat example data (360_v2 datasets, images, COLMAP .bin) — ~13 GB, not code
+deps/
+
+# --- Run logs & Python caches ---
+*.log
+Python/logs/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Large binary / data artifacts (safety net) ---
+*.npz
+*.npy
+*.bin
+*.mp4
+*.avi
+*.ply
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.tar
+*.tar.gz
+*.pkl
+*.mat
+*.png
+*.jpg
+*.jpeg
+*.h5
+
+# keep the prebuilt XM solver (.so) — the Python imports it; source is in the XM-code repo
+!XM/build/*.so
