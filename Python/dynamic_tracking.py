@@ -107,7 +107,22 @@ ONLINE_USE_CERTAINTY = True
 ONLINE_CERTAINTY_RADIUS = 8
 ONLINE_CERTAINTY_THRESHOLD = dataset_config.get_float("DYN_ONLINE_CERTAINTY_THRESHOLD", 0.8, env="DYN_ONLINE_CERTAINTY_THRESHOLD")
 ONLINE_QUERY_DOWNSAMPLE_THRESHOLD = None
-ONLINE_MAX_POINTS = 50000
+ONLINE_MAX_POINTS = dataset_config.get_int("DYN_ONLINE_MAX_POINTS", 50000, env="DYN_ONLINE_MAX_POINTS")  # was hard-coded 50000 (config key ignored)
+# Behaviour when the active set reaches DYN_ONLINE_MAX_POINTS (config DYN_CAP_MODE):
+#   "bad_eviction"    (default = original) evict points that were off-mask / large-move in most of the past frames or
+#                     invisible for DYN_MAXPT_INVIS_CONSEC frames (runs only at the cap)
+#   "prune_invisible" randomly drop INVISIBLE points (occluded for >= DYN_CAP_PRUNE_PATIENCE consecutive frames) down to
+#                     DYN_CAP_INVISIBLE_KEEP of them (0.2 = keep 20%); visible points are never dropped, adding continues.
+DYN_CAP_MODE = str(dataset_config._resolve("DYN_CAP_MODE", "bad_eviction", "DYN_CAP_MODE")).strip().lower()
+DYN_CAP_PRUNE_PATIENCE = dataset_config.get_int("DYN_CAP_PRUNE_PATIENCE", 1, env="DYN_CAP_PRUNE_PATIENCE")
+DYN_CAP_INVISIBLE_KEEP = dataset_config.get_float("DYN_CAP_INVISIBLE_KEEP", 0.2, env="DYN_CAP_INVISIBLE_KEEP")
+# How new dynamic queries are proposed each frame (config DYN_RESAMPLE_MODE):
+#   "mask_frac" (default = original) every uncovered dynamic-mask pixel, subsampled by DYN_MASK_KEEP_FRAC
+#   "grid"      like the static tracker: DYN_RESAMPLE_GRID^2 random candidates inside the dynamic mask, kept if farther than
+#               DYN_RESAMPLE_RADIUS px (256-grid) from every visible track / recent addition
+DYN_RESAMPLE_MODE = str(dataset_config._resolve("DYN_RESAMPLE_MODE", "mask_frac", "DYN_RESAMPLE_MODE")).strip().lower()
+DYN_RESAMPLE_GRID = dataset_config.get_int("DYN_RESAMPLE_GRID", 30, env="DYN_RESAMPLE_GRID")
+DYN_RESAMPLE_RADIUS = dataset_config.get_float("DYN_RESAMPLE_RADIUS", 2.0, env="DYN_RESAMPLE_RADIUS")
 ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO = 0.5
 
 CHECKPOINT = (
@@ -151,6 +166,9 @@ elif dataset_cat == "Dycheck":
     gt = load_dycheck_gt(str(rootpath))
 elif dataset_cat == "Custom":
     gt = load_custom_gt(rootpath)
+elif dataset_cat == "NVIDIA":
+    from utils.readgt_nvidia import load_nvidia_gt
+    gt = load_nvidia_gt(str(rootpath))
 else:
     raise ValueError(f"Unsupported dataset_cat '{dataset_cat}'")
 
@@ -267,6 +285,38 @@ def _make_uncovered_query_points_at_frame(
     if swap_xy_for_query:
         return np.stack([t_arr, y, x], axis=1)[None, ...]
     return np.stack([t_arr, x, y], axis=1)[None, ...]
+
+
+def _make_grid_query_points_in_mask(tracks_xy_256, occluded, frame_idx, mask_256, grid, margin, radius,
+                                    prev_added_xy=None, swap_xy_for_query=False, rng=None):
+    """Static-tracker style resampling restricted to the dynamic mask: grid^2 uniform random candidates in the 256 frame,
+    kept if inside the (dilated) dynamic mask of the NEXT frame and farther than `radius` from every visible track and
+    every recent addition. Returns [1,Q,3] (t, y, x) when swap_xy_for_query else (t, x, y); None if nothing to add."""
+    t = int(frame_idx)
+    if mask_256 is None:
+        return None
+    m = mask_256[..., 0] if mask_256.ndim == 3 else mask_256
+    rng = rng if rng is not None else np.random.default_rng()
+    n = int(max(1, grid * grid)); lo, hi = float(margin), float(255 - margin)
+    cand = np.stack([rng.uniform(lo, hi, size=n), rng.uniform(lo, hi, size=n)], axis=1)          # (x, y)
+    inm = m[np.rint(cand[:, 1]).astype(np.int64), np.rint(cand[:, 0]).astype(np.int64)] > 0
+    cand = cand[inm]
+    if cand.shape[0] == 0:
+        return None
+    pts = tracks_xy_256[0, :, t, :]
+    valid = np.isfinite(pts).all(axis=1) & (~occluded[0, :, t])
+    refs = [pts[valid].astype(np.float64)] if np.any(valid) else []
+    if prev_added_xy is not None and prev_added_xy.shape[0] > 0:
+        refs.append(prev_added_xy.astype(np.float64))
+    if refs:
+        refs = np.concatenate(refs, axis=0)
+        min_d2 = np.min(np.sum((cand[:, None, :] - refs[None, :, :]) ** 2, axis=2), axis=1)
+        cand = cand[min_d2 > float(radius) ** 2]
+    if cand.shape[0] == 0:
+        return None
+    t_arr = np.full(cand.shape[0], float(t), dtype=np.float64)
+    out = np.stack([t_arr, cand[:, 1], cand[:, 0]], axis=1) if swap_xy_for_query else np.stack([t_arr, cand[:, 0], cand[:, 1]], axis=1)
+    return out[None, ...]
 
 
 def _compute_move_delete_first_frame(
@@ -626,6 +676,11 @@ def track_online_tapnext(
     maxpt_invis_consec: int = 20,
     maxpt_move_window: float = 6.0,
     maxpt_move_eps: float = 1.0,
+    cap_mode: str = "bad_eviction",
+    cap_prune_patience: int = 1,
+    cap_invisible_keep: float = 0.2,
+    resample_mode: str = "mask_frac",
+    resample_grid: int = 30,
 ):
     if checkpoint.endswith(".npz"):
         model = TAPNext(image_size=(256, 256)).to(device).eval()
@@ -659,9 +714,27 @@ def track_online_tapnext(
     last_tracks_xy = None
     last_occ_np = None
     last_active_query_indices = None
+    occ_streak = np.zeros(init_q, dtype=np.int64)          # consecutive occluded frames per ACTIVE query
+    n_cap_events = 0
 
     if downsample_threshold is not None and downsample_threshold <= 0:
         downsample_threshold = None
+
+    def _shrink_active(keep_local):
+        nonlocal active_query_indices, query_points_t, state, occ_streak, last_tracks_xy, last_occ_np, last_active_query_indices
+        keep_local = np.sort(np.asarray(keep_local, dtype=np.int64))
+        keep_local_t = torch.as_tensor(keep_local, dtype=torch.long, device=query_points_t.device)
+        active_query_indices = active_query_indices[keep_local]
+        query_points_t = query_points_t.index_select(1, keep_local_t)
+        if state is not None:
+            state = _subset_state_for_queries(state, keep_local, prefix_tokens=num_video_tokens)
+        occ_streak = occ_streak[keep_local]
+        if last_tracks_xy is not None:
+            last_tracks_xy = last_tracks_xy[keep_local]
+        if last_occ_np is not None:
+            last_occ_np = last_occ_np[keep_local]
+        last_active_query_indices = active_query_indices.copy()
+        prev_added_xy_history.clear()
 
     for t in tqdm(range(T), desc="Online tracking dynamic"):
         query_grew = False
@@ -677,6 +750,7 @@ def track_online_tapnext(
                 active_query_indices = active_query_indices[keep_local]
                 query_points_t = query_points_t.index_select(1, keep_local_t)
                 state = _subset_state_for_queries(state, keep_local, prefix_tokens=num_video_tokens)
+                occ_streak = occ_streak[keep_local]
                 if last_tracks_xy is not None:
                     last_tracks_xy = last_tracks_xy[keep_local]
                 if last_occ_np is not None:
@@ -690,7 +764,17 @@ def track_online_tapnext(
         # dynamic mask by >maxpt_offmask_px256 OR large-2D-move vs neighbours in >maxpt_bad_min of the past
         # maxpt_past frames, OR invisible for the last maxpt_invis_consec consecutive frames), instead of
         # dropping every currently-invisible point -- frees capacity while keeping temporarily-hidden points.
-        if last_occ_np is not None and int(active_query_indices.shape[0]) >= int(max_points):
+        if cap_mode == "prune_invisible" and last_occ_np is not None and int(active_query_indices.shape[0]) >= int(max_points):
+            n_active = int(active_query_indices.shape[0])
+            gone = np.where(occ_streak >= max(1, cap_prune_patience))[0]
+            n_keep_gone = int(round(cap_invisible_keep * gone.size))
+            if gone.size > n_keep_gone:
+                drop = np.random.default_rng(2000 + t).choice(gone, size=gone.size - n_keep_gone, replace=False)
+                keep_mask = np.ones(n_active, dtype=bool); keep_mask[drop] = False
+                _shrink_active(np.where(keep_mask)[0]); n_cap_events += 1
+                if n_cap_events <= 3 or n_cap_events % 25 == 0:
+                    print(f"[cap] t={t}: active {n_active} -> {int(keep_mask.sum())} (dropped {drop.size} of {gone.size} invisible, visible untouched)")
+        if cap_mode == "bad_eviction" and last_occ_np is not None and int(active_query_indices.shape[0]) >= int(max_points):
             n_active = int(active_query_indices.shape[0])
             keep_bool = _maxpoints_bad_eviction(
                 active_query_indices, tracks_per_frame, occ_per_frame, active_indices_per_frame,
@@ -706,6 +790,7 @@ def track_online_tapnext(
                 if last_tracks_xy is not None:
                     last_tracks_xy = last_tracks_xy[keep_local]
                 last_occ_np = last_occ_np[keep_local]
+                occ_streak = occ_streak[keep_local]
                 last_active_query_indices = active_query_indices.copy()
                 prev_added_xy_history.clear()
                 print(f"[online] timestep {t}: max_points ({n_active}); evicted "
@@ -736,18 +821,24 @@ def track_online_tapnext(
                     tmp_tracks[0, curr_pos, 0, :] = last_tracks_xy[prev_pos]
                     tmp_occ[0, curr_pos, 0] = last_occ_np[prev_pos]
 
-            new_q = _make_uncovered_query_points_at_frame(
-                tmp_tracks,
-                tmp_occ,
-                frame_idx=0,
-                mask_256=(dynamic_masks_256[t + 1] if dynamic_masks_256 is not None else None),
-                keep_frac=keep_frac,
-                margin=resample_margin,
-                radius=resample_radius,
-                prev_added_xy=prev_added_xy,
-                swap_xy_for_query=swap_xy_for_query,
-                rng=np.random.default_rng(1000 + t),
-            )
+            if resample_mode == "grid":
+                new_q = _make_grid_query_points_in_mask(
+                    tmp_tracks, tmp_occ, 0, (dynamic_masks_256[t + 1] if dynamic_masks_256 is not None else None),
+                    resample_grid, resample_margin, resample_radius, prev_added_xy=prev_added_xy,
+                    swap_xy_for_query=swap_xy_for_query, rng=np.random.default_rng(1000 + t))
+            else:
+                new_q = _make_uncovered_query_points_at_frame(
+                    tmp_tracks,
+                    tmp_occ,
+                    frame_idx=0,
+                    mask_256=(dynamic_masks_256[t + 1] if dynamic_masks_256 is not None else None),
+                    keep_frac=keep_frac,
+                    margin=resample_margin,
+                    radius=resample_radius,
+                    prev_added_xy=prev_added_xy,
+                    swap_xy_for_query=swap_xy_for_query,
+                    rng=np.random.default_rng(1000 + t),
+                )
             if new_q is not None:
                 new_q[:, :, 0] = float(t + 1)
                 if dynamic_masks_256 is not None:
@@ -781,6 +872,7 @@ def track_online_tapnext(
 
                         query_grew = n_add > 0
                         n_add_effective = n_add
+                        occ_streak = np.concatenate([occ_streak, np.zeros(n_add, dtype=np.int64)])
 
         if query_grew and state is not None:
             state.query_points = query_points_t
@@ -809,6 +901,8 @@ def track_online_tapnext(
 
         occluded_np = occluded.detach().cpu().numpy().astype(bool).reshape(-1)
 
+        occ_streak[occluded_np] += 1
+        occ_streak[~occluded_np] = 0
         tracks_per_frame.append(tracks_xy)
         occ_per_frame.append(occluded_np)
         active_indices_per_frame.append(active_query_indices.copy())
@@ -872,6 +966,8 @@ if REVERSE:                                               # flip masks in time s
     dynamic_masks_vis = dynamic_masks_vis[::-1].copy()
 
 query_np = _make_mask_query_points(dynamic_masks_query_256[0], keep_frac=DENSITY_FRAC, query_t=0)
+print(f"[online] max_points={ONLINE_MAX_POINTS} cap_mode={DYN_CAP_MODE} (invisible_keep={DYN_CAP_INVISIBLE_KEEP}, patience={DYN_CAP_PRUNE_PATIENCE}) "
+      f"resample_mode={DYN_RESAMPLE_MODE} grid={DYN_RESAMPLE_GRID} radius={DYN_RESAMPLE_RADIUS if DYN_RESAMPLE_MODE == 'grid' else ONLINE_RESAMPLE_RADIUS:.2f}")
 print(f"Density: DYN_MASK_KEEP_FRAC={DENSITY_FRAC:.2f} (kept at frame 0 AND every online resample); "
       f"coverage radius={ONLINE_RESAMPLE_RADIUS:.2f}px(@256)")
 if query_np is None or query_np.shape[1] == 0:
@@ -879,32 +975,61 @@ if query_np is None or query_np.shape[1] == 0:
 print(f"Initial dynamic queries: {query_np.shape[1]}")
 
 video_256 = torch.from_numpy(video_np_256).to(device)
-tracks_xy_256, occluded, query_t = track_online_tapnext(
-    video_256,
-    query_np,
-    device=device,
-    checkpoint=str(CHECKPOINT),
-    add_points=ONLINE_ADD_POINTS,
-    add_every=ONLINE_ADD_EVERY,
-    add_start=ONLINE_ADD_START,
-    keep_frac=DENSITY_FRAC,
-    resample_margin=ONLINE_RESAMPLE_MARGIN,
-    resample_radius=ONLINE_RESAMPLE_RADIUS,
-    swap_xy_for_query=RESAMPLE_SWAP_XY,
-    use_certainty=ONLINE_USE_CERTAINTY,
-    certainty_radius=ONLINE_CERTAINTY_RADIUS,
-    certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
-    dynamic_masks_256=dynamic_masks_query_256,
-    max_points=ONLINE_MAX_POINTS,
-    downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
-    downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
-    maxpt_offmask_px256=MAXPT_OFFMASK_PX * 256.0 / float(max(H, W)),   # 10px native -> 256-grid
-    maxpt_past=MAXPT_PAST,
-    maxpt_bad_min=MAXPT_BAD_MIN,
-    maxpt_invis_consec=MAXPT_INVIS_CONSEC,
-    maxpt_move_window=MOVE_WINDOW_SIZE * 256.0 / float(max(H, W)),
-    maxpt_move_eps=float(MOVE_DELETE_TOP_PERCENT) / 100.0,
-)
+
+# Online causal TAPNext drifts under a large inter-frame baseline (e.g. NVIDIA's teleporting
+# camera moves ~18% of the scene per frame). DYN_EXTERNAL_TRACKS_NPZ lets us drop in externally
+# computed 2D tracks (e.g. MoSca's offline CoTracker output: keys `tracks` (T,N,2) native px,
+# `visibility` (T,N)); all downstream lifting/masking/saving reuse our depth+pose pipeline so the
+# dynamic 3D stays in OUR world/scale.
+_EXT_TRACKS = os.environ.get("DYN_EXTERNAL_TRACKS_NPZ", "").strip()
+if _EXT_TRACKS:
+    _m = np.load(_EXT_TRACKS)
+    _tr = np.asarray(_m["tracks"], dtype=np.float64)        # (T, N, 2) native px, [x, y]
+    _vis = np.asarray(_m["visibility"], dtype=bool)         # (T, N)
+    if REVERSE:
+        _tr = _tr[::-1].copy(); _vis = _vis[::-1].copy()
+    T_ext, N_ext = _tr.shape[0], _tr.shape[1]
+    if T_ext != T:
+        raise ValueError(f"external tracks T={T_ext} != video T={T} ({_EXT_TRACKS})")
+    tracks_xy_256 = np.empty((1, N_ext, T, 2), dtype=np.float64)
+    tracks_xy_256[0, :, :, 0] = _tr[:, :, 0].T * 256.0 / float(W)   # (N,T) x in 256-grid
+    tracks_xy_256[0, :, :, 1] = _tr[:, :, 1].T * 256.0 / float(H)
+    occluded = (~_vis).T[None, :, :].copy()                # (1, N, T)
+    _vis_nt = _vis.T                                        # (N, T)
+    query_t = np.where(_vis_nt.any(1), _vis_nt.argmax(1), 0).astype(np.int64)
+    print(f"[external] loaded {N_ext} tracks x {T} frames from {_EXT_TRACKS} (skipping TAPNext)")
+else:
+    tracks_xy_256, occluded, query_t = track_online_tapnext(
+        video_256,
+        query_np,
+        device=device,
+        checkpoint=str(CHECKPOINT),
+        add_points=ONLINE_ADD_POINTS,
+        add_every=ONLINE_ADD_EVERY,
+        add_start=ONLINE_ADD_START,
+        keep_frac=DENSITY_FRAC,
+        resample_margin=ONLINE_RESAMPLE_MARGIN,
+        resample_radius=(DYN_RESAMPLE_RADIUS if DYN_RESAMPLE_MODE == "grid" else ONLINE_RESAMPLE_RADIUS),
+        swap_xy_for_query=RESAMPLE_SWAP_XY,
+        use_certainty=ONLINE_USE_CERTAINTY,
+        certainty_radius=ONLINE_CERTAINTY_RADIUS,
+        certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
+        dynamic_masks_256=dynamic_masks_query_256,
+        max_points=ONLINE_MAX_POINTS,
+        downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
+        downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
+        maxpt_offmask_px256=MAXPT_OFFMASK_PX * 256.0 / float(max(H, W)),   # 10px native -> 256-grid
+        maxpt_past=MAXPT_PAST,
+        maxpt_bad_min=MAXPT_BAD_MIN,
+        maxpt_invis_consec=MAXPT_INVIS_CONSEC,
+        maxpt_move_window=MOVE_WINDOW_SIZE * 256.0 / float(max(H, W)),
+        maxpt_move_eps=float(MOVE_DELETE_TOP_PERCENT) / 100.0,
+        cap_mode=DYN_CAP_MODE,
+        cap_prune_patience=DYN_CAP_PRUNE_PATIENCE,
+        cap_invisible_keep=DYN_CAP_INVISIBLE_KEEP,
+        resample_mode=DYN_RESAMPLE_MODE,
+        resample_grid=DYN_RESAMPLE_GRID,
+    )
 
 tracks_xy = tracks_xy_256.astype(np.float64, copy=True)
 tracks_xy[..., 0] = tracks_xy[..., 0] / 256.0 * W
@@ -929,8 +1054,24 @@ for t in range(T):
     idx_valid = np.where(valid_t)[0][in_bounds]
     dynamic_obs_mask[idx_valid, t] = mask_t[yi[in_bounds], xi[in_bounds]] > 0
 
+# Mask filter, the dynamic-side complement of the static rule in utils.track_tapnet.apply_dynamic_mask_filter:
+#   (i)  a track whose visible observations fall OUTSIDE the dynamic mask more than DYN_OFFMASK_MAX_FRAC of
+#        the time does not live on the moving object -> drop the whole track;
+#   (ii) otherwise drop only its off-mask observations.
+# Without (i) a skeleton/TAPNext track that drifts off the object keeps its on-mask frames and can still be
+# chosen as an EDG node.
+DYN_OFFMASK_MAX_FRAC = dataset_config.get_float("DYN_OFFMASK_MAX_FRAC", 0.2, env="DYN_OFFMASK_MAX_FRAC")
 occluded_dynamic = occluded.copy()
-occluded_dynamic[0] |= ~dynamic_obs_mask
+_seen = (~occluded[0]) & np.isfinite(tracks_xy[0]).all(-1)        # visible observations we could test
+_off = _seen & (~dynamic_obs_mask)
+_den = _seen.sum(1)
+_ratio = np.divide(_off.sum(1), _den, out=np.zeros(len(_den), np.float64), where=_den > 0)
+_drop = _ratio > DYN_OFFMASK_MAX_FRAC
+occluded_dynamic[0] |= ~dynamic_obs_mask                          # (ii) per-observation
+occluded_dynamic[0][_drop] = True                                 # (i)  whole track
+print(f"[dyn-mask] off-mask filter (> {DYN_OFFMASK_MAX_FRAC:.0%} of visible obs outside the mask): "
+      f"{int(_drop.sum())}/{len(_den)} tracks dropped entirely, "
+      f"{int((_off & ~_drop[:, None]).sum())} further observations dropped")
 
 # if EDGE_ERODE_PX > 0:
 #     edge_obs_mask = np.zeros((Q, T), dtype=bool)

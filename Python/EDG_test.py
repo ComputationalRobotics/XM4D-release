@@ -46,6 +46,11 @@ def load_all(tracks_path=None):
     produced by build_edg.py. tracks_path MUST match what build_edg used (same track id space)."""
     root = Path(utils.definitions.rootpath)
     data = np.load(tracks_path or utils.definitions.tracks_dynamics_path, allow_pickle=True)
+    dv = data["depth_variant"].item() if "depth_variant" in data.files else None
+    if dv is not None and dv != utils.definitions.depth_variant:
+        print(f"[depth] *** WARNING: {Path(str(tracks_path or utils.definitions.tracks_dynamics_path)).name} was lifted with XM_DEPTH_VARIANT={dv} but this "
+              f"run uses {utils.definitions.depth_variant} -- 3D will NOT match. Set XM_DEPTH_VARIANT={dv} "
+              f"or re-lift the tracks. ***")
     tracks_xyz = data["tracks_xyz"]                  # (1,Q,T,3)
     occluded = data["occluded"]                      # (1,Q,T)
     dyn_mask = data["dynamic_obs_mask"]              # (Q,T)
@@ -195,10 +200,54 @@ def solve_segment(inp, output_dir, w_arap, w_smooth):
             np.asarray(out["dyn_mapped"], np.float64), np.unique(inp["dyn_kp_idx"]))
 
 
+def arap_edge_errors(edg_deformed, R_edg, inp):
+    """Per-edge ARAP residual of a solved segment -- exactly the term utils.edg builds (utils/edg.py:561):
+    r_i(t) = R_i(t)(g_j - g_i) - (x_j(t) - x_i(t)), and the same with R_j, over every frame after the rest.
+    Returns the RMS over both ends and all those frames, one number per row of inp["edges"]."""
+    edges, idx, g = inp["edges"], inp["edg_idx_map"], inp["g"]
+    if edges.size == 0:
+        return np.zeros(0)
+    i = np.array([idx[int(a)] for a in edges[:, 0]], dtype=int)
+    j = np.array([idx[int(b)] for b in edges[:, 1]], dtype=int)
+    e = g[j] - g[i]                                                    # (E,3) rest edge vector
+    d = edg_deformed[j, 1:] - edg_deformed[i, 1:]                      # (E,T-1,3) deformed edge vector
+    ri = np.einsum("etab,eb->eta", R_edg[i, 1:], e) - d
+    rj = np.einsum("etab,eb->eta", R_edg[j, 1:], e) - d
+    return np.sqrt(np.nanmean((np.square(ri).sum(-1) + np.square(rj).sum(-1)) / 2.0, axis=-1))
+
+
 # ----------------------------------------------------------------------------------------- per-segment viz
-def visualize_segment(edg_deformed, R_global_seg, dyn_mapped, inp, node_r, seg_id):
+def _polyline_set(traj, upto, color, o3d):
+    """LineSet joining traj[j, 0..upto] for every node j, skipping gaps (NaN) -- the TAIL of each track."""
+    pts, lines = [], []
+    for j in range(traj.shape[0]):
+        prev = None
+        for k in range(upto + 1):
+            q = traj[j, k]
+            if not np.isfinite(q).all():
+                prev = None
+                continue
+            pts.append(q)
+            cur = len(pts) - 1
+            if prev is not None:
+                lines.append([prev, cur])
+            prev = cur
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.asarray(pts, np.float64).reshape(-1, 3))
+    ls.lines = o3d.utility.Vector2iVector(np.asarray(lines, np.int32).reshape(-1, 2))
+    if lines:
+        ls.paint_uniform_color(color)
+    return ls
+
+
+def visualize_segment(edg_deformed, R_global_seg, dyn_mapped, inp, node_r, seg_id, obs=None, tails=True):
     """Open3D window for ONE solved segment: red = solved EDG (nodes+edges), blue = deformed dynamic
-    points, and per-node RGB axes = the CHAINED global rotation (R_global). SPACE/B step frames, Q/ESC -> next."""
+    points, and per-node RGB axes = the CHAINED global rotation (R_global). SPACE/B step frames, Q/ESC -> next.
+
+    `obs` (M, T_rev, 3, NaN where the node is unobserved) adds the RAW INPUT the solve was fitting: a green
+    sphere at each node's own world-lifted observation and a yellow line from the solved node to it (the
+    residual). `tails` draws each track's history up to the current frame -- orange = solved, green =
+    observed; T toggles them live."""
     import open3d as o3d
     present, frames, idx_map = inp["present"], inp["frames"], inp["edg_idx_map"]
     edges_local = np.array([[idx_map[int(a)], idx_map[int(b)]] for a, b in inp["edges"].tolist()],
@@ -215,8 +264,15 @@ def visualize_segment(edg_deformed, R_global_seg, dyn_mapped, inp, node_r, seg_i
     line = o3d.geometry.LineSet()
     rot_ls = o3d.geometry.LineSet()          # per-node rotation axes (chained global R)
     dyn_pcd = o3d.geometry.PointCloud()
+    obs_mesh = o3d.geometry.TriangleMesh()   # green: the node's own raw observation this frame
+    res_ls = o3d.geometry.LineSet()          # yellow: solved node -> its observation (the residual)
+    tail_ls = o3d.geometry.LineSet()         # orange: solved trajectory up to this frame
+    otail_ls = o3d.geometry.LineSet()        # green: observed trajectory up to this frame
     axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=node_r * 20)
-    st = {"i": 0}
+    st = {"i": 0, "tails": bool(tails)}
+
+    def _copy_ls(dst, src):
+        dst.points, dst.lines, dst.colors = src.points, src.lines, src.colors
 
     def fill(i):
         P = edg_deformed[:, i, :]
@@ -234,16 +290,41 @@ def visualize_segment(edg_deformed, R_global_seg, dyn_mapped, inp, node_r, seg_i
         rot_ls.colors = o3d.utility.Vector3dVector(ax_cols)
         dyn_pcd.points = o3d.utility.Vector3dVector(dyn_mapped[:, i, :])
         dyn_pcd.paint_uniform_color([0.2, 0.4, 1.0])
+        _copy_ls(tail_ls, _polyline_set(edg_deformed, i, [1.0, 0.45, 0.05], o3d) if st["tails"]
+                 else o3d.geometry.LineSet())
+        n_obs = res = 0
+        if obs is not None:
+            O = obs[:, i, :]
+            ok = np.isfinite(O).all(1)
+            n_obs = int(ok.sum())
+            om = VTE._edg_sphere_mesh(O[ok], node_r * 0.8, [0.05, 0.9, 0.2]) if n_obs else \
+                o3d.geometry.TriangleMesh()
+            obs_mesh.vertices, obs_mesh.triangles = om.vertices, om.triangles
+            obs_mesh.vertex_colors, obs_mesh.vertex_normals = om.vertex_colors, om.vertex_normals
+            both = ok & np.isfinite(P).all(1)
+            nb = int(both.sum())
+            res_ls.points = o3d.utility.Vector3dVector(np.concatenate([P[both], O[both]], 0)
+                                                       if nb else np.zeros((0, 3)))
+            res_ls.lines = o3d.utility.Vector2iVector(
+                np.stack([np.arange(nb), np.arange(nb) + nb], 1).astype(np.int32) if nb
+                else np.zeros((0, 2), np.int32))
+            if nb:
+                res_ls.paint_uniform_color([1.0, 0.85, 0.1])
+                res = float(np.linalg.norm(P[both] - O[both], axis=1).mean())
+            _copy_ls(otail_ls, _polyline_set(obs, i, [0.05, 0.9, 0.2], o3d) if st["tails"]
+                     else o3d.geometry.LineSet())
         tag = " (REST/overlap)" if int(frames[i]) == inp["rest"] else ""
         print(f"[seg {seg_id}] frame {int(frames[i])}{tag}  trev {i+1}/{len(frames)}  "
-              f"nodes={M} dyn={dyn_mapped.shape[0]}")
+              f"nodes={M} dyn={dyn_mapped.shape[0]}"
+              + (f"  obs={n_obs}/{M} mean|solved-obs|={res:.4f}" if obs is not None else ""))
 
     def refresh(vis):
         fill(st["i"])
-        for gm in (mesh, line, rot_ls, dyn_pcd):
+        for gm in (mesh, line, rot_ls, dyn_pcd, obs_mesh, res_ls, tail_ls, otail_ls):
             vis.update_geometry(gm)
         return False
 
+    def tgl(vis): st["tails"] = not st["tails"]; return refresh(vis)
     def nxt(vis): st["i"] = (st["i"] + 1) % len(frames); return refresh(vis)
     def prv(vis): st["i"] = (st["i"] - 1) % len(frames); return refresh(vis)
     def clo(vis): vis.close(); return False
@@ -251,13 +332,17 @@ def visualize_segment(edg_deformed, R_global_seg, dyn_mapped, inp, node_r, seg_i
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name=f"EDG_test segment {seg_id}", width=1280, height=720)
     fill(0)
-    for gm in (mesh, line, rot_ls, dyn_pcd, axes):
+    for gm in (mesh, line, rot_ls, dyn_pcd, obs_mesh, res_ls, tail_ls, otail_ls, axes):
         vis.add_geometry(gm)
     vis.get_render_option().point_size = 5.0
     vis.register_key_callback(ord(" "), nxt)
     vis.register_key_callback(ord("b"), prv); vis.register_key_callback(ord("B"), prv)
+    vis.register_key_callback(ord("t"), tgl); vis.register_key_callback(ord("T"), tgl)
     vis.register_key_callback(ord("q"), clo); vis.register_key_callback(ord("Q"), clo); vis.register_key_callback(256, clo)
-    print(f"[seg {seg_id}] SPACE=next frame, B=prev, Q/ESC=close (-> next segment). RGB axes = chained global rotation.")
+    print(f"[seg {seg_id}] SPACE=next frame, B=prev, T=toggle tails (now {'on' if st['tails'] else 'off'}), "
+          "Q/ESC=close (-> next segment). RGB axes = chained global rotation."
+          + ("  GREEN = raw observation + its tail, YELLOW = solved-to-observed residual, ORANGE = solved "
+             "tail." if obs is not None else ""))
     vis.run(); vis.destroy_window()
 
 

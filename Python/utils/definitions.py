@@ -11,8 +11,8 @@ MPI_SINTEL_TRAINING_ROOT = Path(
     )
 )
 
-dataset_cat = os.environ.get("XM_DATASET_CAT", "Syn4D")  # "Sintel", "DAVIS", "TUM", "Replica", "Syn4D", "Lab", "IMC", "NVIDIA" or "Custom"
-dataset_name = os.environ.get("XM_DATASET_NAME", "bear1")  # e.g. "alley_2" for Sintel, "bear" for DAVIS, "rgbd_dataset_freiburg1_desk" for TUM
+dataset_cat = os.environ.get("XM_DATASET_CAT", "Dycheck")  # "Sintel", "DAVIS", "TUM", "Replica", "Syn4D", "Lab", "IMC", "NVIDIA" or "Custom"
+dataset_name = os.environ.get("XM_DATASET_NAME", "paper-windmill")  # e.g. "alley_2" for Sintel, "bear" for DAVIS, "rgbd_dataset_freiburg1_desk" for TUM
 depth_source = os.environ.get("XM_DEPTH_SOURCE", "da3")
 
 # ---- per-dataset parameter config (Python/configs/*.json) ----
@@ -31,17 +31,30 @@ def _config_key(cat, name):
 active_config_name = _config_key(dataset_cat, dataset_name)
 
 
+def _scene_config_name(cat, name):
+    """Optional per-SCENE override file, layered on top of the category config:
+    configs/<cat>_<scene>.json (e.g. custom_cup.json). Lets a single hard scene carry its
+    own tuned params without disturbing sibling scenes that share the category config."""
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(name).lower())
+    return f"{str(cat).lower()}_{safe}"
+
+
+scene_config_name = _scene_config_name(dataset_cat, dataset_name)
+
+
 def _load_active_config():
     cfg = {}
-    for fname in ("default.json", f"{active_config_name}.json"):
+    loaded = []
+    for fname in ("default.json", f"{active_config_name}.json", f"{scene_config_name}.json"):
         path = CONFIG_DIR / fname
         if path.exists():
             cfg.update(json.loads(path.read_text()))
-    return cfg
+            loaded.append(fname)
+    return cfg, loaded
 
 
-active_config = _load_active_config()
-print(f"[config] {dataset_cat}/{dataset_name} -> configs/{active_config_name}.json")
+active_config, _loaded_cfgs = _load_active_config()
+print(f"[config] {dataset_cat}/{dataset_name} -> {' + '.join(_loaded_cfgs)}")
 
 rootpath = Path(
     os.environ.get(

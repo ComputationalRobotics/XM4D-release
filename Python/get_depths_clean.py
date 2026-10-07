@@ -478,6 +478,9 @@ def main() -> None:
         gt = load_colmap_gt(str(dataset_root / "colmap")) if USE_INTRINSICS_GT else None
     elif dataset_cat == "Dycheck":
         gt = load_dycheck_gt(str(dataset_root)) if USE_INTRINSICS_GT else None
+    elif dataset_cat == "NVIDIA":
+        from utils.readgt_nvidia import load_nvidia_gt
+        gt = load_nvidia_gt(str(dataset_root)) if USE_INTRINSICS_GT else None
     else:
         gt = None
         USE_INTRINSICS_GT = False

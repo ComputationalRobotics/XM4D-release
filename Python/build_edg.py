@@ -32,6 +32,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import utils.definitions
+from utils import dataset_config
 from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
 
 
@@ -40,6 +41,11 @@ from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
 def _load_all(tracks_path=None):
     root = Path(utils.definitions.rootpath)
     data = np.load(tracks_path or utils.definitions.tracks_dynamics_path, allow_pickle=True)
+    dv = data["depth_variant"].item() if "depth_variant" in getattr(data, "files", []) else None
+    if dv is not None and dv != utils.definitions.depth_variant:
+        print(f"[depth] *** WARNING: {Path(tracks_path or utils.definitions.tracks_dynamics_path).name} was lifted with XM_DEPTH_VARIANT={dv} but this run "
+              f"uses {utils.definitions.depth_variant} -- 3D will NOT match the file. Re-run with "
+              f"XM_DEPTH_VARIANT={dv} or re-lift the tracks. ***")
     tracks_xyz = data["tracks_xyz"]          # (1, Q, T, 3)
     tracks_xy = data["tracks_xy"]            # (1, Q, T, 2)  image px
     occluded = data["occluded"]              # (1, Q, T)
@@ -95,6 +101,122 @@ def _dilate_dyn_mask(D, dilate_px):
     print(f"[dyn-mask] dilated dynamic masks by {dilate_px}px: dynamic obs "
           f"{int(np.asarray(D['dyn_mask']).sum())} -> {int(dyn.sum())}")
     return dyn
+
+
+def _compute_person_ids(D, min_area_frac=0.005, match_radius_frac=0.18, min_frames_labeled=1):
+    """Assign each dynamic track to a PHYSICAL BODY (person_id, int64 (Q,); -1 = unresolved), so the
+    edge/node builders below never bridge two independently-moving people just because they share one
+    dynamic mask (e.g. multiple people who visually overlap/merge in 2D at some frames). Independent of
+    the 3D lift (which can itself be wrong) -- uses only the 2D dynamic mask's CONNECTED COMPONENTS.
+
+    Method:
+      1. Per frame with >=2 "big" components (area > min_area_frac of the frame), greedily match each
+         component to a GLOBAL person id by nearest centroid to the previous labeled frame's centroids
+         (within match_radius_frac of the image diagonal); unmatched components start a new global id.
+         Frames with <2 big components (e.g. people have visually merged) are skipped for this matching
+         step -- they can't disambiguate identity, but by then most tracks already got labeled earlier.
+      2. Each track takes the global id of the FIRST (earliest) frame where it is reliable AND its pixel
+         falls inside a labeled component.
+      3. Any track never observed during a resolvable frame (e.g. only visible after full merge) is
+         NN-propagated in 3D (mean lifted position) from the nearest already-labeled track.
+      4. If nothing was ever resolvable (e.g. a genuinely single-person scene), every track gets id 0 --
+         identical to the current (no-op) behaviour.
+    """
+    import cv2
+    Q, T = D["tracks_xyz"].shape[1], D["T"]
+    person_id = np.full(Q, -1, dtype=np.int64)
+    mask_dir = getattr(utils.definitions, "mask_dir", None)
+    if mask_dir is None or not Path(str(mask_dir)).exists():
+        print("[person] no mask dir; treating scene as single-body (no-op).")
+        return np.zeros(Q, dtype=np.int64)
+    try:
+        from utils.track_tapnet import load_dynamic_masks
+    except Exception as e:
+        print(f"[person] cannot load masks ({e}); treating scene as single-body (no-op).")
+        return np.zeros(Q, dtype=np.int64)
+    H, W = cv2.imread(D["image_paths"][0]).shape[:2]
+    masks = load_dynamic_masks(str(mask_dir), utils.definitions.mask_pattern,
+                               t_expected=T, mask_mode="dynamic_positive", target_size=(W, H))
+    min_area = float(min_area_frac) * H * W
+    match_radius = float(match_radius_frac) * float(np.hypot(H, W))
+
+    xy = D["tracks_xy"][0]                                    # (Q, T, 2) native px
+    occ = D["occluded"][0]; dyn = np.asarray(D["dyn_mask"]).astype(bool)
+    reliable = (~occ) & dyn & np.isfinite(xy).all(-1)         # (Q, T)
+
+    active_centroids = {}                                     # global_id -> last-seen centroid (px)
+    next_id = 0
+    frame_labels = []                                         # per frame: (label_map, {local_label: global_id})
+    n_multibody_frames = 0
+    for t in range(T):
+        n, lbl, stats, cent = cv2.connectedComponentsWithStats(masks[t].astype(np.uint8), connectivity=8)
+        big = [i for i in range(1, n) if stats[i, 4] > min_area]
+        if len(big) < 2:
+            frame_labels.append((None, {}))
+            continue
+        n_multibody_frames += 1
+        assign = {}
+        used_globals = set()
+        # greedy nearest-first matching to previously active global ids
+        pairs = []
+        for i in big:
+            for gid, gc in active_centroids.items():
+                d = float(np.hypot(cent[i][0] - gc[0], cent[i][1] - gc[1]))
+                if d <= match_radius:
+                    pairs.append((d, i, gid))
+        pairs.sort()
+        for d, i, gid in pairs:
+            if i in assign or gid in used_globals:
+                continue
+            assign[i] = gid; used_globals.add(gid)
+        for i in big:
+            if i not in assign:
+                assign[i] = next_id; next_id += 1
+        for i in big:
+            active_centroids[assign[i]] = cent[i]
+        frame_labels.append((lbl, assign))
+
+    n_persons_found = next_id
+    if n_persons_found == 0:
+        print("[person] no frame had >=2 separable bodies; treating scene as single-body (no-op).")
+        return np.zeros(Q, dtype=np.int64)
+
+    for g in range(Q):
+        for t in range(T):
+            if not reliable[g, t]:
+                continue
+            lbl, assign = frame_labels[t]
+            if lbl is None:
+                continue
+            x, y = xy[g, t]
+            xi, yi = int(round(x)), int(round(y))
+            if not (0 <= xi < W and 0 <= yi < H):
+                continue
+            loc = int(lbl[yi, xi])
+            if loc in assign:
+                person_id[g] = assign[loc]
+                break
+
+    n_labeled_direct = int((person_id >= 0).sum())
+    # NN-propagate stragglers from labeled tracks' mean 3D lifted position
+    xyz = D["tracks_xyz"][0]
+    canon = np.full((Q, 3), np.nan)
+    finite_cnt = np.isfinite(xyz).all(-1).sum(1)
+    has_any = finite_cnt > 0
+    canon[has_any] = np.nanmean(np.where(np.isfinite(xyz[has_any]), xyz[has_any], np.nan), axis=1)
+    labeled = np.where((person_id >= 0) & has_any)[0]
+    unlabeled = np.where((person_id < 0) & has_any)[0]
+    if labeled.size > 0 and unlabeled.size > 0:
+        tree = cKDTree(canon[labeled])
+        _, nn = tree.query(canon[unlabeled], k=1)
+        person_id[unlabeled] = person_id[labeled[nn]]
+
+    counts = {int(p): int((person_id == p).sum()) for p in sorted(set(person_id[person_id >= 0].tolist()))}
+    print(f"[person] {n_multibody_frames}/{T} frames had >=2 separable bodies; found {n_persons_found} "
+          f"physical bodies; {n_labeled_direct} tracks labeled directly, "
+          f"{int((person_id >= 0).sum()) - n_labeled_direct} propagated by 3D nearest-neighbour, "
+          f"{int((person_id < 0).sum())} unresolved (treated as wildcard). counts={counts}")
+    return person_id
 
 
 def _dyn_region_near_px(D, frac, fallback=15.0):
@@ -261,8 +383,10 @@ class EdgeConfig:
     candidate_radius: float = 0.0        # 0 -> 1.5 * edge_distance_threshold
     min_overlap_frames: int = 3
     min_overlap_ratio: float = 0.20
-    distance_quantile: float = 0.90
-    edge_distance_threshold: float = 0.0  # 0 -> auto from nearest-neighbour scale
+    distance_quantile: float = 0.90      # edge accepted if this quantile (x%) of per-frame track
+                                         # distances <= threshold (EDG_EDGE_DIST_QUANTILE)
+    edge_distance_threshold: float = 0.0  # 0 -> auto = edge_thresh_mult * median NN distance
+    edge_thresh_mult: float = 5.0        # x in "threshold = x * median NN dist" (EDG_EDGE_THRESH_MULT)
     # Redundant-track PRE-FILTER (runs before candidates/edges/EDG): drop a visible track if it lies
     # within prune_radius_factor * edge_distance (canonical-3D, the edge-distance scale) of an already-
     # kept track that is at least as long (>= reliable-frame count). Length-priority NMS -> keep the
@@ -300,8 +424,9 @@ def _stack_sampled(D, s, sampled):
     return Ps, Vs
 
 
-def _auto_edge_threshold(Ps, Vs):
-    """Robust default: ~2.5x the median nearest-neighbour distance across a few sampled frames."""
+def _auto_edge_threshold(Ps, Vs, mult=5.0):
+    """Edge distance threshold = mult * median nearest-neighbour distance (a few sampled frames).
+    `mult` is the config-controlled x in "x * median NN dist" (EDG_EDGE_THRESH_MULT)."""
     nn = []
     for k in range(min(5, Ps.shape[0])):
         idx = np.where(Vs[k])[0]
@@ -311,7 +436,7 @@ def _auto_edge_threshold(Ps, Vs):
         nn.append(dd[:, 1])
     if not nn:
         return 0.1
-    return float(5.0 * np.median(np.concatenate(nn)))
+    return float(mult * np.median(np.concatenate(nn)))
 
 
 def _auto_edge_threshold_2d(Ps2d, Vs):
@@ -368,7 +493,7 @@ def build_edg_edges(D, s, cfg: EdgeConfig, verbose=True):
     Ps, Vs = _stack_sampled(D, s, sampled)
     Ocount = Vs.sum(axis=0)  # per-track reliable sampled-frame count
 
-    thr = cfg.edge_distance_threshold or _auto_edge_threshold(Ps, Vs)
+    thr = cfg.edge_distance_threshold or _auto_edge_threshold(Ps, Vs, cfg.edge_thresh_mult)
 
     # --- redundant-track pre-filter (length-priority NMS at the edge-distance scale) ---
     # pruned tracks are made never-reliable (Vs zeroed) so they are excluded from candidates, edges,
@@ -383,63 +508,72 @@ def build_edg_edges(D, s, cfg: EdgeConfig, verbose=True):
     # expose the sampled positions/reliability so the EDG node selection can rank by length + overlap
     D["_edg_aux"] = dict(Ps=Ps, Vs=Vs, Ocount=Ocount, thr=thr, sampled=sampled)
 
-    radius = cfg.candidate_radius or (1.5 * thr)
+    radius = cfg.candidate_radius or (2.0 * thr)
     Ps2d = thr2d = radius2d = None
     if cfg.use_2d:
         xy = D["tracks_xy"][0]                                          # (Q, T, 2) image px
         Ps2d = np.where(Vs[..., None], np.transpose(xy[:, sampled, :], (1, 0, 2)).astype(np.float64), np.nan)
         thr2d = cfg.edge_thresh_2d or _auto_edge_threshold_2d(Ps2d, Vs)
-        radius2d = cfg.candidate_radius_2d or (1.5 * thr2d)
+        radius2d = cfg.candidate_radius_2d or (2.0 * thr2d)
     if verbose:
         print(f"[edges] {sampled.size} frames{' (full video)' if sampled.size == T else ' (sampled)'}, "
               f"edge_thresh={thr:.4f}, cand_radius={radius:.4f}"
               + (f" | 2D rescue: edge_thresh={thr2d:.1f}px" if cfg.use_2d else ""))
 
     # --- step 2: candidate pairs (union of per-frame KD-tree neighbours) ------------------------
-    cand = set()
+    # Vectorised + parallel (workers=-1): the old per-entry Python set-insert loop dominated this pass.
+    # Pairs are encoded min*Q + max into int64 and unique'd once -- the same SET as before, and the final
+    # edge array is sorted downstream, so the output is identical.
+    Qtot = Vs.shape[1]
+    enc = []
+
+    def _collect(P_k, idx, rad):
+        tree = cKDTree(P_k)
+        kq = min(cfg.candidate_k + 1, idx.size)
+        dists, nbrs = tree.query(P_k, k=kq, distance_upper_bound=rad, workers=-1)
+        dists = np.atleast_2d(dists); nbrs = np.atleast_2d(nbrs)
+        A = np.repeat(np.arange(idx.size), nbrs.shape[1])
+        B, Dv = nbrs.ravel(), dists.ravel()
+        m = (B < idx.size) & np.isfinite(Dv)
+        ia, ib = idx[A[m]], idx[B[m]]
+        m = ia != ib
+        ia, ib = ia[m], ib[m]
+        lo, hi = np.minimum(ia, ib), np.maximum(ia, ib)
+        enc.append(lo.astype(np.int64) * Qtot + hi)
+
     for k in tqdm(range(sampled.size), desc="[edges] 3D candidates", disable=not verbose):
         idx = np.where(Vs[k])[0]
-        if idx.size < 2:
-            continue
-        tree = cKDTree(Ps[k, idx])
-        kq = min(cfg.candidate_k + 1, idx.size)
-        dists, nbrs = tree.query(Ps[k, idx], k=kq, distance_upper_bound=radius)
-        dists = np.atleast_2d(dists)
-        nbrs = np.atleast_2d(nbrs)
-        for a in range(idx.size):
-            ia = int(idx[a])
-            for b, d in zip(nbrs[a], dists[a]):
-                if b >= idx.size or not np.isfinite(d):  # cKDTree pads misses with n / inf
-                    continue
-                ib = int(idx[b])
-                if ia != ib:
-                    cand.add((ia, ib) if ia < ib else (ib, ia))
+        if idx.size >= 2:
+            _collect(Ps[k, idx], idx, radius)
     # 2D candidate pass: per-frame KD-tree in IMAGE space, so image-adjacent pairs become candidates
     # even if they are far apart in 3D (bad depth). Acceptance below verifies persistent 2D closeness.
     if cfg.use_2d:
         for k in tqdm(range(sampled.size), desc="[edges] 2D candidates", disable=not verbose):
             idx = np.where(Vs[k])[0]
-            if idx.size < 2:
-                continue
-            tree = cKDTree(Ps2d[k, idx])
-            kq = min(cfg.candidate_k + 1, idx.size)
-            dists, nbrs = tree.query(Ps2d[k, idx], k=kq, distance_upper_bound=radius2d)
-            dists = np.atleast_2d(dists); nbrs = np.atleast_2d(nbrs)
-            for a in range(idx.size):
-                ia = int(idx[a])
-                for b, d in zip(nbrs[a], dists[a]):
-                    if b >= idx.size or not np.isfinite(d):
-                        continue
-                    ib = int(idx[b])
-                    if ia != ib:
-                        cand.add((ia, ib) if ia < ib else (ib, ia))
+            if idx.size >= 2:
+                _collect(Ps2d[k, idx], idx, radius2d)
+    uniq = np.unique(np.concatenate(enc)) if enc else np.zeros(0, np.int64)
     if verbose:
-        print(f"[edges] {len(cand)} candidate pairs")
-    if not cand:
+        print(f"[edges] {uniq.size} candidate pairs")
+    if uniq.size == 0:
         return np.zeros((0, 2), np.int64), np.zeros((0,), np.float64)
 
-    cand_arr = np.fromiter((x for pair in cand for x in pair), dtype=np.int64).reshape(-1, 2)
+    cand_arr = np.stack([uniq // Qtot, uniq % Qtot], 1)
     ci, cj = cand_arr[:, 0], cand_arr[:, 1]
+
+    # --- MULTI-BODY SEPARATION: never propose an edge between two DIFFERENT physical bodies (e.g.
+    # several people who visually overlap in 2D at some frames). person_id[-1] = unresolved -> treated
+    # as a wildcard (kept) so ambiguous points aren't needlessly dropped. ---
+    pid = D.get("person_id")
+    if pid is not None and int(pid.max(initial=-1)) > 0:
+        same_body = (pid[ci] == pid[cj]) | (pid[ci] < 0) | (pid[cj] < 0)
+        n_cross = int((~same_body).sum())
+        if n_cross:
+            cand_arr = cand_arr[same_body]; ci, cj = cand_arr[:, 0], cand_arr[:, 1]
+            if verbose:
+                print(f"[edges] multi-body filter: dropped {n_cross} cross-body candidate pairs")
+        if cand_arr.shape[0] == 0:
+            return np.zeros((0, 2), np.int64), np.zeros((0,), np.float64)
 
     # --- step 3: persistent proximity (vectorised + chunked over candidates) -------------------
     #     accept a pair if it stays close in 3D (s3 <= thr) OR in 2D image space (s2 <= thr2d).
@@ -457,14 +591,16 @@ def build_edg_edges(D, s, cfg: EdgeConfig, verbose=True):
             continue
         a, b, co = a[keep], b[keep], co[:, keep]
         d3 = np.where(co, np.linalg.norm(Ps[:, a, :] - Ps[:, b, :], axis=2), np.nan)
-        s3 = np.nanquantile(d3, cfg.distance_quantile, axis=0)      # (C',) 3D persistent distance
+        s3 = _nanq_cols(d3, cfg.distance_quantile)                  # (C',) 3D persistent distance
         ok = s3 <= thr
         if cfg.use_2d:
-            d2 = np.where(co, np.linalg.norm(Ps2d[:, a, :] - Ps2d[:, b, :], axis=2), np.nan)
-            s2 = np.nanquantile(d2, cfg.distance_quantile, axis=0)  # (C',) 2D persistent distance (px)
-            ok2 = s2 <= thr2d
-            n_2d_rescue += int((ok2 & ~ok).sum())                  # accepted by 2D but NOT by 3D
-            ok = ok | ok2
+            nd = ~ok                                               # 2D can only RESCUE pairs 3D rejected,
+            if nd.any():                                           # so compute it just for those (same ok)
+                d2 = np.where(co[:, nd], np.linalg.norm(Ps2d[:, a[nd], :] - Ps2d[:, b[nd], :], axis=2), np.nan)
+                s2 = _nanq_cols(d2, cfg.distance_quantile)         # 2D persistent distance (px)
+                ok2 = s2 <= thr2d
+                n_2d_rescue += int(ok2.sum())                      # accepted by 2D but NOT by 3D
+                ok[nd] = ok2
         # score = 3D persistent distance (used by the stretch filter; large for bad-depth 2D-rescues)
         acc_i.append(a[ok]); acc_j.append(b[ok]); acc_s.append(s3[ok])
     if not acc_i or sum(x.size for x in acc_i) == 0:
@@ -510,17 +646,38 @@ def build_edg_edges(D, s, cfg: EdgeConfig, verbose=True):
             adj[int(a)].add(int(b)); adj[int(b)].add(int(a))
         under = [int(u) for u in has_idx if len(adj[u]) < cfg.min_degree]
         add = {}
-        if under and has_idx.size > cfg.min_degree:
-            tree = cKDTree(canon[has_idx])
-            kq = int(min(cfg.min_degree + 6, has_idx.size))
-            dd, nn = tree.query(canon[under], k=kq)
+        pid = D.get("person_id")
+        multi_body = pid is not None and int(pid.max(initial=-1)) > 0
+        # MULTI-BODY SEPARATION: this fallback used to search ALL has_idx globally for whoever is
+        # nearest -- exactly the mechanism that bridges two different people when one is under-observed.
+        # Build one candidate pool PER BODY (own-body only) and search unresolved tracks (person_id -1)
+        # against the full global pool, since we don't know which body they belong to.
+        groups = []  # list of (under_connected_subset, candidate_pool)
+        if multi_body:
+            for p in sorted(set(pid[has_idx].tolist())):
+                if p < 0:
+                    continue
+                sel = has_idx[pid[has_idx] == p]
+                u_group = [u for u in under if pid[u] == p]
+                groups.append((u_group, sel))
+            unresolved_u = [u for u in under if pid[u] < 0]
+            if unresolved_u:
+                groups.append((unresolved_u, has_idx))
+        else:
+            groups.append((under, has_idx))
+        for u_group, sel in groups:
+            if not u_group or sel.size <= 1:
+                continue
+            tree = cKDTree(canon[sel])
+            kq = int(min(cfg.min_degree + 6, sel.size))
+            dd, nn = tree.query(canon[u_group], k=kq)
             dd = np.atleast_2d(dd); nn = np.atleast_2d(nn)
-            for r, u in enumerate(under):
+            for r, u in enumerate(u_group):
                 need = cfg.min_degree - len(adj[u])
                 for lj, d in zip(nn[r], dd[r]):
                     if need <= 0:
                         break
-                    gj = int(has_idx[lj])
+                    gj = int(sel[lj])
                     if gj == u or gj in adj[u] or not np.isfinite(d):
                         continue
                     key = (u, gj) if u < gj else (gj, u)
@@ -623,6 +780,15 @@ def _link_rigid_components(D, cfg, edges, scores, Ps, Vs, verbose=True):
         return edges, scores
     if verbose:
         print(f"[rigid] testing {len(parts)} parts (of {n_comp} components) for rigid linkage")
+    # MULTI-BODY SEPARATION: never rigid-link two parts that belong to different PHYSICAL bodies (e.g.
+    # two people), even if a sparse/short co-visible window makes their motion look spuriously rigid.
+    pid = D.get("person_id")
+    part_body = None
+    if pid is not None and int(pid.max(initial=-1)) > 0:
+        part_body = []
+        for pr in parts:
+            labs = pid[pr]; labs = labs[labs >= 0]
+            part_body.append(int(np.bincount(labs).argmax()) if labs.size else -1)
     parent = list(range(len(parts)))
     def find(x):
         while parent[x] != x:
@@ -633,6 +799,8 @@ def _link_rigid_components(D, cfg, edges, scores, Ps, Vs, verbose=True):
     for i in range(len(parts)):
         for j in range(i + 1, len(parts)):
             if find(i) == find(j):
+                continue
+            if part_body is not None and part_body[i] >= 0 and part_body[j] >= 0 and part_body[i] != part_body[j]:
                 continue
             linked, links = _rigid_link_test(parts[i], parts[j], Ps, Vs, canon, scale, cfg, rng)
             if linked:
@@ -669,6 +837,25 @@ def _frame_trees_2d(xy, Vs, T):
         idx_per.append(idx)
         tree_per.append(cKDTree(xy[idx, t]) if idx.size else None)
     return idx_per, tree_per
+
+
+def _nanq_cols(x, q):
+    """np.nanquantile(x, q, axis=0) via ONE vectorised sort (NaNs sort to the end) -- same 'linear'
+    interpolation (incl. numpy's two-sided lerp), orders of magnitude faster than nanquantile, which
+    dominated the persistent-proximity pass."""
+    xs = np.sort(x, axis=0)
+    n = (~np.isnan(x)).sum(0)
+    out = np.full(x.shape[1], np.nan)
+    ok = n > 0
+    if not ok.any():
+        return out
+    cols = np.where(ok)[0]
+    pos = q * (n[ok] - 1.0)
+    lo = np.floor(pos).astype(np.int64)
+    hi = np.ceil(pos).astype(np.int64)
+    a, b, t = xs[lo, cols], xs[hi, cols], pos - lo
+    out[ok] = np.where(t < 0.5, a + t * (b - a), b - (1.0 - t) * (b - a))
+    return out
 
 
 def select_edg_nodes_2d(xy, Vs, Ocount, near_px, overlap_frac=0.5, max_nodes=100, min_node_frames=20,
@@ -776,11 +963,10 @@ def select_edg_nodes_covering(xy, Vs, Ocount, near_px0, overlap_frac=0.5, max_no
     return kept, float(near_px0)
 
 
-def build_edg_graph(edges, Q, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_frac=0.5,
+def build_edg_graph(edges, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_frac=0.5,
                     edge_hops=6, max_nodes=100, min_node_frames=20, max_edge_factor=0.0,
                     quantile=0.90, min_degree=4, verbose=True, nodes_3d=False, near_frac=0.16,
-                    edge_max_dist_factor=3.0, edge_min_max_ratio=0.5,
-                    sphere_factor=1.3, sphere_pct=95.0):
+                    edge_min_max_ratio=0.5, person_id=None):
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import dijkstra
     # --- NODE SELECTION: full-coverage NMS. EDG_NODES_3D=1 -> 3D world (Ps) distance for GT/LiDAR depth;
@@ -793,129 +979,181 @@ def build_edg_graph(edges, Q, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_fra
             print(f"[EDG] node selection: 3D world distance (radius={near_sel:.4f}, near_frac={near_frac})")
     else:
         pts_sel, near_sel = xy, near_px
-    nodes, _ = select_edg_nodes_covering(pts_sel, Vs, Ocount, near_sel, overlap_frac, max_nodes,
-                                         min_node_frames, quantile, verbose=verbose)
-    if nodes.size == 0 or edges.shape[0] == 0:
-        return nodes, np.zeros((0, 2), np.int64)
-
-    # --- EDG EDGES: node pairs within edge_hops on the track graph (chunked capped Dijkstra) ---
-    edge_hops = int(edge_hops) if edge_hops > 0 else 6
-    ii = np.concatenate([edges[:, 0], edges[:, 1]])
-    jj = np.concatenate([edges[:, 1], edges[:, 0]])
-    A = csr_matrix((np.ones(ii.size, np.float32), (ii, jj)), shape=(Q, Q))
-    K = nodes.size
-    pair_lo, pair_hi = [], []
-    CH = 128
-    for st in tqdm(range(0, K, CH), desc="EDG edges", disable=not verbose):
-        src = nodes[st:st + CH]
-        Dn = dijkstra(A, directed=False, indices=src, unweighted=True, limit=float(edge_hops))  # (c, Q)
-        Hc = Dn[:, nodes]                                # (c, K) hop distances to every EDG node
-        ri, bi = np.where((Hc <= edge_hops) & (Hc > 0) & np.isfinite(Hc))
-        a = src[ri]; b = nodes[bi]
-        pair_lo.append(np.minimum(a, b)); pair_hi.append(np.maximum(a, b))
-    if pair_lo:
-        und = np.unique(np.stack([np.concatenate(pair_lo), np.concatenate(pair_hi)], 1), axis=0)
-        edg_edges = und.astype(np.int64)
+    # MULTI-BODY SEPARATION: with >1 physical body, run the SAME coverage-NMS selection once PER BODY
+    # (each gets its own full max_nodes budget, so a body with fewer/shorter tracks is never starved by
+    # a bigger one) instead of once globally. Tracks with unresolved person_id (-1) are excluded from
+    # candidacy as NODES here (they still bind as ordinary dynamic points via the track graph).
+    if person_id is not None and int(np.max(person_id, initial=-1)) > 0:
+        bodies = sorted(int(p) for p in set(person_id.tolist()) if p >= 0)
+        node_list = []
+        for b in bodies:
+            Ocount_b = np.where(person_id == b, Ocount, 0)
+            nb, _ = select_edg_nodes_covering(pts_sel, Vs, Ocount_b, near_sel, overlap_frac, max_nodes,
+                                              min_node_frames, quantile, verbose=verbose)
+            if verbose:
+                print(f"[EDG] body {b}: {nb.size} nodes")
+            node_list.append(nb)
+        nodes = np.concatenate(node_list) if node_list else np.zeros(0, np.int64)
     else:
-        edg_edges = np.zeros((0, 2), np.int64)
+        nodes, _ = select_edg_nodes_covering(pts_sel, Vs, Ocount, near_sel, overlap_frac, max_nodes,
+                                             min_node_frames, quantile, verbose=verbose)
+    if nodes.size == 0 or edges.shape[0] == 0:
+        return nodes, np.zeros((0, 2), np.int64), np.zeros((0, 2), np.int64), np.zeros((0, 2), np.int64)
 
-    # --- METRIC CAP + STABILITY FILTERS: hops are topological, so a chain of short hops can connect
-    # FAR-APART nodes. Drop a hop-connected pair if (a) its robust p90 co-visible 3D distance exceeds
-    # max_edge_factor*thr, OR (b) its MAXIMUM co-visible distance exceeds edge_max_dist_factor*thr (far in
-    # even a few frames), OR (c) that distance VARIES a lot (min < edge_min_max_ratio*max, only when
-    # max>thr). Never-co-visible pairs are dropped too (unverifiable). The min-degree augmentation below
-    # then restores connectivity (>= min_degree per node), preferring edges that pass these filters. ---
-    _do_cap = bool(max_edge_factor and max_edge_factor > 0)
-    _do_far = bool(edge_max_dist_factor and edge_max_dist_factor > 0)
-    _do_var = bool(edge_min_max_ratio and edge_min_max_ratio > 0)
-    if (_do_cap or _do_far or _do_var) and edg_edges.shape[0]:
-        cap = float(max_edge_factor) * float(thr) if _do_cap else np.inf   # p90 cap stays on thr (existing)
-        p90 = np.full(edg_edges.shape[0], np.inf)
-        dmn = np.full(edg_edges.shape[0], np.inf); dmx = np.full(edg_edges.shape[0], np.inf)
-        for i, (a, b) in enumerate(edg_edges.tolist()):
-            both = Vs[:, a] & Vs[:, b]
-            if both.any():
-                dd = np.linalg.norm(Ps[both, a] - Ps[both, b], axis=1)
-                p90[i] = np.percentile(dd, 90); dmn[i] = float(dd.min()); dmx[i] = float(dd.max())
-        # the NEW filters are relative to NODE SPACING (median finite edge p90), NOT thr -- thr can be much
-        # smaller than the actual node spacing, which would over-reject and leave min-degree to re-add nearest.
-        _fin = np.isfinite(p90)
-        scale_node = float(np.median(p90[_fin])) if _fin.any() else float(thr)
-        max_cap = float(edge_max_dist_factor) * scale_node if _do_far else np.inf
-        keep_cap = p90 <= cap
-        keep_far = dmx <= max_cap
-        keep_var = ~((dmx > scale_node) & (dmn < float(edge_min_max_ratio) * dmx)) if _do_var else np.ones_like(keep_cap)
-        keep = keep_cap & keep_far & keep_var & _fin
-        if verbose:
-            print(f"[EDG] edge cap/filter (node-spacing {scale_node:.4f}; p90<= {cap:.4f}, max<= {max_cap:.4f}, "
-                  f"min>= {edge_min_max_ratio:g}max): kept {int(keep.sum())}/{edg_edges.shape[0]} "
-                  f"(dropped {int((~keep_cap).sum())} p90, {int((keep_cap & ~keep_far).sum())} max-dist, "
-                  f"{int((keep_cap & keep_far & ~keep_var).sum())} varying, {int((~_fin).sum())} never-co-visible)")
-        edg_edges = edg_edges[keep]
-
-    # --- MIN-DEGREE kNN FALLBACK: the hop graph fragments on large / occlusion-heavy dynamic regions
-    # (e.g. block: 91/130 nodes isolated), leaving the deformation graph disconnected so ARAP has nothing
-    # to regularize. Guarantee every EDG node connects to >= min_degree nearest co-visible nodes (robust
-    # p90 3D distance over co-visible frames -- same metric as the cap), adding edges as needed. ---
-    if min_degree and min_degree > 0 and nodes.size > 1:
-        edg_edges = _augment_edg_min_degree(edg_edges, nodes, Ps, Vs, int(min_degree), verbose,
-                                            thr=float(thr), max_dist_factor=edge_max_dist_factor,
-                                            min_max_ratio=edge_min_max_ratio)
-
-    # --- FINAL SPHERE FILTER (the LAST step, after min-degree): the far node of a rigid edge must stay
-    # within a sphere of radius sphere_factor * mean(distance) around the near node (the sphere that
-    # "covers the EDG position"). Break an edge whose p<sphere_pct> co-visible distance escapes that sphere
-    # (i.e. the node leaves it in >(100-sphere_pct)% of frames). Runs AFTER min-degree, so it CAN reduce a
-    # node's degree -- that is intended (isolate cross-body links). ---
-    if sphere_factor and sphere_factor > 0 and edg_edges.shape[0]:
-        keep = np.ones(edg_edges.shape[0], bool)
-        for i, (a, b) in enumerate(edg_edges.tolist()):
-            both = Vs[:, a] & Vs[:, b]
-            if int(both.sum()) < 3:
-                continue
-            d = np.linalg.norm(Ps[both, a] - Ps[both, b], axis=1)
-            mu = float(d.mean())
-            if mu > 1e-9 and float(np.percentile(d, sphere_pct)) > float(sphere_factor) * mu:
-                keep[i] = False
-        if verbose:
-            print(f"[EDG] final sphere filter (p{sphere_pct:g} distance <= {sphere_factor:g}x mean): broke "
-                  f"{int((~keep).sum())}/{edg_edges.shape[0]} edges whose far node escaped the covering sphere")
-        edg_edges = edg_edges[keep]
-
-    if verbose:
-        print(f"[EDG] {nodes.size} nodes, {edg_edges.shape[0]} edges (hop distance <= {edge_hops}"
-              + (f", min-degree {min_degree}" if min_degree and min_degree > 0 else "")
-              + (f", sphere<= {sphere_factor:g}x mean" if sphere_factor and sphere_factor > 0 else "") + ")")
-    return nodes, edg_edges
-
-
-def _augment_edg_min_degree(edg_edges, nodes, Ps, Vs, min_degree, verbose=True,
-                            thr=None, max_dist_factor=0.0, min_max_ratio=0.0):
-    """Add kNN edges so every EDG node has >= min_degree neighbours. Distance = p90 of co-visible-frame
-    3D distance (inf if never co-visible). Neighbours PREFER edges that pass the same stability filters as
-    the edge cap (max co-visible dist <= max_dist_factor*thr, and not varying: min >= min_max_ratio*max),
-    falling back to filter-failing neighbours only when needed so the min_degree guarantee is never broken.
-    Nodes with fewer than min_degree co-visible partners connect to all available."""
-    from collections import defaultdict
+    # --- STEP 1: FILTER FIRST -- build the BLUE (all-pairs, non-hop) graph over EDG nodes BEFORE any hop
+    # restriction: a pair passes iff (a) it is co-visible at least once, (b) its robust p90 co-visible 3D
+    # distance does NOT exceed max_edge_factor*scale_node, and (c) it does NOT vary a lot (min co-visible
+    # distance >= edge_min_max_ratio * max). scale_node (typical node spacing) is now the median finite
+    # p90 over ALL co-visible node pairs (there is no separate hop-candidate set to derive it from
+    # anymore). Cross-body pairs (multi-body) are excluded outright (never co-visible for this purpose),
+    # so blue -- and everything built from it below -- can never bridge two different people. ---
+    edge_hops = int(edge_hops) if edge_hops > 0 else 6
     K = nodes.size
-    # persistent co-visible 3D distance stats (symmetric, inf on the diagonal / never-co-visible pairs)
-    D = np.full((K, K), np.inf); Dmn = np.full((K, K), np.inf); Dmx = np.full((K, K), np.inf)
+    node_person = person_id[nodes] if person_id is not None else None
+    cross_body = None
+    if node_person is not None and int(np.max(node_person, initial=-1)) > 0:
+        cross_body = ((node_person[:, None] != node_person[None, :])
+                      & (node_person[:, None] >= 0) & (node_person[None, :] >= 0))
+    P90 = np.full((K, K), np.inf); Dmn = np.full((K, K), np.inf); Dmx = np.full((K, K), np.inf)
     Vn = [Vs[:, nodes[i]] for i in range(K)]
-    for i in range(K):
+    for i in tqdm(range(K), desc="blue pairs", disable=not verbose):
         for j in range(i + 1, K):
+            if cross_body is not None and cross_body[i, j]:
+                continue
             both = Vn[i] & Vn[j]
             if both.any():
                 dd = np.linalg.norm(Ps[both, nodes[i]] - Ps[both, nodes[j]], axis=1)
-                D[i, j] = D[j, i] = np.percentile(dd, 90)
+                P90[i, j] = P90[j, i] = np.percentile(dd, 90)
                 Dmn[i, j] = Dmn[j, i] = float(dd.min()); Dmx[i, j] = Dmx[j, i] = float(dd.max())
-    bad = np.zeros((K, K), bool)                              # fails the same filters as the edge cap
-    # scale = node spacing (median finite p90), consistent with the edge cap (NOT thr, which can be smaller)
-    _finD = np.isfinite(D) & (D > 0)
-    scale_node = float(np.median(D[_finD])) if _finD.any() else (float(thr) if thr else 1.0)
-    if max_dist_factor and max_dist_factor > 0:
-        bad |= Dmx > float(max_dist_factor) * scale_node
-    if min_max_ratio and min_max_ratio > 0:
-        bad |= (Dmx > scale_node) & (Dmn < float(min_max_ratio) * Dmx)
+    _fin = np.isfinite(P90)
+    scale_node = float(np.median(P90[_fin])) if _fin.any() else float(thr)
+    _do_cap = bool(max_edge_factor and max_edge_factor > 0)
+    _do_var = bool(edge_min_max_ratio and edge_min_max_ratio > 0)
+    cap = float(max_edge_factor) * scale_node if _do_cap else np.inf
+    too_far = P90 > cap
+    too_variable = (Dmn < float(edge_min_max_ratio) * Dmx) if _do_var else np.zeros_like(too_far)
+    blue_adj = _fin & ~too_far & ~too_variable
+    np.fill_diagonal(blue_adj, False)
+    cap_filtered_edges = np.zeros((0, 2), np.int64)   # kept only for return-arity: filtering now happens
+                                                        # BEFORE hop selection, so nothing is "dropped from
+                                                        # a hop-candidate set" anymore -- always empty.
+    if verbose:
+        n_possible = K * (K - 1) // 2
+        print(f"[EDG] blue filter (node-spacing {scale_node:.4f}; p90<= {cap:.4f}, "
+              f"min>= {edge_min_max_ratio:g}max): {int(blue_adj.sum()) // 2}/{max(n_possible, 1)} "
+              f"all-pairs connections pass (BEFORE hop restriction)")
+
+    # --- TRACK-GRAPH HOP DISTANCE (computed ONCE, on the RAW dynamic-point graph `edges` -- NOT on the
+    # blue graph): this is a genuine topological-proximity signal, independent of the metric filter, used
+    # two ways below. BUG FIXED HERE: an earlier version computed hop-distance ON the blue graph itself,
+    # which reintroduces exactly the "chain of good hops connects far-apart nodes" failure the metric
+    # filter exists to prevent -- verified on Jumping that 896/1609 (56%!) of the resulting red edges were
+    # NOT directly blue at all, just reachable via a multi-hop chain through OTHER blue pairs (e.g. gid
+    # 6962<->157: P90=1.47 > cap=1.35, correctly blue=False, but still became a "red" edge). Hop distance
+    # on the FINE raw track graph does not have this problem: it is independent of blue_adj, so
+    # RED = blue_adj AND hop<=edge_hops requires the DIRECT pair to pass the metric test too. ---
+    Qn = int(Vs.shape[1])
+    Hn = np.where(np.eye(K, dtype=bool), 0.0, np.inf)   # (K,K) hop distance on the raw track graph
+    if edges.shape[0]:
+        ii = np.concatenate([edges[:, 0], edges[:, 1]])
+        jj = np.concatenate([edges[:, 1], edges[:, 0]])
+        A = csr_matrix((np.ones(ii.size, np.float32), (ii, jj)), shape=(Qn, Qn))
+        Hn = dijkstra(A, directed=False, indices=nodes, unweighted=True)[:, nodes]   # (K,K), inf if disconnected
+    reachable = np.isfinite(Hn)          # ANY finite hop count -- used by the fallback (STEP 3) below
+    hop_close = reachable & (Hn <= float(edge_hops)) & (Hn > 0)   # <= edge_hops -- used by STEP 2 below
+    if verbose:
+        n_pairs = K * (K - 1) // 2
+        print(f"[EDG] track-graph hops: {int(np.triu(reachable, 1).sum())}/{max(n_pairs, 1)} pairs "
+              f"finite-hop-connected, {int(np.triu(hop_close, 1).sum())} within {edge_hops} hop(s)")
+
+    # --- STEP 2: RED edges = blue pairs (direct 3D distance + variability) that are ALSO within
+    # edge_hops on the RAW track graph. Both conditions on the SAME pair -- no chaining through blue. ---
+    final_adj = blue_adj & hop_close
+    iu, ju = np.triu_indices(K, k=1)
+    sel = final_adj[iu, ju]
+    a, b = nodes[iu[sel]], nodes[ju[sel]]
+    edg_edges = np.stack([np.minimum(a, b), np.maximum(a, b)], axis=1).astype(np.int64)
+    if verbose:
+        print(f"[EDG] {edg_edges.shape[0]} red edges (blue AND within {edge_hops} hop(s) on the track graph)")
+
+    # --- STEP 3: MIN-DEGREE FALLBACK, drawing ONLY from the BLUE graph AND requiring finite track-graph
+    # reachability (matches "fallback after every filter": it can never add a filter-failing OR
+    # disconnected pair -- a node with too few such neighbours simply stays under-connected). ---
+    if min_degree and min_degree > 0 and K > 1:
+        edg_edges = _augment_edg_min_degree(edg_edges, nodes, P90, blue_adj & reachable, int(min_degree), verbose)
+
+    # --- DEBUG (BLUE viewer edges): blue-approved pairs NOT included in the final graph above (beyond
+    # --edg-edge-hops on the blue graph, or not needed by the fallback) -- i.e. quality-passing
+    # connections the hop restriction is still leaving out. NOT used to build edg_edges. ---
+    nonhop_debug_edges = np.zeros((0, 2), np.int64)
+    if blue_adj.any():
+        iu, ju = np.triu_indices(K, k=1)
+        sel = blue_adj[iu, ju]
+        a, b = nodes[iu[sel]], nodes[ju[sel]]
+        blue_pairs = np.stack([np.minimum(a, b), np.maximum(a, b)], axis=1).astype(np.int64)
+        if blue_pairs.size and edg_edges.size:
+            final_set = set(map(tuple, edg_edges.tolist()))
+            keep = np.array([tuple(p) not in final_set for p in blue_pairs.tolist()], dtype=bool)
+            nonhop_debug_edges = blue_pairs[keep]
+        else:
+            nonhop_debug_edges = blue_pairs
+        if verbose:
+            print(f"[EDG] debug non-hop: {nonhop_debug_edges.shape[0]}/{blue_pairs.shape[0] if blue_pairs.size else 0} "
+                  f"blue-approved pairs excluded from the final graph (beyond --edg-edge-hops / not needed "
+                  f"by fallback) -- viewer-only, not part of the graph")
+
+    # --- FINAL WITHIN-BODY OUTLIER DELETION: a node whose canonical position is still an extreme
+    # outlier relative to its OWN body's other nodes (>4x that body's typical inter-node spacing) is a
+    # genuine placement defect (e.g. an occlusion-induced track mis-association), not a multi-body
+    # artifact (already structurally prevented above) -- DELETE it as an EDG node entirely (and any
+    # edges referencing it) instead of leaving it in the graph. ---
+    if person_id is not None and nodes.size > 2:
+        cnt_n = Vs[:, nodes].sum(0)
+        canon_n = np.full((nodes.size, Ps.shape[-1]), np.nan)
+        has_n = cnt_n > 0
+        canon_n[has_n] = np.where(Vs[:, nodes][..., None], Ps[:, nodes], 0.0).sum(0)[has_n] / cnt_n[has_n, None]
+        node_body = person_id[nodes]
+        keep_node = np.ones(nodes.size, bool)
+        for b in sorted(int(x) for x in set(node_body.tolist()) if x >= 0):
+            sel = np.where(node_body == b)[0]
+            fin = sel[np.isfinite(canon_n[sel]).all(1)]
+            if fin.size < 3:
+                continue
+            med = np.median(canon_n[fin], axis=0)
+            d = np.linalg.norm(canon_n[fin] - med[None], axis=1)
+            typical = float(np.median(d))
+            if typical <= 1e-9:
+                continue
+            bad_n = fin[d > 4.0 * typical]
+            keep_node[bad_n] = False
+        n_deleted = int((~keep_node).sum())
+        if n_deleted:
+            deleted_gids = nodes[~keep_node]
+            if verbose:
+                print(f"[EDG] within-body outlier deletion: removed {n_deleted}/{nodes.size} nodes "
+                      f"whose own-body canonical position is >4x that body's typical node spacing "
+                      f"(gids={sorted(int(g) for g in deleted_gids)})")
+            nodes = nodes[keep_node]
+            if edg_edges.shape[0]:
+                keep_e = ~(np.isin(edg_edges[:, 0], deleted_gids) | np.isin(edg_edges[:, 1], deleted_gids))
+                edg_edges = edg_edges[keep_e]
+
+    if verbose:
+        print(f"[EDG] {nodes.size} nodes, {edg_edges.shape[0]} edges (hop distance <= {edge_hops}"
+              + (f", min-degree {min_degree}" if min_degree and min_degree > 0 else "") + ")")
+    return nodes, edg_edges, cap_filtered_edges, nonhop_debug_edges
+
+
+def _augment_edg_min_degree(edg_edges, nodes, P90, blue_adj, min_degree, verbose=True):
+    """Add edges so every EDG node has >= min_degree neighbours, drawing ONLY from blue_adj (node pairs
+    that already passed the too-far/variability filter AND the track-graph reachability safeguard in
+    build_edg_graph -- this fallback NEVER adds a filter-failing, disconnected, or cross-body pair; a
+    node with fewer than min_degree available candidates simply stays under-connected). Neighbours are
+    added nearest-first by P90 (robust co-visible-frame 3D distance). P90/blue_adj are the (K,K) matrices
+    already computed over `nodes` by the caller (the caller passes blue_adj & reachable, and cross-body
+    pairs are already excluded from blue_adj too)."""
+    from collections import defaultdict
+    K = nodes.size
     adj = defaultdict(set)
     loc = {int(g): i for i, g in enumerate(nodes)}
     for a, b in edg_edges.tolist():
@@ -925,9 +1163,8 @@ def _augment_edg_min_degree(edg_edges, nodes, Ps, Vs, min_degree, verbose=True,
         need = min_degree - len(adj[i])
         if need <= 0:
             continue
-        # prefer filter-passing neighbours (bad=False) nearest-first, then fall back to bad ones by distance
-        order = sorted((j for j in range(K) if j != i and np.isfinite(D[i, j]) and j not in adj[i]),
-                       key=lambda j: (bool(bad[i, j]), float(D[i, j])))
+        order = sorted((j for j in range(K) if j != i and blue_adj[i, j] and j not in adj[i]),
+                       key=lambda j: float(P90[i, j]))
         for j in order:
             adj[i].add(j); adj[j].add(i)
             lo, hi = (i, j) if nodes[i] < nodes[j] else (j, i)
@@ -939,13 +1176,13 @@ def _augment_edg_min_degree(edg_edges, nodes, Ps, Vs, min_degree, verbose=True,
         add = np.array(sorted(new_pairs), dtype=np.int64)
         edg_edges = np.unique(np.concatenate([edg_edges, add], 0), axis=0) if edg_edges.size else add
         if verbose:
-            print(f"[EDG] min-degree {min_degree}: +{len(new_pairs)} kNN edges for under-connected nodes")
+            print(f"[EDG] min-degree {min_degree}: +{len(new_pairs)} blue-only kNN edges for under-connected nodes")
     return edg_edges
 
 
 def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, min_conn=2,
                            max_factor=3.0, cand_k=8, quantile=90, verbose=True, hop_limit=20,
-                           max_dist_factor=3.0, min_max_ratio=0.5):
+                           max_dist_factor=3.0, min_max_ratio=0.5, person_id=None):
     """Attach each DYNAMIC point (track) to its `min_conn` EDG nodes (ORANGE edges), chosen so the
     connection stays SPATIALLY CLOSE ACROSS ALL co-visible frames. The skinning weight is set once and
     used for every frame (global), so a node that is near at one frame but far at others would corrupt
@@ -1001,6 +1238,18 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
     else:                                                    # no track graph: every node is a candidate
         for q in dyn_ids.tolist():
             cand[q] = set(range(K))
+
+    # MULTI-BODY SEPARATION (defense in depth): the graph-reachable candidate pool above should already
+    # respect body boundaries (the underlying track graph never has cross-body edges), but the no-graph
+    # fallback just above does not -- so re-filter explicitly by body here too. Unresolved person_id (-1,
+    # on either the point or the node) is a wildcard (kept).
+    if person_id is not None and int(np.max(person_id, initial=-1)) > 0:
+        node_body = person_id[edg_nodes]                     # (K,)
+        for q in list(cand.keys()):
+            pq = int(person_id[q])
+            if pq < 0:
+                continue
+            cand[q] = {nl for nl in cand[q] if node_body[nl] < 0 or node_body[nl] == pq}
 
     # --- robust p<quantile> + MIN + MAX per-frame distance for each candidate pair, batched by node ---
     node_pts = defaultdict(list)
@@ -1138,7 +1387,9 @@ def visualize_edg_active_horizon(D, s, edg_nodes, out_path, sort=True):
 
 def _edg_sphere_mesh(positions, radius, color):
     """One merged TriangleMesh with a small sphere at each EDG-node position (so nodes read as 3D
-    markers regardless of point size). Rebuilt each frame from the current node positions."""
+    markers regardless of point size). Rebuilt each frame from the current node positions.
+    color: either a single RGB triple (uniform) or an (N,3) array, one colour per position (e.g. one
+    per physical body)."""
     import open3d as o3d
     m = o3d.geometry.TriangleMesh()
     if len(positions) == 0:
@@ -1149,7 +1400,11 @@ def _edg_sphere_mesh(positions, radius, color):
     Tr = (tt[None, :, :] + (np.arange(len(positions)) * nv)[:, None, None]).reshape(-1, 3)
     m.vertices = o3d.utility.Vector3dVector(V)
     m.triangles = o3d.utility.Vector3iVector(Tr)
-    m.paint_uniform_color(color)
+    color = np.asarray(color, dtype=np.float64)
+    if color.ndim == 1:
+        m.paint_uniform_color(color)
+    else:
+        m.vertex_colors = o3d.utility.Vector3dVector(np.repeat(color, nv, axis=0))
     m.compute_vertex_normals()
     return m
 
@@ -1159,7 +1414,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--no-scale", action="store_true", help="do not apply da3 per-frame scale")
-    ap.add_argument("--edge-thresh", type=float, default=0.0, help="edge_distance_threshold (0=auto)")
+    ap.add_argument("--edge-thresh", type=float, default=dataset_config.get_float("EDG_EDGE_THRESH", 0.0),
+                    help="absolute edge_distance_threshold; 0 = auto = edge-thresh-mult * median NN dist")
+    ap.add_argument("--edge-thresh-mult", type=float,
+                    default=dataset_config.get_float("EDG_EDGE_THRESH_MULT", 5.0),
+                    help="x in 'edge threshold = x * median NN dist' (config EDG_EDGE_THRESH_MULT)")
     ap.add_argument("--no-2d", action="store_true",
                     help="disable the 2D rescue (only 3D distance decides edges)")
     ap.add_argument("--edge-thresh-2d", type=float, default=0.0,
@@ -1173,9 +1432,14 @@ def main():
                     help="Frames used to build the topology; 0 = FULL video (every frame, default). "
                          ">0 subsamples that many frames (faster, less co-visibility evidence). Capped at T.")
     ap.add_argument("--candidate-k", type=int, default=32)
-    ap.add_argument("--min-overlap-frames", type=int, default=3)
+    ap.add_argument("--min-overlap-frames", type=int,
+                    default=dataset_config.get_int("EDG_MIN_OVERLAP_FRAMES", 3),
+                    help="an edge needs >= this many co-visible frames (config EDG_MIN_OVERLAP_FRAMES)")
     ap.add_argument("--min-overlap-ratio", type=float, default=0.20)
-    ap.add_argument("--distance-quantile", type=float, default=0.95)
+    ap.add_argument("--distance-quantile", type=float,
+                    default=dataset_config.get_float("EDG_EDGE_DIST_QUANTILE", 0.95),
+                    help="edge accepted if this quantile (x%%) of the two tracks' per-frame distances "
+                         "<= threshold (config EDG_EDGE_DIST_QUANTILE)")
     ap.add_argument("--max-neighbors", type=int, default=100)
     ap.add_argument("--symmetrize", choices=["union", "mutual"], default="union")
     ap.add_argument("--min-degree", type=int, default=3,
@@ -1211,7 +1475,7 @@ def main():
                          "frames -- same metric as the edge builder) is <= this many pixels. Lower = fewer "
                          "deletions / more nodes. (2D image distance, NOT 3D.) 0 = ADAPTIVE: "
                          "edg-near-frac * sqrt(median dynamic-mask area).")
-    ap.add_argument("--edg-near-frac", type=float, default=0.16,
+    ap.add_argument("--edg-near-frac", type=float, default=dataset_config.get_float("EDG_NEAR_FRAC", 0.16),
                     help="ADAPTIVE radius fraction for --edg-near-px 0: near_px = frac * sqrt(median "
                          "dynamic-mask area px^2). 0.16 reproduces the tuned 15px on paper-windmill.")
     ap.add_argument("--edg-dist-quantile", type=float, default=0.90,
@@ -1220,32 +1484,30 @@ def main():
     ap.add_argument("--edg-overlap-frac", type=float, default=0.5,
                     help="EDG node selection: delete a near track only if it temporally overlaps the chosen "
                          "node by MORE than this fraction of the shorter track's length (0.5 = >50%%).")
-    ap.add_argument("--edg-edge-hops", type=int, default=4,
-                    help="connect two EDG nodes when their hop distance on the track graph is <= this")
-    ap.add_argument("--edg-max-edge-factor", type=float, default=5.0,
+    ap.add_argument("--edg-edge-hops", type=int,
+                    default=dataset_config.get_int("EDG_EDGE_HOPS", 4),
+                    help="connect two EDG nodes when their hop distance on the track graph is <= this "
+                         "(config EDG_EDGE_HOPS)")
+    ap.add_argument("--edg-max-edge-factor", type=float,
+                    default=dataset_config.get_float("EDG_MAX_EDGE_FACTOR", 2.0),
                     help="drop EDG edges whose robust 3D distance (p90 over co-visible frames) exceeds this "
                          "factor x the edge-distance threshold -- prevents hop-chains from connecting "
-                         "far-apart nodes (0 = off; ~2.0 recommended)")
-    ap.add_argument("--edg-max-dist-factor", type=float, default=3.0,
-                    help="HARD: drop an EDG node-node edge whose MAXIMUM co-visible 3D distance exceeds this "
-                         "factor x edge-threshold (far in even a few frames). The --edg-min-degree guarantee "
-                         "still applies afterwards (prefers passing edges). 0=off.")
-    ap.add_argument("--edg-min-max-ratio", type=float, default=0.5,
+                         "far-apart nodes (0 = off; ~2.0 recommended) (config EDG_MAX_EDGE_FACTOR)")
+    ap.add_argument("--edg-min-max-ratio", type=float,
+                    default=dataset_config.get_float("EDG_MIN_MAX_RATIO", 0.3),
                     help="HARD: drop an EDG node-node edge whose distance VARIES a lot (min co-visible dist < "
-                         "this fraction of max, only when max>threshold). --edg-min-degree still guaranteed. 0=off.")
-    ap.add_argument("--edg-sphere-factor", type=float, default=1.3,
-                    help="FINAL filter (LAST, after min-degree): break an EDG edge whose p<edg-sphere-pct> "
-                         "co-visible distance exceeds this factor x its MEAN distance -- i.e. the far node "
-                         "escapes a sphere of radius factor*mean covering its average position. 0=off. Runs "
-                         "last, so it CAN drop a node below min-degree (isolating cross-body links).")
-    ap.add_argument("--edg-sphere-pct", type=float, default=95.0,
-                    help="percentile used as the 'max' distance in --edg-sphere-factor (95 = allow 5% outlier frames).")
-    ap.add_argument("--edg-max-nodes", type=int, default=200,
+                         "this fraction of max, only when max>threshold). --edg-min-degree still guaranteed. "
+                         "0=off. (config EDG_MIN_MAX_RATIO)")
+    ap.add_argument("--edg-max-nodes", type=int,
+                    default=dataset_config.get_int("EDG_MAX_NODES", 100),
                     help="EDG node BUDGET: the selection radius is auto-tuned so FULL coverage of all "
-                         "eligible tracks fits within this many nodes (select_edg_nodes_covering)")
-    ap.add_argument("--edg-min-frames", type=int, default=20,
-                    help="EDG node must be reliably observed in MORE than this many frames (length floor).")
-    ap.add_argument("--edg-min-degree", type=int, default=4,
+                         "eligible tracks fits within this many nodes (select_edg_nodes_covering) "
+                         "(config EDG_MAX_NODES)")
+    ap.add_argument("--edg-min-frames", type=int,
+                    default=dataset_config.get_int("EDG_MIN_FRAMES", 20),
+                    help="EDG node must be reliably observed in MORE than this many frames (length floor). "
+                         "MUST be < number of frames T, else 0 nodes. (config EDG_MIN_FRAMES)")
+    ap.add_argument("--edg-min-degree", type=int, default=3,
                     help="Guarantee every EDG NODE connects to >= this many nearest co-visible nodes "
                          "(kNN fallback after the hop graph). Fixes disconnected deformation graphs on "
                          "large/occluded dynamic regions (0 disables; keeps hop-only edges).")
@@ -1265,10 +1527,11 @@ def main():
                     help="drop a dynamic->EDG link whose robust (p90) co-visible-frame distance exceeds "
                          "this factor x the typical nearest-node distance (node spacing) -- prevents "
                          "connections that are far in some frames. Lower = stricter.")
-    ap.add_argument("--dyn-edg-max-dist-factor", type=float, default=3.0,
+    ap.add_argument("--dyn-edg-max-dist-factor", type=float,
+                    default=dataset_config.get_float("DYN_EDG_MAX_DIST_FACTOR", 3.0),
                     help="HARD: drop a dynamic->EDG link whose MAXIMUM co-visible-frame distance exceeds "
                          "this factor x node spacing -- rejects links far in even a few frames (not just on "
-                         "average). 0=off.")
+                         "average). 0=off. (config DYN_EDG_MAX_DIST_FACTOR)")
     ap.add_argument("--dyn-edg-min-max-ratio", type=float, default=0.5,
                     help="HARD: drop a dynamic->EDG link whose distance VARIES a lot: min co-visible distance "
                          "< this fraction of the max (only when the point ever gets far, dmax>spacing) -- "
@@ -1276,6 +1539,10 @@ def main():
     ap.add_argument("--topology-out", type=str, default="",
                     help="save the EDG + dynamic-edge topology npz here (default output_dir/edg_topology.npz)")
     ap.add_argument("--save-npz", type=str, default="", help="also save edges to this .npz path")
+    ap.add_argument("--tracks", default="", help="explicit tracks npz (name under outputs/ or a full path); "
+                                                 "overrides --merged/--smoothed. Use the lifted file "
+                                                 "(tracks_dynamic_merged_lift.npz) when the merge skipped "
+                                                 "its smoothing stage (--no-optimize).")
     ap.add_argument("--merged", action=argparse.BooleanOptionalAction, default=True,
                     help="use MERGED tracks (default on; --no-merged uses raw tracks_dynamic_only)")
     ap.add_argument("--smoothed", action=argparse.BooleanOptionalAction, default=True,
@@ -1289,7 +1556,11 @@ def main():
     # merged (which base tracks) and smoothed (whether optimized) are ORTHOGONAL; both default ON.
     base = "merged" if args.merged else "only"
     name = f"tracks_dynamic_{base}_smoothed.npz" if args.smoothed else f"tracks_dynamic_{base}.npz"
-    _tp = str(Path(utils.definitions.output_dir) / name)
+    if args.tracks:                                                   # explicit file wins
+        name = args.tracks
+        _tp = args.tracks if "/" in args.tracks else str(Path(utils.definitions.output_dir) / args.tracks)
+    else:
+        _tp = str(Path(utils.definitions.output_dir) / name)
     if not Path(_tp).exists():
         raise FileNotFoundError(
             f"{name} not found. Generate the smoothed tracks first:\n"
@@ -1298,6 +1569,12 @@ def main():
     print(f"[tracks] EDG on {name}  |  node-selection distance: {'3D world (--gt-depth)' if args.gt_depth else '2D image'}")
     D = _load_all(tracks_path=_tp)
     D["dyn_mask"] = _dilate_dyn_mask(D, args.mask_dilate_px)  # grow dynamic reliability region by N px
+    # multi-body (person_id) separation DISABLED -- the 2D-mask-based labeling proved unreliable under
+    # fast/occlusion-heavy motion (Jumping), and the blue filter + track-graph hop restriction already
+    # reject bad cross-part connections on their own merits (distance/variability/topology), without
+    # needing an explicit, error-prone body label. Every consumer below already guards on
+    # `person_id is not None`, so simply never setting it cleanly disables the whole mechanism -- the EDG
+    # graph is now a single uniform (red) graph regardless of how many people are in the scene.
     if args.disable_depth_move_filter:                       # undo depth + large-move filters (needs depth)
         _load_depth(D)
         _disable_depth_move_filter(D)
@@ -1307,7 +1584,8 @@ def main():
         max_sampled_frames=args.max_sampled_frames,
         candidate_k=args.candidate_k, min_overlap_frames=args.min_overlap_frames,
         min_overlap_ratio=args.min_overlap_ratio, distance_quantile=args.distance_quantile,
-        edge_distance_threshold=args.edge_thresh, max_neighbors=args.max_neighbors,
+        edge_distance_threshold=args.edge_thresh, edge_thresh_mult=args.edge_thresh_mult,
+        max_neighbors=args.max_neighbors,
         symmetrize=args.symmetrize, min_degree=args.min_degree,
         rigid_link=not args.no_rigid_link, rigid_thresh=args.rigid_thresh, rigid_min_part=args.rigid_min_part,
         use_2d=not args.no_2d, edge_thresh_2d=args.edge_thresh_2d,
@@ -1322,19 +1600,21 @@ def main():
     Q = D["tracks_xyz"].shape[1]
     if args.no_edg:
         edg_nodes, edg_edges = np.zeros(0, np.int64), np.zeros((0, 2), np.int64)
+        edg_edges_capfiltered = np.zeros((0, 2), np.int64)
+        edg_edges_nonhop_debug = np.zeros((0, 2), np.int64)
     else:
         aux = D["_edg_aux"]
         xy_s = D["tracks_xy"][0][:, aux["sampled"]].astype(np.float64)   # 2D px aligned to Vs' time axis
         near_px_eff = (float(args.edg_near_px) if float(args.edg_near_px) > 0
                        else _dyn_region_near_px(D, args.edg_near_frac))
-        edg_nodes, edg_edges = build_edg_graph(
-            edges, Q, xy_s, aux["Ps"], aux["Vs"], aux["Ocount"], aux["thr"],
+        edg_nodes, edg_edges, edg_edges_capfiltered, edg_edges_nonhop_debug = build_edg_graph(
+            edges, xy_s, aux["Ps"], aux["Vs"], aux["Ocount"], aux["thr"],
             near_px=near_px_eff, overlap_frac=args.edg_overlap_frac, nodes_3d=args.gt_depth, near_frac=args.edg_near_frac,
             edge_hops=args.edg_edge_hops, max_nodes=args.edg_max_nodes,
             min_node_frames=args.edg_min_frames, max_edge_factor=args.edg_max_edge_factor,
             quantile=args.edg_dist_quantile, min_degree=args.edg_min_degree,
-            edge_max_dist_factor=args.edg_max_dist_factor, edge_min_max_ratio=args.edg_min_max_ratio,
-            sphere_factor=args.edg_sphere_factor, sphere_pct=args.edg_sphere_pct)
+            edge_min_max_ratio=args.edg_min_max_ratio,
+            person_id=D.get("person_id"))
 
     # dynamic-point -> EDG node edges (ORANGE): nodes within < dyn_edg_hop_lt hops, unioned with each
     # point's dyn_edg_min nearest nodes AT ITS FIRST APPEARING FRAME (every appearing point gets >= that many).
@@ -1344,7 +1624,7 @@ def main():
                         hop_lt=args.dyn_edg_hop_lt, min_conn=args.dyn_edg_min,
                         max_factor=args.dyn_edg_max_factor,
                         max_dist_factor=args.dyn_edg_max_dist_factor,
-                        min_max_ratio=args.dyn_edg_min_max_ratio)
+                        min_max_ratio=args.dyn_edg_min_max_ratio, person_id=D.get("person_id"))
                      if edg_nodes.size else np.zeros((0, 2), np.int64))
 
     # save the topology result: EDG nodes/edges + dynamic-point (track) edges + dynamic->EDG edges
@@ -1352,7 +1632,13 @@ def main():
     np.savez_compressed(topo_out, edg_nodes=edg_nodes, edg_edges=edg_edges,
                         track_edges=edges, track_scores=scores, dyn_edg_edges=dyn_edg_edges,
                         dyn_edg_hop_lt=int(args.dyn_edg_hop_lt), dyn_edg_min_conn=int(args.dyn_edg_min),
-                        n_tracks=int(Q))                              # track-id space stamp (merged vs raw)
+                        n_tracks=int(Q),                              # track-id space stamp (merged vs raw)
+                        person_id=D.get("person_id", np.zeros(Q, np.int64)))  # per-track physical-body id
+                                                                       # (same track-index space as Q above;
+                                                                       # -1 = unresolved). Lets downstream
+                                                                       # consumers (train_4dgs_edg.py) apply
+                                                                       # a final within-body outlier check on
+                                                                       # the ACTUAL solved positions.
     print(f"[topology] saved -> {topo_out}  ({edg_nodes.size} EDG nodes, {edg_edges.shape[0]} EDG edges, "
           f"{edges.shape[0]} track edges, {dyn_edg_edges.shape[0]} dyn->EDG edges)")
 
@@ -1371,6 +1657,22 @@ def main():
     C_DYN = np.array([0.6, 0.2, 0.85])       # purple = ALL dynamic points (coloured uniformly)
     C_EDG = [1.0, 0.05, 0.05]                # red    = EDG nodes + edges
     C_DYN2EDG = [0.95, 0.55, 0.1]            # orange = dynamic point -> EDG node (hop < dyn_edg_hop_lt)
+    C_CAPFILT = [0.55, 0.27, 0.07]           # brown  = EDG edges DROPPED by the cap/stability filter
+    C_NONHOP = [0.15, 0.35, 0.95]            # blue   = debug: all-pairs (non-hop) links failing the
+                                              #          too-far + variability test (shown with capfilt_line
+                                              #          when dynamic points are hidden, D-toggle)
+    C_BODY = [                               # MULTI-BODY: one distinct colour per physical body, used for
+        [0.90, 0.10, 0.10],                  # the EDG (red) nodes/edges INSTEAD of uniform C_EDG whenever
+        [0.10, 0.65, 0.10],                  # person_id has > 1 body -- makes the "should be N separate
+        [0.10, 0.35, 0.95],                  # EDG graphs" claim directly checkable by eye (single-body
+        [0.95, 0.60, 0.05],                  # scenes are completely unaffected, still plain red).
+        [0.60, 0.10, 0.75],
+        [0.95, 0.90, 0.10],
+        [0.10, 0.80, 0.80],
+        [0.85, 0.30, 0.55],
+    ]
+    person_id_all = D.get("person_id")
+    multi_body = person_id_all is not None and int(np.max(person_id_all, initial=-1)) > 0
 
     # EDG node marker radius from the scene scale at the start frame
     P0 = _valid_at(D, s, int(np.clip(args.start, 0, T - 1)))[0]
@@ -1378,11 +1680,13 @@ def main():
     diag = float(np.linalg.norm(P0[fin0].max(0) - P0[fin0].min(0))) if fin0.any() else 1.0
     node_r = max(1e-4, 0.006 * diag)
 
-    state = {"idx": int(np.clip(args.start, 0, T - 1))}
+    state = {"idx": int(np.clip(args.start, 0, T - 1)), "show_dyn": True, "show_nonhop": False}
     pcd = o3d.geometry.PointCloud()
     lines = o3d.geometry.LineSet()
     edg_line = o3d.geometry.LineSet()                    # red EDG edges
     dyn_edg_line = o3d.geometry.LineSet()                # orange dynamic-point -> EDG node edges
+    capfilt_line = o3d.geometry.LineSet()                # brown edges dropped by the cap/stability filter
+    nonhop_line = o3d.geometry.LineSet()                 # blue debug: all-pairs (non-hop) bad links
     edg_mesh = o3d.geometry.TriangleMesh()               # red EDG node spheres
     axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
 
@@ -1396,8 +1700,11 @@ def main():
             draw = v                                 # only these are drawn (occluded / off-mask hidden)
             idx = np.where(draw)[0]
             st = status[idx]
-            pcd.points = o3d.utility.Vector3dVector(P[idx])
-            pcd.paint_uniform_color(C_DYN)           # ALL dynamic points -> purple
+            if state["show_dyn"]:
+                pcd.points = o3d.utility.Vector3dVector(P[idx])
+                pcd.paint_uniform_color(C_DYN)       # ALL dynamic points -> purple
+            else:
+                pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
             n_valid = int((st == 0).sum()); n_occ = int((st == 1).sum())
             n_off = int((st == 2).sum()); n_pruned = int((st == 3).sum())
         else:
@@ -1405,9 +1712,12 @@ def main():
             if pruned is not None:
                 v = v & ~pruned                      # pruned tracks are hidden in --valid-only
             pts = P[v]
-            pcd.points = o3d.utility.Vector3dVector(pts)
-            if len(pts) > 0:
-                pcd.paint_uniform_color(C_DYN)       # ALL dynamic points -> purple
+            if state["show_dyn"]:
+                pcd.points = o3d.utility.Vector3dVector(pts)
+                if len(pts) > 0:
+                    pcd.paint_uniform_color(C_DYN)   # ALL dynamic points -> purple
+            else:
+                pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
             n_valid = int(v.sum()); n_occ = n_off = n_pruned = 0
 
         P_safe = np.where(np.isfinite(P), P, 0.0)
@@ -1421,15 +1731,25 @@ def main():
                 n_hidden = int((em & ~not_stretched).sum())
                 em = em & not_stretched
             lines.points = o3d.utility.Vector3dVector(P_safe)  # full track array; only valid ends referenced
-            lines.lines = o3d.utility.Vector2iVector(edges[em].astype(np.int32) if em.any() else np.zeros((0, 2), np.int32))
-            lines.paint_uniform_color([0.1, 0.9, 0.9])  # cyan edges
+            if state["show_dyn"]:
+                lines.lines = o3d.utility.Vector2iVector(edges[em].astype(np.int32) if em.any() else np.zeros((0, 2), np.int32))
+                lines.paint_uniform_color([0.1, 0.9, 0.9])  # cyan edges
+            else:
+                lines.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), np.int32))
             n_e = int(em.sum())
 
-        # --- coarse EDG deformation graph (RED): node spheres + edges, drawn where endpoints reliable ---
+        # --- coarse EDG deformation graph: node spheres + edges, drawn where endpoints reliable.
+        # RED (uniform) for single-body scenes; one colour PER PHYSICAL BODY (C_BODY) when multi_body,
+        # so "should be N separate EDG graphs" is directly checkable by eye. ---
         n_en = n_ee = 0
         if edg_nodes.size:
             nm = v[edg_nodes]
-            sm = _edg_sphere_mesh(P_safe[edg_nodes[nm]], node_r, C_EDG)
+            if multi_body:
+                nb = person_id_all[edg_nodes[nm]]
+                node_cols = np.array([C_BODY[int(b) % len(C_BODY)] if b >= 0 else C_EDG for b in nb.tolist()])
+                sm = _edg_sphere_mesh(P_safe[edg_nodes[nm]], node_r, node_cols)
+            else:
+                sm = _edg_sphere_mesh(P_safe[edg_nodes[nm]], node_r, C_EDG)
             edg_mesh.vertices = sm.vertices
             edg_mesh.triangles = sm.triangles
             edg_mesh.vertex_colors = sm.vertex_colors
@@ -1437,10 +1757,15 @@ def main():
             n_en = int(nm.sum())
         if edg_edges.size:
             eem = v[edg_edges[:, 0]] & v[edg_edges[:, 1]]
+            kept = edg_edges[eem] if eem.any() else np.zeros((0, 2), np.int64)
             edg_line.points = o3d.utility.Vector3dVector(P_safe)
-            edg_line.lines = o3d.utility.Vector2iVector(
-                edg_edges[eem].astype(np.int32) if eem.any() else np.zeros((0, 2), np.int32))
-            edg_line.paint_uniform_color(C_EDG)
+            edg_line.lines = o3d.utility.Vector2iVector(kept.astype(np.int32))
+            if multi_body and kept.shape[0]:
+                eb = person_id_all[kept[:, 0]]                   # both endpoints share a body (0 cross-body)
+                edge_cols = np.array([C_BODY[int(b) % len(C_BODY)] if b >= 0 else C_EDG for b in eb.tolist()])
+                edg_line.colors = o3d.utility.Vector3dVector(edge_cols)
+            else:
+                edg_line.paint_uniform_color(C_EDG)
             n_ee = int(eem.sum())
 
         # --- dynamic-point -> EDG node edges (ORANGE), drawn where both endpoints reliable this frame ---
@@ -1448,22 +1773,66 @@ def main():
         if dyn_edg_edges.size:
             dem = v[dyn_edg_edges[:, 0]] & v[dyn_edg_edges[:, 1]]
             dyn_edg_line.points = o3d.utility.Vector3dVector(P_safe)
-            dyn_edg_line.lines = o3d.utility.Vector2iVector(
-                dyn_edg_edges[dem].astype(np.int32) if dem.any() else np.zeros((0, 2), np.int32))
-            dyn_edg_line.paint_uniform_color(C_DYN2EDG)
+            if state["show_dyn"]:
+                dyn_edg_line.lines = o3d.utility.Vector2iVector(
+                    dyn_edg_edges[dem].astype(np.int32) if dem.any() else np.zeros((0, 2), np.int32))
+                dyn_edg_line.paint_uniform_color(C_DYN2EDG)
+            else:
+                dyn_edg_line.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), np.int32))
             n_de = int(dem.sum())
-        return n_valid, n_occ, n_off, n_pruned, n_e, n_hidden, n_en, n_ee, n_de
+
+        # --- EDG edges DROPPED by the cap/stability filter (BROWN): drawn so you can visually check
+        # whether the filter is removing edges that were actually necessary (e.g. genuine long-but-rigid
+        # connections vs spurious hop-chain shortcuts). ---
+        n_cf = 0
+        if edg_edges_capfiltered.size:
+            cfm = v[edg_edges_capfiltered[:, 0]] & v[edg_edges_capfiltered[:, 1]]
+            capfilt_line.points = o3d.utility.Vector3dVector(P_safe)
+            if state["show_dyn"]:
+                capfilt_line.lines = o3d.utility.Vector2iVector(
+                    edg_edges_capfiltered[cfm].astype(np.int32) if cfm.any() else np.zeros((0, 2), np.int32))
+                capfilt_line.paint_uniform_color(C_CAPFILT)
+            else:
+                capfilt_line.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), np.int32))
+            n_cf = int(cfm.sum())
+
+        # --- DEBUG all-pairs (non-hop) surviving links (BLUE): OFF by default, independent of the D
+        # (dynamic-points) toggle -- press N to show/hide. When on: every rigid, plausible EDG-node pair
+        # the hop restriction left out of the real graph (red). ---
+        n_nh = 0
+        if edg_edges_nonhop_debug.size:
+            nhm = v[edg_edges_nonhop_debug[:, 0]] & v[edg_edges_nonhop_debug[:, 1]]
+            nonhop_line.points = o3d.utility.Vector3dVector(P_safe)
+            if state["show_nonhop"]:
+                nonhop_line.lines = o3d.utility.Vector2iVector(
+                    edg_edges_nonhop_debug[nhm].astype(np.int32) if nhm.any() else np.zeros((0, 2), np.int32))
+                nonhop_line.paint_uniform_color(C_NONHOP)
+            else:
+                nonhop_line.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), np.int32))
+            n_nh = int(nhm.sum())
+        return n_valid, n_occ, n_off, n_pruned, n_e, n_hidden, n_en, n_ee, n_de, n_cf, n_nh
 
     def refresh(vis, frame):
-        n_valid, n_occ, n_off, n_pruned, n_e, n_hidden, n_en, n_ee, n_de = _fill(frame)
-        for g in (pcd, lines, edg_line, dyn_edg_line, edg_mesh):
+        n_valid, n_occ, n_off, n_pruned, n_e, n_hidden, n_en, n_ee, n_de, n_cf, n_nh = _fill(frame)
+        for g in (pcd, lines, edg_line, dyn_edg_line, capfilt_line, nonhop_line, edg_mesh):
             vis.update_geometry(g)
         hid = f"  hidden(over-stretched)={n_hidden}" if args.max_draw_stretch > 0 else ""
         extra = (f"  hidden: occluded={n_occ} off-mask={n_off}" if show_all else "")
         edg = f"  EDG(red): {n_en} nodes {n_ee} edges" if edg_nodes.size else ""
         orn = f"  dyn->EDG(orange): {n_de}" if dyn_edg_edges.size else ""
-        print(f"[Open3D] frame={frame}  reliable={n_valid}{extra}  edges={n_e}{hid}{edg}{orn}")
+        cpf = f"  cap-filtered(brown): {n_cf}" if edg_edges_capfiltered.size else ""
+        dynflag = "" if state["show_dyn"] else "  [dynamic points HIDDEN, D to show]"
+        nhf = f"  non-hop-ok(blue): {n_nh}" if (edg_edges_nonhop_debug.size and state["show_nonhop"]) else ""
+        print(f"[Open3D] frame={frame}  reliable={n_valid}{extra}  edges={n_e}{hid}{edg}{orn}{cpf}{dynflag}{nhf}")
         return False
+
+    def on_toggle_dyn(vis):
+        state["show_dyn"] = not state["show_dyn"]
+        return refresh(vis, state["idx"])
+
+    def on_toggle_nonhop(vis):
+        state["show_nonhop"] = not state["show_nonhop"]
+        return refresh(vis, state["idx"])
 
     def on_space(vis):
         state["idx"] = (state["idx"] + 1) % T
@@ -1494,8 +1863,14 @@ def main():
               else "Points: reliable dynamic tracks only (--valid-only), PURPLE. ")
     edgleg = "" if args.no_edg else "RED spheres/lines = coarse EDG (hop-distance deformation graph). "
     ornleg = "" if not dyn_edg_edges.size else f"ORANGE lines = dynamic->EDG (hop < {args.dyn_edg_hop_lt}). "
-    print("Open3D controls: SPACE=next frame, B=prev, S=save PLY, Q/ESC=close. "
-          f"Start frame={state['idx']} (T={T}). {legend}Cyan lines = track connectivity (Notes/EDG.md). {edgleg}{ornleg}")
+    cpfleg = "" if not edg_edges_capfiltered.size else "BROWN lines = EDG edges dropped by the cap/stability filter. "
+    nhleg = ("" if not edg_edges_nonhop_debug.size else
+             "BLUE lines (OFF by default, N to toggle) = every non-hop node pair that PASSES the "
+             "too-far/variability test (rigid candidates the hop graph is missing). ")
+    print("Open3D controls: SPACE=next frame, B=prev, D=toggle dynamic points, N=toggle blue debug edges, "
+          f"S=save PLY, Q/ESC=close. Start frame={state['idx']} (T={T}). {legend}"
+          f"Cyan lines = track connectivity (Notes/EDG.md). {edgleg}{ornleg}{cpfleg}"
+          f"Press D to hide dynamic points/track edges and show ONLY the EDG nodes+edges (red). {nhleg}")
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="build_edg: dynamic points (purple) + EDG (red)", width=1280, height=720)
     _fill(state["idx"])  # fill BEFORE add_geometry so the camera fits
@@ -1503,12 +1878,16 @@ def main():
     vis.add_geometry(lines)
     vis.add_geometry(edg_line)
     vis.add_geometry(dyn_edg_line)
+    vis.add_geometry(capfilt_line)
+    vis.add_geometry(nonhop_line)
     vis.add_geometry(edg_mesh)
     vis.add_geometry(axes)
     vis.get_render_option().point_size = 4.0
     for key in (" ",):
         vis.register_key_callback(ord(key), on_space)
     vis.register_key_callback(ord("b"), on_b); vis.register_key_callback(ord("B"), on_b)
+    vis.register_key_callback(ord("d"), on_toggle_dyn); vis.register_key_callback(ord("D"), on_toggle_dyn)
+    vis.register_key_callback(ord("n"), on_toggle_nonhop); vis.register_key_callback(ord("N"), on_toggle_nonhop)
     vis.register_key_callback(ord("s"), on_save); vis.register_key_callback(ord("S"), on_save)
     vis.register_key_callback(ord("q"), on_q); vis.register_key_callback(ord("Q"), on_q)
     vis.register_key_callback(256, on_q)  # ESC

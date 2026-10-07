@@ -36,6 +36,7 @@ from eval_depth_gaussian_ours import (
     _alignment_est_to_gt,
     _build_app_module,
     _gt_key_for_frame,
+    _load_camera_and_gt_intrinsics,
     _load_gaussians,
     _load_gt_intrinsics,
     _load_novel_metadata,
@@ -48,12 +49,15 @@ from eval_depth_gaussian_ours import (
 )
 from estimate_ours_render import (
     _apply_color_affine,
+    _apply_pose_adjust,
     _build_old_metrics,
+    _build_pose_adjust_module,
     _eval_rgb_metric,
     _find_image_path,
     _fit_color_affine,
     _infer_result_dir_from_gaussians,
     _load_novel_intrinsics,
+    _load_pose_adjust_state,
     _load_yaml,
     _metric_valid_mask,
     _read_rgb,
@@ -80,7 +84,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha-threshold", type=float, default=0.99)
     parser.add_argument("--use-covisible-mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--color-calib", choices=["none", "scene", "per-view"], default="none")
-    parser.add_argument("--novel-app", choices=["base", "zero", "mean"], default="base")
+    parser.add_argument("--novel-app", choices=["base", "zero", "mean", "frame0", "split0"], default="base")
     parser.add_argument("--sh-degree", type=int, default=1)
     parser.add_argument("--near-plane", type=float, default=0.01)
     parser.add_argument("--far-plane", type=float, default=1e10)
@@ -97,6 +101,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     # pose method
     parser.add_argument("--novel-align", choices=["sim3", "tto", "tto-cam"], default="tto")
+    parser.add_argument("--novel-fixed-cam", type=int, default=-1,
+                        help="If >=0, place EVERY test view at this est TRAINING camera (pose-refined) with "
+                             "its training K, bypassing Sim3/TTO. For NVIDIA's fixed-v000 protocol "
+                             "(--novel-fixed-cam 0) only time is novel, so frame-0 reproduces the training "
+                             "render exactly (t=0 PSNR -> training quality). Overrides --novel-align.")
     # MoSca iphone TTO defaults (mosca_evaluate.test_main iphone branch)
     parser.add_argument("--tto-steps", type=int, default=200)
     parser.add_argument("--tto-decay-start", type=int, default=15)
@@ -217,6 +226,12 @@ def _prep_frozen_gaussians(
         elif args.novel_app == "mean":
             image_ids = None
             embed_override = app_module.embeds.weight.detach().mean(dim=0)
+        elif args.novel_app == "frame0":
+            # fixed-v000 protocol: the novel camera is physical camera 0 -> frame-0 embedding
+            image_ids = torch.tensor([0], device=device, dtype=torch.long)
+        elif args.novel_app == "split0":
+            # hybrid: static -> camera-0 embedding, dynamic -> frame-t embedding
+            image_ids = torch.tensor([0], device=device, dtype=torch.long)
         colors = app_module(
             features=splats["features"].float(),
             embed_ids=image_ids,
@@ -224,6 +239,17 @@ def _prep_frozen_gaussians(
             sh_degree=min(int(args.sh_degree), app_module.sh_degree),
             embed_override=embed_override,
         )
+        if (args.novel_app == "split0" and edg is not None
+                and edg.get("dyn_indices") is not None and int(frame_index) != 0):
+            colors_t = app_module(
+                features=splats["features"].float(),
+                embed_ids=torch.tensor([int(frame_index)], device=device, dtype=torch.long),
+                dirs=means[None, :, :] - camtoworld[:, None, :3, 3],
+                sh_degree=min(int(args.sh_degree), app_module.sh_degree),
+            )
+            dyn_i = edg["dyn_indices"].to(device).long()
+            colors = colors.clone()
+            colors[:, dyn_i] = colors_t[:, dyn_i]
         colors = torch.sigmoid(colors + splats["colors"].float())
         sh_degree = None
     else:
@@ -412,6 +438,7 @@ def _evaluate_novel_tto(
     device: torch.device,
     ssim_metric,
     lpips_metric,
+    pose_adjust: torch.nn.Module | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     novel_dir = (args.novel_dir or (scene_dir / "novel")).resolve()
     records = _load_novel_metadata(scene_dir, novel_dir)
@@ -482,6 +509,19 @@ def _evaluate_novel_tto(
             del batches
             torch.cuda.empty_cache()
 
+    # --novel-fixed-cam: place ALL views at this est training camera (pose-refined) with its training K,
+    # bypassing Sim3/TTO. For the fixed-v000 protocol the novel viewpoint IS a training camera, so t=0
+    # reproduces the training render (PSNR -> training quality).
+    fixed_c2w = None
+    fixed_K = None
+    if int(getattr(args, "novel_fixed_cam", -1)) >= 0:
+        fc = int(args.novel_fixed_cam)
+        c2w_fc, K_fc, _, _, _ = _load_camera_and_gt_intrinsics(scene_dir, fc, args.camera_source)
+        fixed_c2w = _apply_pose_adjust(c2w_fc, fc, pose_adjust, device)
+        fixed_K = np.asarray(K_fc, dtype=np.float64)
+        print(f"[tto] novel-fixed-cam={fc}: placing ALL test views at est training camera {fc} "
+              f"(pose-refined), training K; Sim3/TTO bypassed.")
+
     # Phase 1: place cameras (+ per-view TTO), render, collect.
     collected: list[dict[str, Any]] = []
     for i, rec in enumerate(records):
@@ -490,16 +530,23 @@ def _evaluate_novel_tto(
             continue
         gt = _read_rgb(image_path)
         base_frame = int(rec["base_frame"])
-        K = _load_novel_intrinsics(novel_dir, rec["image_name"], gt.shape[:2])
-        if K is None:
-            base_key = _gt_key_for_frame(scene_dir, base_frame)
-            base_image = _read_rgb(_find_image_path(scene_dir, base_key))
-            K = _scale_K_for_size(_load_gt_intrinsics(scene_dir, base_key), base_image.shape[:2], gt.shape[:2])
+        if fixed_c2w is not None:
+            src_hw = (int(round(2 * fixed_K[1, 2])), int(round(2 * fixed_K[0, 2])))   # (H,W) from cx,cy
+            K = _scale_K_for_size(fixed_K, src_hw, gt.shape[:2])                       # est frame-k training K
+        else:
+            K = _load_novel_intrinsics(novel_dir, rec["image_name"], gt.shape[:2])
+            if K is None:
+                base_key = _gt_key_for_frame(scene_dir, base_frame)
+                base_image = _read_rgb(_find_image_path(scene_dir, base_key))
+                K = _scale_K_for_size(_load_gt_intrinsics(scene_dir, base_key), base_image.shape[:2], gt.shape[:2])
         c2w_sim3 = np.asarray(_transform_gt_c2w_to_est(rec["c2w_gt"], s, R_align, t_align), np.float64)
         w2c_sim3 = np.linalg.inv(c2w_sim3)
         gi = gids[i]
 
-        if args.novel_align == "sim3":
+        if fixed_c2w is not None:            # fixed est training camera -> reproduces training at t=0
+            c2w_final = fixed_c2w
+            rot_d, tr_d = 0.0, 0.0
+        elif args.novel_align == "sim3":
             c2w_final = c2w_sim3
             rot_d, tr_d = 0.0, 0.0
         elif args.novel_align == "tto-cam":
@@ -602,6 +649,13 @@ def _evaluate_novel_tto(
             cv2.imwrite(str(novel_out / f"novel{novel_id:06d}_alpha.png"), (np.clip(c["alpha"], 0.0, 1.0) * 255).astype(np.uint8))
             _write_rgb_preview(novel_out / f"novel{novel_id:06d}_compare.png", c["gt"], pred, c["alpha"], args.alpha_threshold)
 
+    # Per-frame TEST PSNR after alignment (v000_t000 == training frame 0, so t=0 should be highest).
+    print(f"[tto] per-frame test PSNR (novel-align={args.novel_align}, color-calib={args.color_calib}):")
+    for r in sorted(rows, key=lambda x: int(x["novel_id"])):
+        print(f"[tto]   view {int(r['novel_id']):3d} (base_frame {int(r['base_frame']):3d}): "
+              f"psnr={r.get('psnr', float('nan')):6.2f}  ssim={r.get('ssim', float('nan')):.3f}  "
+              f"lpips={r.get('lpips', float('nan')):.3f}")
+
     # One render video per physical test camera (MoSca's tto_test_cam{i}.mp4 convention).
     for gi, frames in sorted(video_frames.items()):
         h, w = frames[0].shape[:2]
@@ -649,6 +703,7 @@ def main() -> None:
     gaussian_paths = _resolve_gaussian_paths(scene_dir, args.gaussians)
     splats, edg, app_state, step = _load_gaussians(gaussian_paths, device)
     app_module = _build_app_module(app_state, splats, device)
+    pose_adjust = _build_pose_adjust_module(_load_pose_adjust_state(gaussian_paths, device), device)
     result_dir = _infer_result_dir_from_gaussians(gaussian_paths)
     if args.sync_train_cfg and result_dir is not None:
         cfg = _load_yaml(result_dir / "cfg.yml")
@@ -663,6 +718,7 @@ def main() -> None:
     ssim_metric, lpips_metric = _build_old_metrics(device)
     rows, meta = _evaluate_novel_tto(
         scene_dir, splats, edg, app_module, args, out_dir, device, ssim_metric, lpips_metric,
+        pose_adjust=pose_adjust,
     )
     result: dict[str, Any] = {
         "scene_dir": str(scene_dir),

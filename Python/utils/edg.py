@@ -429,7 +429,7 @@ def solve_qcqp_and_recover_until_part5(
 	w_smooth: float = 0.02,
 	w_edg_obs: float = 10.0,
 	c_float: float = 200.0,
-	solver_rank: int = 5,
+	solver_rank: int = 8,
 	solver_tol: float = 1e-4,
 	solver_mu: float = 0.0,
 	solver_max_iter: float = 1000.0,

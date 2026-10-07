@@ -299,6 +299,7 @@ def main():
         out = {k: src[k] for k in src.files}
         out["tracks_xyz"] = xyz_cam_new[None].astype(np.float64)
         out["occluded"] = occ[None]                                 # includes the boundary/depth-discont drops
+    out["depth_variant"] = np.str_(D.depth_variant)                 # provenance: which depth lifted the 3D
     np.savez(O / out_name, **out)
     print(f"  wrote {O / out_name}\n  -> build EDG (GT/LiDAR depth):  python build_edg.py --gt-depth   "
           f"(uses merged+smoothed tracks by default)")

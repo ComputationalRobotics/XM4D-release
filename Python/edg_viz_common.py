@@ -257,23 +257,33 @@ def _load_2d_context(merged: bool, n_tracks: int | None = None):
     import glob
     from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
     out_dir = Path(utils.definitions.output_dir)
-    # merge is 2D-only now -> the 3D lives in the smoothed file (optimize_dynamic_tracks output). Prefer it.
-    merged_sm = out_dir / "tracks_dynamic_merged_smoothed.npz"
-    merged_p = merged_sm if merged_sm.exists() else (out_dir / "tracks_dynamic_merged.npz")
+    # merge is 2D-only now -> the 3D lives in the smoothed OR lift file (optimize_dynamic_tracks output,
+    # the latter with --iters 0). Candidates in preference order; the raw merged file comes LAST because
+    # its tracks_xyz is all-NaN. A stale smoothed/lift file from an older track pool is skipped by the
+    # n_tracks stamp.
     raw_p = Path(utils.definitions.tracks_dynamics_path)
-    tracks_path = merged_p if merged else raw_p
-    data = np.load(str(tracks_path), allow_pickle=True)
-    if n_tracks is not None and int(data["tracks_xy"].shape[1]) != int(n_tracks):
-        other = raw_p if tracks_path == merged_p else merged_p
-        alt = np.load(str(other), allow_pickle=True)
-        if int(alt["tracks_xy"].shape[1]) == int(n_tracks):
-            print(f"[2d] npz stamp n_tracks={n_tracks} does not match {tracks_path.name} -> "
-                  f"auto-switching to {other.name} (your --merged flag was wrong for this npz)")
-            data, tracks_path = alt, other
-        else:
-            raise ValueError(f"npz stamp n_tracks={n_tracks} matches neither {tracks_path.name} "
-                             f"({int(data['tracks_xy'].shape[1])}) nor {other.name} "
-                             f"({int(alt['tracks_xy'].shape[1])}); re-run the tracking/solve pipeline.")
+    merged_cands = [out_dir / "tracks_dynamic_merged_smoothed.npz",
+                    out_dir / "tracks_dynamic_merged_lift.npz",
+                    out_dir / "tracks_dynamic_merged.npz"]
+    cands = ([p_ for p_ in merged_cands if p_.exists()] + [raw_p]) if merged \
+        else [raw_p] + [p_ for p_ in merged_cands if p_.exists()]
+    tracks_path, data = cands[0], None
+    if n_tracks is None:
+        data = np.load(str(tracks_path), allow_pickle=True)
+    else:
+        sizes = {}
+        for p_ in cands:
+            d_ = np.load(str(p_), allow_pickle=True)
+            sizes[p_.name] = int(d_["tracks_xy"].shape[1])
+            if sizes[p_.name] == int(n_tracks):
+                if p_ != cands[0]:
+                    print(f"[2d] npz stamp n_tracks={n_tracks} does not match {cands[0].name} -> "
+                          f"auto-switching to {p_.name}")
+                tracks_path, data = p_, d_
+                break
+        if data is None:
+            raise ValueError(f"npz stamp n_tracks={n_tracks} matches none of {sizes}; "
+                             "re-run the tracking/solve pipeline.")
     xy = np.asarray(data["tracks_xy"], np.float64)[0]                 # (Q,T,2) pixels
     xyz = np.asarray(data["tracks_xyz"], np.float64)[0]               # (Q,T,3) camera-space
     occ = np.asarray(data["occluded"])[0].astype(bool)                # (Q,T)

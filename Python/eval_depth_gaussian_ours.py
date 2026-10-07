@@ -356,6 +356,10 @@ def _load_gt(scene_dir: Path) -> dict[str, Any]:
         from utils.readgt_dycheck import load_dycheck_gt
 
         return load_dycheck_gt(str(scene_dir))
+    elif dataset_cat == "NVIDIA":
+        from utils.readgt_nvidia import load_nvidia_gt
+
+        return load_nvidia_gt(str(scene_dir))
     else:
         raise RuntimeError(f"No GT reader configured for dataset category {dataset_cat}")
 
@@ -806,6 +810,17 @@ def _render_depth(
         elif app_embed_mode == "mean":
             image_ids = None
             embed_override = app_module.embeds.weight.detach().mean(dim=0)
+        elif app_embed_mode == "frame0":
+            # NVIDIA fixed-v000 protocol: training frame t IS physical camera t, so the frame-t
+            # embedding encodes camera t's color response. The novel view is always physical
+            # camera 0 -> its matching embedding is frame 0's, for every t (kills the static
+            # appearance flicker that per-frame embeddings impose on a fixed test camera).
+            image_ids = torch.tensor([0], device=device, dtype=torch.long)
+        elif app_embed_mode == "split0":
+            # hybrid: static Gaussians use the camera-0 embedding (matches the fixed novel
+            # camera), dynamic Gaussians keep the frame-t embedding (their appearance was only
+            # ever observed by camera t at time t).
+            image_ids = torch.tensor([0], device=device, dtype=torch.long)
         colors = app_module(
             features=splats["features"].float(),
             embed_ids=image_ids,
@@ -813,6 +828,17 @@ def _render_depth(
             sh_degree=min(int(args.sh_degree), app_module.sh_degree),
             embed_override=embed_override,
         )
+        if (app_embed_mode == "split0" and edg is not None
+                and edg.get("dyn_indices") is not None and int(frame_index) != 0):
+            colors_t = app_module(
+                features=splats["features"].float(),
+                embed_ids=torch.tensor([int(frame_index)], device=device, dtype=torch.long),
+                dirs=means[None, :, :] - camtoworld[:, None, :3, 3],
+                sh_degree=min(int(args.sh_degree), app_module.sh_degree),
+            )
+            dyn_i = edg["dyn_indices"].to(device).long()
+            colors = colors.clone()
+            colors[:, dyn_i] = colors_t[:, dyn_i]
         colors = torch.sigmoid(colors + splats["colors"].float())
         sh_degree = None
     else:
@@ -1323,7 +1349,12 @@ def _load_novel_metadata(scene_dir: Path, novel_dir: Path) -> list[dict[str, Any
         c2w_gt = np.eye(4, dtype=np.float64)
         c2w_gt[:3, :3] = _quat_wxyz_to_rot(qw, qx, qy, qz)
         c2w_gt[:3, 3] = np.array([tx, ty, tz], dtype=np.float64)
-        depth_path = _resolve_depth_path(novel_dir / depth_name)
+        # Depth is only used for the optional co-visible mask (DyCheck protocol). Datasets
+        # without per-view novel depth (e.g. NVIDIA, evaluated full-frame) leave it absent.
+        try:
+            depth_path = _resolve_depth_path(novel_dir / depth_name)
+        except FileNotFoundError:
+            depth_path = None
         records.append(
             {
                 "novel_id": novel_id,
@@ -1374,6 +1405,10 @@ def _evaluate_novel_gaussian(
     rendered_frames: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
 
     for rec in records:
+        # Novel-view depth metrics need per-view GT depth; datasets without it (e.g. NVIDIA,
+        # RGB-only) leave depth_path None -> nothing to score here, skip.
+        if rec.get("depth_path") is None:
+            continue
         base_key = _gt_key_for_frame(scene_dir, int(rec["base_frame"]))
         K = _load_gt_intrinsics(scene_dir, base_key)
         gt_depth = _read_depth(Path(rec["depth_path"]), float(args.gt_scale))

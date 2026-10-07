@@ -41,7 +41,9 @@ OUT_DIR = utils.definitions.output_dir
 IMAGE_PATTERN = utils.definitions.image_pattern
 MASK_PATTERN = utils.definitions.mask_pattern
 
-GRID = 50
+GRID = dataset_config.get_int(
+    "STATIC_INIT_GRID", 50, env="STATIC_INIT_GRID"
+)  # initial query density; init points ~= grid^2 (sparser -> fewer static tracks)
 
 # If blank-region resampling appears mirrored (e.g., top-right becomes bottom-left),
 # enable this to emit resample queries as (t, y, x) instead of (t, x, y).
@@ -50,10 +52,20 @@ MOVE_DELETE_ENABLED = True
 MOVE_WINDOW_SIZE = 10.0
 MOVE_DELETE_FLOW_ERROR_THRESHOLD = dataset_config.get_float(
     "MOVE_DELETE_FLOW_ERROR_THRESHOLD", 10.0, env="MOVE_DELETE_FLOW_ERROR_THRESHOLD"
-)  # Pixel threshold for local flow-vector deviation.
+)  # theta_min: the FLOOR of the motion-adaptive threshold below
+# Motion-adaptive large-2D-drift threshold (paper Eq. 38): theta_t = max(theta_min, kappa * m_t), with m_t the median
+# local-reference-flow magnitude at that transition. Fast camera motion inflates every track's flow, so a fixed
+# threshold over-deletes there; the floor keeps the test strict on quasi-static frames. kappa = 0 disables the
+# adaptive term (fixed theta_min, the pre-2026-09 behaviour).
+# NOTE: every shipped dataset config in configs/ sets MOVE_DELETE_FLOW_KAPPA = 0, so the experiments in the
+# paper all ran with the constant threshold theta_t = theta_min; the adaptive term is available but unused.
+# Pixel threshold for local flow-vector deviation.
 # Dilation (native-resolution px) applied to dynamic masks for BOTH the query
 # exclusion (before track_online_tapnext) and the final track filter, so a
 # conservative margin around moving objects is used consistently.
+MOVE_DELETE_FLOW_KAPPA = dataset_config.get_float(
+    "MOVE_DELETE_FLOW_KAPPA", 2.0, env="MOVE_DELETE_FLOW_KAPPA"
+)  # kappa in theta_t = max(theta_min, kappa * m_t)
 MASK_DILATE_PX = dataset_config.get_int("MASK_DILATE_PX", 10, env="MASK_DILATE_PX")
 
 CHECKPOINT = (
@@ -81,8 +93,27 @@ ONLINE_CERTAINTY_THRESHOLD = dataset_config.get_float(
     "ONLINE_CERTAINTY_THRESHOLD", 0.8, env="ONLINE_CERTAINTY_THRESHOLD"
 )
 ONLINE_QUERY_DOWNSAMPLE_THRESHOLD = None
-ONLINE_MAX_POINTS = 20000
+ONLINE_MAX_POINTS = dataset_config.get_int(
+    "ONLINE_MAX_POINTS", 20000, env="ONLINE_MAX_POINTS")
+# Prune a query point once it has been continuously occluded/invisible for this many
+# frames (0 = disabled). Occluded points otherwise stay resident on the GPU and are
+# re-predicted every frame, so the active set (and tracking GPU memory) grows without
+# bound as frames accumulate. Pruning keeps the active set ~= #visible-per-frame, which
+# is roughly constant, so tracking memory stays flat in sequence length.
+PRUNE_OCCLUDED_PATIENCE = dataset_config.get_int(
+    "PRUNE_OCCLUDED_PATIENCE", 0, env="PRUNE_OCCLUDED_PATIENCE"
+)
 ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO = 0.5
+# What happens when the active set reaches ONLINE_MAX_POINTS (config STATIC_CAP_MODE):
+#   "stop"            (default = original behaviour) stop adding queries for the rest of the video
+#   "prune_invisible" make room and KEEP adding: randomly drop INVISIBLE points (off-frame or tracker-occluded for
+#                     >= STATIC_CAP_PRUNE_PATIENCE consecutive frames) down to STATIC_CAP_INVISIBLE_KEEP of them (0.2 = keep 20%).
+#                     Visible points are never dropped, so track lengths stay long; if the freed slots do not fit all new
+#                     candidates, only as many as fit are added (adding continues on later frames). Runtime is dominated by
+#                     TAPNext attention over (1024 image + Q query) tokens, so Q is what matters.
+STATIC_CAP_MODE = str(dataset_config._resolve("STATIC_CAP_MODE", "stop", "STATIC_CAP_MODE")).strip().lower()
+STATIC_CAP_PRUNE_PATIENCE = dataset_config.get_int("STATIC_CAP_PRUNE_PATIENCE", 1, env="STATIC_CAP_PRUNE_PATIENCE")
+STATIC_CAP_INVISIBLE_KEEP = dataset_config.get_float("STATIC_CAP_INVISIBLE_KEEP", 0.2, env="STATIC_CAP_INVISIBLE_KEEP")
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 install_script_logger("static_tracking", OUT_DIR)
@@ -185,16 +216,23 @@ def _compute_flow_error_by_transition(
     tracks_xy: np.ndarray,
     occluded_obs: np.ndarray,
     window: float,
-) -> np.ndarray:
+    return_frame_flow: bool = False,
+):
     """Compute per-transition local flow-vector error for each query.
 
     Returns [Q, T] where entry [:, t] measures the difference between a
     query's flow and the median flow of nearby points from t-1 to t. Values
     are NaN when that transition cannot be evaluated.
+
+    With return_frame_flow, also returns m[T]: the median magnitude of the local reference flow over all tracks
+    evaluated at that transition (m_t in the paper), which drives the motion-adaptive threshold
+    theta_t = max(theta_min, kappa * m_t) -- so fast camera motion, which inflates every track's flow, does not
+    trigger spurious deletions, while theta_min keeps the test strict on quasi-static frames.
     """
     Q = tracks_xy.shape[1]
     T = tracks_xy.shape[2]
     flow_error = np.full((Q, T), np.nan, dtype=np.float64)
+    frame_flow = np.full(T, np.nan, dtype=np.float64)          # m_t: median local-reference-flow magnitude
     window = float(max(1e-6, window))
     half = window / 2.0
 
@@ -221,6 +259,7 @@ def _compute_flow_error_by_transition(
             by = int(np.floor(float(p[1]) / window))
             bins.setdefault((bx, by), []).append(i)
 
+        ref_mag = []
         for i, p in enumerate(P):
             bx = int(np.floor(float(p[0]) / window))
             by = int(np.floor(float(p[1]) / window))
@@ -244,7 +283,12 @@ def _compute_flow_error_by_transition(
             neighbor_flow = np.median(flow[cand], axis=0)
             err = float(np.linalg.norm(flow[i] - neighbor_flow))
             flow_error[idx_valid[i], t] = err
+            ref_mag.append(float(np.linalg.norm(neighbor_flow)))
+        if ref_mag:
+            frame_flow[t] = float(np.median(ref_mag))
 
+    if return_frame_flow:
+        return flow_error, frame_flow
     return flow_error
 
 
@@ -404,6 +448,9 @@ def track_online_tapnext(
     max_points: int = 6000,
     downsample_threshold: int | None = None,
     downsample_target_ratio: float = 0.5,
+    cap_mode: str = "stop",
+    cap_prune_patience: int = 1,
+    cap_invisible_keep: float = 0.2,
 ):
     """Online tracking with per-frame query augmentation."""
     if checkpoint.endswith(".npz"):
@@ -425,10 +472,18 @@ def track_online_tapnext(
     all_query_points_abs = query_points_np.astype(np.float64, copy=True)
     init_q = int(all_query_points_abs.shape[1])
     if init_q > max_points:
-        raise ValueError(f"init_q={init_q} exceeds max_points={max_points}")
+        if cap_mode == "prune_invisible":                # cap below the initial grid: random-subsample the initial queries
+            sel = np.sort(np.random.RandomState(0).choice(init_q, size=max_points, replace=False))
+            all_query_points_abs = all_query_points_abs[:, sel, :]
+            print(f"[cap] initial queries {init_q} -> {max_points} (random subsample to ONLINE_MAX_POINTS)")
+            init_q = max_points
+        else:
+            raise ValueError(f"init_q={init_q} exceeds max_points={max_points}")
 
     active_query_indices = np.arange(init_q, dtype=np.int64)
     query_points_t = torch.from_numpy(all_query_points_abs[:, active_query_indices, :]).float().to(device)
+    # consecutive-occluded frame count per ACTIVE query (aligned with active_query_indices)
+    occ_streak = np.zeros(init_q, dtype=np.int64)
 
     state = None
     tracks_per_frame = []
@@ -441,6 +496,23 @@ def track_online_tapnext(
 
     if downsample_threshold is not None and downsample_threshold <= 0:
         downsample_threshold = None
+
+    n_cap_events = 0
+
+    def _shrink_active(keep_local):
+        nonlocal active_query_indices, query_points_t, state, occ_streak, last_tracks_xy, last_occ_np, last_active_query_indices
+        keep_local = np.asarray(keep_local, dtype=np.int64)
+        keep_local_t = torch.as_tensor(keep_local, dtype=torch.long, device=query_points_t.device)
+        active_query_indices = active_query_indices[keep_local]
+        query_points_t = query_points_t.index_select(1, keep_local_t)
+        if state is not None:
+            state = _subset_state_for_queries(state, keep_local, prefix_tokens=num_video_tokens)
+        occ_streak = occ_streak[keep_local]
+        if last_tracks_xy is not None:
+            last_tracks_xy = last_tracks_xy[keep_local]
+        if last_occ_np is not None:
+            last_occ_np = last_occ_np[keep_local]
+        last_active_query_indices = active_query_indices.copy()
 
     for t in tqdm(range(T), desc="Online tracking"):
         query_grew = False
@@ -460,6 +532,7 @@ def track_online_tapnext(
                     keep_local,
                     prefix_tokens=num_video_tokens,
                 )
+                occ_streak = occ_streak[keep_local]
                 if last_tracks_xy is not None:
                     last_tracks_xy = last_tracks_xy[keep_local]
                 if last_occ_np is not None:
@@ -517,12 +590,28 @@ def track_online_tapnext(
                 if new_q is not None and new_q.shape[1] > 0:
                     q_total = int(all_query_points_abs.shape[1])
                     q_free = int(max_points - q_curr)
+                    if cap_mode == "prune_invisible" and q_free < new_q.shape[1] and t > 0:
+                        # make room by dropping a random (1 - keep) share of the INVISIBLE points only; visible ones stay
+                        gone = np.where(occ_streak >= max(1, cap_prune_patience))[0]
+                        n_keep_gone = int(round(cap_invisible_keep * gone.size))
+                        drop = np.random.choice(gone, size=gone.size - n_keep_gone, replace=False) if gone.size > n_keep_gone else np.zeros(0, np.int64)
+                        if drop.size > 0:
+                            keep_mask = np.ones(q_curr, dtype=bool); keep_mask[drop] = False
+                            keep_local = np.where(keep_mask)[0]
+                            _shrink_active(keep_local)
+                            n_cap_events += 1
+                            if n_cap_events <= 3 or n_cap_events % 25 == 0:
+                                print(f"[cap] t={t}: active {q_curr} -> {keep_local.size} (dropped {drop.size} of {gone.size} invisible, "
+                                      f"visible untouched); keep adding queries")
+                            q_curr = int(keep_local.size)
+                            q_free = int(max_points - q_curr)
                     if q_free <= 0:
-                        print("Reached max_points limit; skipping new query additions.")
-                        add_points = False
+                        if cap_mode != "prune_invisible":
+                            print("Reached max_points limit; skipping new query additions.")
+                            add_points = False
                     else:
                         n_add = int(min(q_free, new_q.shape[1]))
-                        if n_add < new_q.shape[1]:
+                        if n_add < new_q.shape[1] and cap_mode != "prune_invisible":
                             print(f"Reached max_points limit; truncated new queries: keeping {n_add}/{new_q.shape[1]}")
                             add_points = False
                         add_np = new_q[:, :n_add, :].astype(np.float64, copy=False)
@@ -540,6 +629,9 @@ def track_online_tapnext(
 
                         query_grew = n_add > 0
                         n_add_effective = n_add
+                        occ_streak = np.concatenate(
+                            [occ_streak, np.zeros(n_add, dtype=np.int64)]
+                        )
 
         if query_grew and state is not None:
             # Keep recurrent state alive: update query points and pad block caches
@@ -571,12 +663,53 @@ def track_online_tapnext(
 
         occluded_np = occluded.detach().cpu().numpy().astype(bool).reshape(-1)
 
+        # A point whose predicted position has left the 256x256 tracking frame is NOT visible,
+        # even when TAPNext still flags it visible (it keeps hallucinating off-screen positions
+        # as the camera pans). Mark it occluded in the OUTPUT so no bogus off-frame 2D obs
+        # reaches the solver.
+        _m = 2.0
+        out_of_frame = ((tracks_xy[:, 0] < _m) | (tracks_xy[:, 0] > 255.0 - _m)
+                        | (tracks_xy[:, 1] < _m) | (tracks_xy[:, 1] > 255.0 - _m))
+        occluded_np |= out_of_frame
+
+        # RETIREMENT visibility (separate from the strict, certainty-gated output occlusion):
+        # a point is "present" if it is IN frame AND the tracker itself predicts it visible
+        # (raw logit, NOT certainty-gated). Retirement must never drop a currently-present
+        # point -- a visible point on the repetitive calligraphy can fail the certainty gate,
+        # but it is still on the object and must keep its query slot. The streak advances ONLY
+        # for genuinely-gone points (off-frame or tracker-occluded) and resets for present ones.
+        raw_visible = (visible_logits.detach().cpu() > 0).squeeze(0).squeeze(0).numpy().astype(bool).reshape(-1)
+        present = raw_visible & (~out_of_frame)
+
         tracks_per_frame.append(tracks_xy)
         occ_per_frame.append(occluded_np)
         active_indices_per_frame.append(active_query_indices.copy())
         last_tracks_xy = tracks_xy.copy()
         last_occ_np = occluded_np.copy()
         last_active_query_indices = active_query_indices.copy()
+
+        # Prune points that have been occluded/invisible for too long, so the active
+        # set (and tracking GPU memory) stays ~= #visible-per-frame instead of growing
+        # without bound. This frame's observations are already recorded above; pruning
+        # only affects FUTURE frames. occ_streak stays aligned with the active set.
+        occ_streak[~present] += 1      # advance only for genuinely-gone (off-frame / occluded) points
+        occ_streak[present] = 0        # any point present in the frame is never retired
+        if PRUNE_OCCLUDED_PATIENCE > 0 and (t + 1 < T):
+            keep_local = np.where(occ_streak < PRUNE_OCCLUDED_PATIENCE)[0]
+            if 0 < keep_local.size < active_query_indices.shape[0]:
+                keep_local_t = torch.as_tensor(
+                    keep_local, dtype=torch.long, device=query_points_t.device
+                )
+                active_query_indices = active_query_indices[keep_local]
+                query_points_t = query_points_t.index_select(1, keep_local_t)
+                if state is not None:
+                    state = _subset_state_for_queries(
+                        state, keep_local, prefix_tokens=num_video_tokens
+                    )
+                occ_streak = occ_streak[keep_local]
+                last_tracks_xy = last_tracks_xy[keep_local]
+                last_occ_np = last_occ_np[keep_local]
+                last_active_query_indices = active_query_indices.copy()
 
     Q_final = int(all_query_points_abs.shape[1])
     tracks_xy_full = np.full((1, Q_final, T, 2), np.nan, dtype=np.float32)
@@ -655,7 +788,12 @@ tracks_xy_256, occluded = track_online_tapnext(
     max_points=ONLINE_MAX_POINTS,
     downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
     downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
+    cap_mode=STATIC_CAP_MODE,
+    cap_prune_patience=STATIC_CAP_PRUNE_PATIENCE,
+    cap_invisible_keep=STATIC_CAP_INVISIBLE_KEEP,
 )
+print(f"[online] cap_mode={STATIC_CAP_MODE} max_points={ONLINE_MAX_POINTS} cap_prune_patience={STATIC_CAP_PRUNE_PATIENCE} "
+      f"invisible_keep={STATIC_CAP_INVISIBLE_KEEP} resample_grid={ONLINE_RESAMPLE_GRID} resample_radius={ONLINE_RESAMPLE_RADIUS}")
 
 
 # Map tracks from 256-grid space back to original image space
@@ -709,15 +847,24 @@ if MOVE_DELETE_ENABLED:
     window = float(max(1e-6, MOVE_WINDOW_SIZE))
     flow_error_threshold = float(max(0.0, MOVE_DELETE_FLOW_ERROR_THRESHOLD))
     n_trimmed_obs = 0
-    flow_error_by_transition = _compute_flow_error_by_transition(
+    flow_error_by_transition, frame_flow = _compute_flow_error_by_transition(
         tracks_xy[:, :, :T_md, :],
         occluded[:, :, :T_md],
         window=window,
+        return_frame_flow=True,
     )
-    move_delete_query_mask = np.any(
-        np.isfinite(flow_error_by_transition) & (flow_error_by_transition > flow_error_threshold),
-        axis=1,
-    )
+    # theta_t = max(theta_min, kappa * m_t)  (per-transition, broadcast over tracks)
+    kappa = float(max(0.0, MOVE_DELETE_FLOW_KAPPA))
+    theta_t = np.full(T_md, flow_error_threshold, dtype=np.float64)
+    if kappa > 0:
+        adaptive = kappa * np.nan_to_num(frame_flow, nan=0.0)
+        theta_t = np.maximum(theta_t, adaptive)
+    n_relaxed = int(np.sum(theta_t > flow_error_threshold + 1e-9))
+    print(f"[move-delete] adaptive threshold: theta_min={flow_error_threshold:.1f}px kappa={kappa:g}; "
+          f"median flow m_t median={np.nanmedian(frame_flow):.2f}px max={np.nanmax(frame_flow) if np.isfinite(frame_flow).any() else float('nan'):.2f}px; "
+          f"{n_relaxed}/{T_md} transitions relaxed above the floor (max theta_t={theta_t.max():.1f}px)")
+    bad_all = np.isfinite(flow_error_by_transition) & (flow_error_by_transition > theta_t[None, :])
+    move_delete_query_mask = np.any(bad_all, axis=1)
     n_move_delete = int(np.sum(move_delete_query_mask))
     if n_move_delete > 0:
         for q_idx in np.where(move_delete_query_mask)[0]:
@@ -730,10 +877,7 @@ if MOVE_DELETE_ENABLED:
                 continue
 
             bad_transition = np.zeros(T_md, dtype=bool)
-            bad_transition[1:] = (
-                np.isfinite(flow_error_by_transition[q_idx, 1:T_md])
-                & (flow_error_by_transition[q_idx, 1:T_md] > flow_error_threshold)
-            )
+            bad_transition[1:] = bad_all[q_idx, 1:T_md]
             keep_obs = _select_longest_stable_segment(
                 valid_obs,
                 bad_transition,
@@ -747,7 +891,7 @@ if MOVE_DELETE_ENABLED:
     print(
         f"[move-delete] flagged {n_move_delete} queries; "
         f"trimmed {n_trimmed_obs} observations "
-        f"(flow error > {flow_error_threshold:.3f}px, window={window:.1f}px)"
+        f"(flow error > theta_t = max({flow_error_threshold:.1f}px, {kappa:g}*m_t), window={window:.1f}px)"
     )
 
 occluded_viz = occluded.copy()

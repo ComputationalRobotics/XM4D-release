@@ -95,6 +95,55 @@ def _as_rotation_array(track_dict: Dict[int, np.ndarray], T: int) -> Tuple[np.nd
     return tracks, np.array(gids, dtype=np.int64)
 
 
+def _filter_within_body_outlier_nodes(
+    edg_tracks: np.ndarray, edg_gids: np.ndarray, edg_rots: np.ndarray, outlier_factor: float = 4.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """FINAL safety net: remove any EDG node whose reconstructed position (after build_edg's own
+    topology-time checks AND the EDG_test_fast/complete_edg_table per-segment solve, which can still
+    introduce a positional outlier that wasn't visible at topology-build time) is still an extreme
+    outlier relative to its OWN physical body's other nodes. Loads person_id from edg_topology.npz
+    (same track-index space as the results_all.npz gids); no-op if that file/key is missing (e.g. an
+    older topology) or the scene has a single body.
+
+    A node is deleted if its canonical position (mean over frames where finite) is more than
+    `outlier_factor` x its own body's median inter-node spacing from that body's median position --
+    this catches genuine per-track placement defects (e.g. an occlusion-induced mis-association) that
+    are NOT a cross-body confound (that is prevented structurally further upstream in build_edg.py)."""
+    if edg_gids.size < 3:
+        return edg_tracks, edg_gids, edg_rots
+    topo_path = Path(utils.definitions.output_dir) / "edg_topology.npz"
+    if not topo_path.exists():
+        return edg_tracks, edg_gids, edg_rots
+    topo = np.load(topo_path, allow_pickle=True)
+    if "person_id" not in topo.files:
+        return edg_tracks, edg_gids, edg_rots
+    person_id = topo["person_id"]
+    if int(person_id.max(initial=-1)) <= 0:                  # single-body scene -> no-op
+        return edg_tracks, edg_gids, edg_rots
+    valid_gid = (edg_gids >= 0) & (edg_gids < person_id.shape[0])
+    node_body = np.where(valid_gid, person_id[np.clip(edg_gids, 0, person_id.shape[0] - 1)], -1)
+    canon = np.nanmean(np.where(np.isfinite(edg_tracks), edg_tracks, np.nan), axis=1)  # (N,3)
+    keep = np.ones(edg_gids.shape[0], dtype=bool)
+    for b in sorted(int(x) for x in set(node_body.tolist()) if x >= 0):
+        sel = np.where(node_body == b)[0]
+        fin = sel[np.isfinite(canon[sel]).all(1)]
+        if fin.size < 3:
+            continue
+        med = np.median(canon[fin], axis=0)
+        d = np.linalg.norm(canon[fin] - med[None], axis=1)
+        typical = float(np.median(d))
+        if typical <= 1e-9:
+            continue
+        keep[fin[d > float(outlier_factor) * typical]] = False
+    n_removed = int((~keep).sum())
+    if n_removed:
+        print(f"[EDG] within-body outlier deletion (post-solve): removed {n_removed}/{edg_gids.shape[0]} "
+              f"nodes whose final reconstructed position is >{outlier_factor:g}x their own body's typical "
+              f"node spacing (gids={sorted(int(g) for g in edg_gids[~keep])})")
+        edg_tracks, edg_gids, edg_rots = edg_tracks[keep], edg_gids[keep], edg_rots[keep]
+    return edg_tracks, edg_gids, edg_rots
+
+
 def _compute_knn_weights(edg_pos: np.ndarray, query: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     """Return (indices, weights) for KNN of query to edg_pos."""
     if edg_pos.shape[0] == 0:
@@ -384,7 +433,8 @@ def _save_dyn_density_2d(output_dir, knn, w, rel, er, ero, R_raw, t_raw, K_all, 
 
 def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_raw, K_all,
                                        image_paths, er, ero, node_ids, w2t, target_frame,
-                                       k_neighbors, target_points, stride=2, sigma_frac=1.5):
+                                       k_neighbors, target_points, stride=2, sigma_frac=1.5,
+                                       frame_scales=None):
     """Densely lift dynamic-region depth pixels from EVERY frame to 3D, EDG-bind each at ITS OWN frame
     (rest frame = the frame it was lifted from: rel = R_m(t)^T (X - X_m(t))), colour from the image, then
     ADAPTIVE-DENSITY voxel-downsample (uniform 3D density) to ~target_points. Returns per-point arrays in
@@ -411,6 +461,10 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
         if not ok.any():
             continue
         yy, xx, z = yy[ok], xx[ok], z[ok]
+        if frame_scales is not None and t < len(frame_scales) and np.isfinite(frame_scales[t]):
+            z = z * float(frame_scales[t])         # per-frame DA3 scale: world = R@(s*Xc)+t == (s*R)@Xc+t,
+                                                   # matching the EDG/tracks lift (s*R). Without this the
+                                                   # dyn cloud is off by s_t vs the EDG (camel s~0.62!).
         K_t = np.asarray(K_all[t], np.float64)
         fx, fy, cx, cy = K_t[0, 0], K_t[1, 1], K_t[0, 2], K_t[1, 2]
         Xc = np.stack([(xx - cx) / fx * z, (yy - cy) / fy * z, z], 1)      # camera
@@ -498,7 +552,7 @@ def _flyaway_reject(skin_fn, struct, T, k=8, std_ratio=3.0, frac=0.3, n_sample=2
 
 
 def _depth_consistency_reject(sp, skin_fn, depth_maps, R_raw, t_raw, K_all,
-                              good_mask, tol=0.1, frac=0.3, min_check=5):
+                              good_mask, tol=0.1, frac=0.3, min_check=5, frame_scales=None):
     """Reject dynamic points that float off the observed surface: warp each point to every frame,
     project into that frame's solver camera, sample the depth map at the projected pixel, and compare
     the point's camera-space depth to the observed depth (relative error > `tol`). A point whose depth
@@ -528,6 +582,8 @@ def _depth_consistency_reject(sp, skin_fn, depth_maps, R_raw, t_raw, K_all,
             continue
         dv = np.full(P, np.nan)
         dv[inb] = dm[vi[inb], ui[inb]]
+        if frame_scales is not None and t < len(frame_scales) and np.isfinite(frame_scales[t]):
+            dv = dv * float(frame_scales[t])       # scale observed depth into the (s*R) world gauge
         valid = inb & np.isfinite(dv) & (dv > 1e-6)
         if not valid.any():
             continue
@@ -694,6 +750,7 @@ def _build_edg_good_dynamic_points(
     lift_per_frame: bool = False,
     flyaway_std: float = 3.0,
     flyaway_frac: float = 0.3,
+    frame_scales=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Dynamic cloud from the EDG-skinned photometrically-GOOD tracks (edg_completed.npz).
 
@@ -744,7 +801,8 @@ def _build_edg_good_dynamic_points(
             depth_maps=depth_maps, dynamic_masks=dynamic_masks, R_raw=R_raw, t_raw=t_raw, K_all=K_all,
             image_paths=image_paths, er=er, ero=ero, node_ids=node_ids, w2t=w2t,
             target_frame=int(target_frame), k_neighbors=K,
-            target_points=int(dyn_min_points) if int(dyn_min_points) > 0 else 50000)
+            target_points=int(dyn_min_points) if int(dyn_min_points) > 0 else 50000,
+            frame_scales=frame_scales)
         if xyzL.shape[0] == 0:
             return (np.zeros((0, 3)), np.zeros((0, 3), np.uint8),
                     np.zeros((0, K), np.int64), np.zeros((0, K)), np.zeros((0, K, 3)))
@@ -763,7 +821,8 @@ def _build_edg_good_dynamic_points(
                 return np.einsum("nk,nkd->nd", ls["w"], Xm + np.einsum("nkij,nkj->nki", Rm, ls["rel"]))
             reject, _vf, _nc = _depth_consistency_reject(
                 lifted, _lifted_skin, depth_maps, R_raw, t_raw, K_all,
-                np.ones(xyzL.shape[0], bool), tol=float(depth_reject_tol), frac=float(depth_reject_frac))
+                np.ones(xyzL.shape[0], bool), tol=float(depth_reject_tol), frac=float(depth_reject_frac),
+                frame_scales=frame_scales)
             n_rej = int(reject.sum())
             print(f"[dyn-lift] depth-reject: {n_rej}/{xyzL.shape[0]} lifted points floated off surface "
                   f"(>{100*float(depth_reject_frac):.0f}% frames) -> dropped; kept {xyzL.shape[0]-n_rej}.")
@@ -823,7 +882,7 @@ def _build_edg_good_dynamic_points(
             and R_raw is not None and t_raw is not None and K_all is not None):
         reject, viol_frac, n_check = _depth_consistency_reject(
             sp, _skin_dyn_frame, depth_maps, R_raw, t_raw, K_all, good,
-            tol=float(depth_reject_tol), frac=float(depth_reject_frac))
+            tol=float(depth_reject_tol), frac=float(depth_reject_frac), frame_scales=frame_scales)
         n_rej = int((good & reject).sum())
         print(f"[edg-good] depth-reject: {n_rej}/{int(good.sum())} good points violate depth in "
               f">{100*float(depth_reject_frac):.0f}% of checkable frames (rel-tol {depth_reject_tol:g}) -> dropped.")
@@ -1769,6 +1828,7 @@ def prepare_4dgs_dataset(
     edg_rots, edg_rot_gids = _as_rotation_array(edg_rot_dict.item(), len(next(iter(edg_rot_dict.item().values()))))
     if not np.array_equal(edg_gids, edg_rot_gids):
         raise RuntimeError("Mismatch between edg_reconstruct and edg_rotation node ordering.")
+    edg_tracks, edg_gids, edg_rots = _filter_within_body_outlier_nodes(edg_tracks, edg_gids, edg_rots)
     T = edg_tracks.shape[1] if edg_tracks.shape[0] > 0 else dyn_tracks.shape[1]
 
     if target_frame < 0 or target_frame >= T:
@@ -1978,7 +2038,7 @@ def prepare_4dgs_dataset(
         if bool(dyn_lift_per_frame) and depth_maps is not None:
             try:
                 _dyn_masks_for_lift = _load_dynamic_masks_for_depth(
-                    mask_dir=Path(utils.definitions.rootpath) / "masks",
+                    mask_dir=Path(utils.definitions.mask_dir),
                     pattern=utils.definitions.mask_pattern,
                     t_expected=depth_maps.shape[0],
                     target_hw=(depth_maps.shape[1], depth_maps.shape[2]))
@@ -2007,6 +2067,7 @@ def prepare_4dgs_dataset(
             lift_per_frame=bool(dyn_lift_per_frame),
             flyaway_std=float(dyn_flyaway_std),
             flyaway_frac=float(dyn_flyaway_frac),
+            frame_scales=da3_frame_scales if depth_source_norm == "da3" else None,
         )
         if isinstance(dyn_xyz_target, np.ndarray) and dyn_xyz_target.shape[0] > 0:
             canonical_pts.append(dyn_xyz_target)

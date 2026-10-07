@@ -4,28 +4,52 @@
   "ONLINE_RESAMPLE_GRID": 40,
   "ONLINE_RESAMPLE_RADIUS": 2.0,
   "ONLINE_CERTAINTY_THRESHOLD": 0.8,
-
   "STATIC_TRACK_DEPTH_MAX": 100.0,
   "STATIC_TRACK_DEPTH_GRAD_MAX": 1.0,
-
   "PENALTY_T_MULT": 0.0,
   "PENALTY_T_CERES_REL_MULT": 3.0,
   "PENALTY_T_CERES_ACC_MULT": 0.25,
-
   "USE_CERES_REGULARIZATION": false,
   "CERES_REGULARIZATION_THRESHOLD": 0.01,
-
   "CERES_OPTIMIZE_INTRINSICS": false,
   "CERES_INTRINSIC_SCALE_MIN": 0.25,
   "CERES_INTRINSIC_SCALE_MAX": 4.0,
-  "CERES_FUNCTION_TOLERANCE": 1e-5,
+  "CERES_FUNCTION_TOLERANCE": 1e-05,
   "CERES_MAX_SOLVE_TIME": 20,
-
   "DA3_ASPECT_CAP": 0.0,
   "DA3_PROCESS_RES": 504,
   "DA3_SINGLE_INTRINSIC": true,
-
   "LAMBDA": 5.0,
-
-  "USE_DA3_INTRINSICS": true
+  "EDG_MIN_FRAMES": 4,
+  "EDG_EDGE_THRESH_MULT": 10.0,
+  "EDG_EDGE_DIST_QUANTILE": 0.9,
+  "EDG_MIN_OVERLAP_FRAMES": 2,
+  "edg_tracks_lr": 0.0001,
+  "edg_rots_lr": 0.0001,
+  "edg_weights_lr": 0.0001,
+  "edg_rel_lr": 0.0001,
+  "edg_lr_decay_steps": [
+    15000
+  ],
+  "edg_lr_decay_gamma": 0.1,
+  "edg_arap_lambda": 0.001,
+  "edg_smooth_lambda": 0.01,
+  "edg_skinning_reg_lambda": 0.001,
+  "edg_rel_delta_max": 0.03,
+  "seg_dyn_lambda": 0.3,
+  "dyn_flat_color": false,
+  "dyn_outside_lambda": 0.3,
+  "static_only_region_lambda": 0.3,
+  "means_lr": 0.0003,
+  "pose_opt": true,
+  "depth_lambda": 0.0003,
+  "app_opt": true,
+  "app_opt_reg": 0.003,
+  "USE_DA3_INTRINSICS": false,
+  "EDG_MAX_EDGE_FACTOR": 1.0,
+  "EDG_MIN_MAX_RATIO": 0.5,
+  "EDG_MAX_NODES": 200,
+  "EDG_EDGE_HOPS": 4,
+  "DYN_EDG_MAX_DIST_FACTOR": 3.0,
+  "MOVE_DELETE_FLOW_KAPPA": 0.0
 }

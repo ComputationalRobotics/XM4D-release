@@ -52,15 +52,18 @@ import numpy as np
 import torch
 
 import utils.definitions
+from utils import dataset_config
 from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
 
 
 # --------------------------------------------------------------------------------------- data loading
-def load_inputs(merged, smoothed=True, edges_npz=None, table_path=None):
+def load_inputs(merged, smoothed=True, edges_npz=None, table_path=None, tracks=None):
     """Rebuild glob/valid (world-lifted observations, no XM needed) + topology + the fast-solver table."""
     root = Path(utils.definitions.rootpath)
     out_dir = Path(utils.definitions.output_dir)
-    if merged:
+    if tracks:                                                        # explicit file wins (match the solve)
+        tracks_path = Path(tracks) if "/" in tracks else out_dir / tracks
+    elif merged:
         name = "tracks_dynamic_merged_smoothed.npz" if smoothed else "tracks_dynamic_merged.npz"
         tracks_path = out_dir / name                                  # smoothed holds the 3D (merge is 2D-only)
         if smoothed and not tracks_path.exists():
@@ -70,6 +73,11 @@ def load_inputs(merged, smoothed=True, edges_npz=None, table_path=None):
     else:
         tracks_path = Path(utils.definitions.tracks_dynamics_path)
     data = np.load(str(tracks_path), allow_pickle=True)
+    dv = data["depth_variant"].item() if "depth_variant" in data.files else None
+    if dv is not None and dv != utils.definitions.depth_variant:
+        print(f"[depth] *** WARNING: {Path(str(tracks_path)).name} was lifted with XM_DEPTH_VARIANT={dv} but this "
+              f"run uses {utils.definitions.depth_variant} -- 3D will NOT match. Set XM_DEPTH_VARIANT={dv} "
+              f"or re-lift the tracks. ***")
     tracks_xyz = data["tracks_xyz"]                                   # (1,Q,T,3)
     occluded = data["occluded"]                                      # (1,Q,T)
     dyn_mask = data["dynamic_obs_mask"]                              # (Q,T)
@@ -332,17 +340,34 @@ def _slerp(Ra, Rb, u):
     return Ra @ _so3_exp_np(u * _so3_log_np(Ra.T @ Rb))
 
 
-def init_dense(table, rotation, filled, rot_filled):
+def init_dense(table, rotation, filled, rot_filled, glob=None, node_ids=None, valid=None):
     """Dense starting point: linear interp for c, geodesic interp for R, between nearest observed cells;
-    endpoints held constant. Interpolated cells are NOT anchored (their init prior is off elsewhere)."""
+    endpoints held constant. Interpolated cells are NOT anchored (their init prior is off elsewhere).
+    A node with NO filled table cell (EDG_test_fast's per-segment solve produced nothing usable for it)
+    falls back to ITS OWN raw world-lifted observation (glob at its own track id, wherever valid) instead
+    of silently defaulting to the world origin -- an all-zero init is far from every real node, so it
+    blows up L_p2d/L_arap and dominates the total loss at iteration 0."""
     M, T, _ = table.shape
     c = np.zeros((M, T, 3), dtype=np.float64)
+    n_obs_seed = n_still_empty = 0
     for m in range(M):
         f = np.where(filled[m])[0]
         if f.size == 0:
+            vf = np.where(valid[node_ids[m]])[0] if (glob is not None and valid is not None) else np.array([])
+            if vf.size == 0:
+                n_still_empty += 1
+                continue
+            for d in range(3):
+                c[m, :, d] = np.interp(np.arange(T), vf, glob[node_ids[m], vf, d])
+            n_obs_seed += 1
             continue
         for d in range(3):
             c[m, :, d] = np.interp(np.arange(T), f, table[m, f, d])
+    if n_obs_seed or n_still_empty:
+        print(f"[init] {n_obs_seed} nodes had NO filled table cell -- seeded from their own raw "
+              f"world-lifted observation instead of the origin"
+              + (f"; {n_still_empty} nodes have NO observation at all (left at the origin)"
+                 if n_still_empty else ""))
     R = np.tile(np.eye(3), (M, T, 1, 1))
     for m in range(M):
         f = np.where(rot_filled[m])[0]
@@ -533,7 +558,8 @@ def complete(D, args, device):
     table, rotation = D["table"], D["rotation"]
     filled, rot_filled, weight = D["filled"], D["rot_filled"], D["weight"]
 
-    c_init, R_init = init_dense(table, rotation, filled, rot_filled)
+    c_init, R_init = init_dense(table, rotation, filled, rot_filled,
+                                glob=D["glob"], node_ids=D["edg_nodes"], valid=D["valid"])
     scene = robustscale(np.linalg.norm(c_init[filled] - np.median(c_init[filled], 0), axis=1), 1e-6)
 
     # ---- fixed skinning + observation pairs
@@ -584,6 +610,16 @@ def complete(D, args, device):
         r_dyn = (project(torch.as_tensor(phi_init, dtype=torch.float32, device=device), OB["obs_t"])
                  - OB["obs_xy"]).norm(dim=-1).cpu().numpy()
         sig["p2d"] = robustscale(np.concatenate([r_node, r_dyn]), 0.5)
+        if args.p2d_norm_diag > 0:
+            # NORMALISED 2D loss: residuals expressed as a fraction of the image diagonal and whitened by the FIXED
+            # relative sigma --p2d-norm-diag (resolution-independent, not data-dependent). Equivalent to a pixel
+            # sigma of p2d_norm_diag * diagonal.
+            import cv2, glob as _glob
+            _ip = sorted(_glob.glob(str(Path(utils.definitions.video_dir) / utils.definitions.image_pattern)))
+            _H, _W = cv2.imread(_ip[0]).shape[:2]
+            sig["p2d"] = args.p2d_norm_diag * float(np.hypot(_H, _W))
+            print(f"[2d] normalised 2D loss: residual / image diagonal ({_W}x{_H}, diag {np.hypot(_H, _W):.0f}px), "
+                  f"relative sigma {args.p2d_norm_diag:g} -> {sig['p2d']:.2f}px")
         print(f"[2d] init reprojection error: node median={np.median(r_node):.2f}px "
               f"dyn median={np.median(r_dyn):.2f}px  -> sigma_2d={sig['p2d']:.2f}px")
     print("[scales] " + "  ".join(f"{k}={v:.4g}" for k, v in sig.items()) + f"  (scene~{scene:.4g})")
@@ -607,8 +643,11 @@ def complete(D, args, device):
         # (depth-free -- pins the image-plane drift that the depth-noisy 3D lift cannot see)
         s_d2 = (project(phi, OB["obs_t"]) - OB["obs_xy"]).pow(2).sum(-1) / (sig["p2d"] ** 2)
         s_n2 = (project(c[n2d["m"], n2d["t"]], n2d["t"]) - n2d["xy"]).pow(2).sum(-1) / (sig["p2d"] ** 2)
-        L["p2d"] = (huber(s_d2, args.huber_delta).sum() + huber(s_n2, args.huber_delta).sum()) \
-            / max(2 * (OB["O"] + int(n2d["m"].numel())), 1)
+        # --p2d-node-mult: per-observation weight of a NODE 2D residual relative to a dyn one. The nodes are
+        # outnumbered ~50:1 in this term, so at 1.0 L_init+ARAP can drag them off their own observations.
+        wn = float(args.p2d_node_mult)
+        L["p2d"] = (huber(s_d2, args.huber_delta).sum() + wn * huber(s_n2, args.huber_delta).sum()) \
+            / max(2.0 * (OB["O"] + wn * int(n2d["m"].numel())), 1.0)
         # L_arap over gaps (robust Huber on each coord/length residual)
         d = c[en] - c[em]                                            # [E,T,3]
         Rm = R[em]                                                   # [E,T,3,3]
@@ -627,11 +666,14 @@ def complete(D, args, device):
         # temporal
         dc = c[:, 1:] - c[:, :-1]
         om = so3_log(R[:, 1:] @ R[:, :-1].transpose(-1, -2))          # [M,T-1,3]
-        L["vel"] = (dc.pow(2).sum() / (sig["vc"] ** 2) + om.pow(2).sum() / (sig["vR"] ** 2)) \
+        # rot_mult scales ONLY the rotation half of the temporal terms, so node orientations can be
+        # smoothed harder without over-smoothing the positions (which the 2D/obs terms constrain well).
+        rm = float(args.rot_smooth_mult)
+        L["vel"] = (dc.pow(2).sum() / (sig["vc"] ** 2) + rm * om.pow(2).sum() / (sig["vR"] ** 2)) \
             / max((M * (T - 1)) * 6, 1)
         acc = c[:, 2:] - 2 * c[:, 1:-1] + c[:, :-2]
         oma = om[:, 1:] - om[:, :-1]
-        L["acc"] = (acc.pow(2).sum() / (sig["ac"] ** 2) + oma.pow(2).sum() / (sig["aR"] ** 2)) \
+        L["acc"] = (acc.pow(2).sum() / (sig["ac"] ** 2) + rm * oma.pow(2).sum() / (sig["aR"] ** 2)) \
             / max((M * (T - 2)) * 6, 1)
         total = sum(lam[k] * L[k] for k in L)
         return total, L
@@ -747,23 +789,38 @@ def main():
     ap.add_argument("--merged", action="store_true", help="use the merged tracks (match EDG_test_fast --merged)")
     ap.add_argument("--smoothed", action=argparse.BooleanOptionalAction, default=True,
                     help="use optimize_dynamic_tracks' output (holds the 3D; raw merged is 2D-only now). Default on.")
+    ap.add_argument("--tracks", default="", help="explicit tracks npz (name under outputs/ or a full path); "
+                                                 "overrides --merged/--smoothed. Must be the SAME file "
+                                                 "EDG_test_fast.py solved on.")
     ap.add_argument("--edges-npz", default=None,
                     help="optionally override the EDG edges with a rebuilt set "
                          "(outputs/edg_edges_rebuilt.npz from rebuild_edg_edges.py); default = edg_topology.npz")
     ap.add_argument("--iters", type=int, default=1000)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--gaps", type=int, nargs="+", default=[1], help="ARAP temporal gaps D (e.g. 1 2 4)")
-    ap.add_argument("--lambda-obs", type=float, default=1.0)
-    ap.add_argument("--lambda-arap", type=float, default=1.0)
-    ap.add_argument("--lambda-vel", type=float, default=0.1)
-    ap.add_argument("--lambda-acc", type=float, default=0.0)
-    ap.add_argument("--lambda-init", type=float, default=10.0)
-    ap.add_argument("--lambda-2d", type=float, default=1.0,
+    ap.add_argument("--lambda-obs", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_OBS", 1.0))
+    ap.add_argument("--lambda-arap", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_ARAP", 1.0))
+    ap.add_argument("--lambda-vel", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_VEL", 0.1))
+    ap.add_argument("--lambda-acc", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_ACC", 0.0))
+    ap.add_argument("--lambda-init", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_INIT", 10.0))
+    ap.add_argument("--lambda-2d", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_2D", 1.0),
                     help="2D reprojection loss (dyn warped points + EDG nodes vs their pixel tracks); 0 = off")
+    ap.add_argument("--p2d-node-mult", type=float,
+                    default=dataset_config.get_float("EDG_COMPLETE_P2D_NODE_MULT", 1.0),
+                    help="relative per-observation weight of the EDG nodes' own 2D residuals inside L_p2d "
+                         "(dyn observations stay at 1). (config EDG_COMPLETE_P2D_NODE_MULT)")
+    ap.add_argument("--p2d-norm-diag", type=float, default=dataset_config.get_float("EDG_COMPLETE_P2D_NORM_DIAG", 0.0),
+                    help="normalise the 2D loss: whiten pixel residuals by a FIXED sigma of this fraction of the image "
+                         "diagonal (e.g. 0.005 = 3px on 480x360) instead of the data-driven robust scale; 0 = off")
+    ap.add_argument("--rot-smooth-mult", type=float,
+                    default=dataset_config.get_float("EDG_COMPLETE_ROT_SMOOTH_MULT", 1.0),
+                    help="multiply ONLY the rotation part of L_vel and L_acc by this. Raise it when the "
+                         "solved node orientations oscillate (most node-frames are hole-filled, so the "
+                         "rotations are weakly constrained by data).")
     ap.add_argument("--eta-coord", type=float, default=1.0)
     ap.add_argument("--eta-len", type=float, default=0.1)
     ap.add_argument("--sig-rot", type=float, default=0.1, help="rotation residual scale floor (radians)")
-    ap.add_argument("--huber-delta", type=float, default=2.0,
+    ap.add_argument("--huber-delta", type=float, default=dataset_config.get_float("EDG_COMPLETE_HUBER_DELTA", 2.0),
                     help="Huber transition for L_obs/L_arap, in whitened residual std-devs (PDF: 1.5-2.5)")
     ap.add_argument("--smooth-win", type=int, default=9,
                     help="pre-solve clean, filter 1: smoothing window for the per-cell smooth-error deletion "
@@ -782,9 +839,12 @@ def main():
                     help="AFTER solving, delete a WHOLE track whose solved trajectory fails the same 2D "
                          "criterion (far from observation / outside mask) in more than this fraction of its "
                          "evaluable frames (0 disables)")
-    ap.add_argument("--bad-node-frac", type=float, default=0.3,
+    ap.add_argument("--bad-node-frac", type=float,
+                    default=dataset_config.get_float("EDG_COMPLETE_BAD_NODE_FRAC", 0.0),
                     help="AFTER solving, DELETE the BAD ('red') EDG nodes -- nodes whose skinning-weighted "
-                         "fraction of render-colour-OUTLIER dynamic points is >= this (the same "
+                         "fraction of render-colour-OUTLIER dynamic points is >= this; 0 (the DEFAULT) "
+                         "disables the deletion entirely, since it also removes low-motion nodes such as "
+                         "the pivot of a rotating object, whose colours change fastest. (the same "
                          "classification as visualize_edg_filtered_open3d --edg-quality) -- and REASSIGN "
                          "their dynamic points to the surviving nodes. 0 disables")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -802,7 +862,7 @@ def main():
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     print(f"[device] {device}")
-    D = load_inputs(args.merged, args.smoothed, args.edges_npz, args.table)
+    D = load_inputs(args.merged, args.smoothed, args.edges_npz, args.table, args.tracks)
     masks = None if args.no_mask_del else _load_dyn_mask_images(D["T"], args.mask_dilate_px)
     clean_table(D, args, masks)                                       # delete bad cells, THEN solve
     c_fin, R_fin, tracks = complete(D, args, torch.device(device))

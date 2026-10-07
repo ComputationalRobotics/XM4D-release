@@ -106,6 +106,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-edg-warp", action="store_true")
     parser.add_argument("--eval-novel", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--novel-fixed-cam", type=int, default=-1,
+                        help="If >=0, render EVERY novel view from this est TRAINING camera "
+                             "(pose-refined), instead of the Sim3-placed GT camera. Use when the "
+                             "novel viewpoint coincides with a training camera (e.g. NVIDIA's fixed "
+                             "first-camera v000 protocol, --novel-fixed-cam 0): only TIME is novel, "
+                             "so the camera is known and this avoids Sim3/TTO misregistration drift.")
     parser.add_argument("--novel-dir", type=Path, default=None, help="Default: <scene>/novel")
     parser.add_argument("--save-images", action="store_true", help="Save every per-view GT/render/error preview.")
     parser.add_argument("--json", action="store_true")
@@ -644,6 +650,19 @@ def _evaluate_novel(
     stride = max(1, int(args.frame_stride))
     color_calib = getattr(args, "color_calib", "none")
 
+    # For datasets whose novel viewpoint IS a training camera (NVIDIA fixed-v000: only time is
+    # novel), render every view from that est, pose-refined training camera directly. This avoids
+    # the Sim3/TTO camera drift that a per-view alignment introduces over the static background.
+    fixed_c2w = None
+    fixed_K = None
+    if int(getattr(args, "novel_fixed_cam", -1)) >= 0:
+        fc = int(args.novel_fixed_cam)
+        c2w_fc, K_fc, _, _, _ = _load_camera_and_gt_intrinsics(scene_dir, fc, args.camera_source)
+        fixed_c2w = _apply_pose_adjust(c2w_fc, fc, pose_adjust, device)
+        # Render with the TRAINING intrinsics of that camera (the K the Gaussians were fit to),
+        # not the GT-rig K: v000_t == frame fc's training image, which was trained at this K.
+        fixed_K = np.asarray(K_fc, dtype=np.float64)
+
     # Phase 1: render + mask every novel view, keep pred/gt/alpha/valid for calibration.
     collected: list[dict[str, Any]] = []
     for rec_idx, rec in enumerate(records):
@@ -659,12 +678,17 @@ def _evaluate_novel(
         # Use each test camera's OWN intrinsics (novel/cameras/<stem>.json); only fall back to
         # the training base-frame K if the per-view camera json is missing. Rendering with the
         # training K misregisters the render over the wide-baseline static bg and deflates mPSNR.
-        K = _load_novel_intrinsics(novel_dir, rec["image_name"], gt.shape[:2])
-        if K is None:
-            base_key = _gt_key_for_frame(scene_dir, base_frame)
-            base_image = _read_rgb(_find_image_path(scene_dir, base_key))
-            K = _scale_K_for_size(_load_gt_intrinsics(scene_dir, base_key), base_image.shape[:2], gt.shape[:2])
-        c2w_est = _transform_gt_c2w_to_est(rec["c2w_gt"], s, R_align, t_align)
+        if fixed_c2w is not None:
+            src_hw = (int(round(2 * fixed_K[1, 2])), int(round(2 * fixed_K[0, 2])))  # (H,W) from cx,cy
+            K = _scale_K_for_size(fixed_K, src_hw, gt.shape[:2])
+            c2w_est = fixed_c2w
+        else:
+            K = _load_novel_intrinsics(novel_dir, rec["image_name"], gt.shape[:2])
+            if K is None:
+                base_key = _gt_key_for_frame(scene_dir, base_frame)
+                base_image = _read_rgb(_find_image_path(scene_dir, base_key))
+                K = _scale_K_for_size(_load_gt_intrinsics(scene_dir, base_key), base_image.shape[:2], gt.shape[:2])
+            c2w_est = _transform_gt_c2w_to_est(rec["c2w_gt"], s, R_align, t_align)
         _, alpha, pred = _render_depth(
             splats, edg, app_module, base_frame, c2w_est, K, gt.shape[0], gt.shape[1], args,
             app_embed_mode=getattr(args, "novel_app", "base"),

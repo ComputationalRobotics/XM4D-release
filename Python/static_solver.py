@@ -2101,6 +2101,9 @@ else:
         "(edges, weights, landmarks) or new 2D keys (tracks_xy, occluded)."
     )
 
+# Observation-weight normalization, i.e. solver configurations (5) omega_it/w and (6) omega_it/sqrt(w)
+# of the paper (weight_mode 2 and 3; weight_mode 1 leaves the weights raw).
+
 frame_ids = edges[:, 0].astype(np.int64)
 weight_per_frame = np.bincount(
     frame_ids,
@@ -2228,13 +2231,17 @@ LAMBDA = dataset_config.get_float("LAMBDA", 10.0, env="LAMBDA")
 #   USE_XM2  : run the second XM^2 solve (outlier-removal + resolve). False ~halves solver time.
 RANK = dataset_config.get_int("RANK", 5, env="XM_RANK")
 USE_XM2 = dataset_config.get_bool("USE_XM2", True, env="XM_USE_XM2")
+#   XM_MAX_ITERS : max Burer-Monteiro / trust-region iterations of the XM solve (the trailing
+#                  arg of XM.solve / solve_mixed). Raise for hard long sequences that need more
+#                  iterations to converge; default 30 reproduces the original behaviour.
+XM_MAX_ITERS = dataset_config.get_int("XM_MAX_ITERS", 30, env="XM_MAX_ITERS")
 tol = 1e-4
 solver_time = 0.0
 solver_start = time.perf_counter()
 if MODE == 1:
-    XM.solve_mixed(output_path,RANK,1e-6,LAMBDA,30,sphere_ratio)
+    XM.solve_mixed(output_path,RANK,1e-6,LAMBDA,XM_MAX_ITERS,sphere_ratio)
 elif MODE == 2:
-    XM.solve(output_path, RANK, 1e-4, LAMBDA, 30)
+    XM.solve(output_path, RANK, 1e-4, LAMBDA, XM_MAX_ITERS)
 solver_time += time.perf_counter() - solver_start
 
 # visualize the camera poses
@@ -2285,6 +2292,8 @@ if USE_XM2:
   # XM^2 multi-view depth-consistency filter: drop observations whose 3D residual
   # ||s R x + t - p|| is above the XM2_KEEP_PERCENTILE-th percentile, then re-solve.
   # Lower it (e.g. 85) to reject more imperfect-depth observations.
+  # This default is the P = 95 quoted for the XM^2 residual trim in the paper; note that two dataset
+  # configs override it (configs/dycheck.json P = 75, configs/imc.json P = 85).
   XM2_KEEP_PERCENTILE = dataset_config.get_float("XM2_KEEP_PERCENTILE", 95.0, env="XM_XM2_KEEP_PERCENTILE")
   threshold = np.percentile(error, XM2_KEEP_PERCENTILE)
 
@@ -2330,9 +2339,9 @@ if USE_XM2:
 
   solver_start = time.perf_counter()
   if MODE == 1:
-      XM.solve_mixed(output_path, RANK,1e-4, 0.0, 30, sphere_ratio)
+      XM.solve_mixed(output_path, RANK,1e-4, 0.0, XM_MAX_ITERS, sphere_ratio)
   elif MODE == 2:
-      XM.solve(output_path, RANK, 1e-4, 0.0, 30)
+      XM.solve(output_path, RANK, 1e-4, 0.0, XM_MAX_ITERS)
   solver_time += time.perf_counter() - solver_start
 
   Abar,_ = load_matrix_from_bin(output_path + '/Abar.bin')
