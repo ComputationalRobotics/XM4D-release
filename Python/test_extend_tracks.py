@@ -35,6 +35,7 @@ import glob
 from collections import defaultdict
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 from tqdm import tqdm
@@ -643,6 +644,59 @@ def save_merged(out_path, xy, xyz, occ, qt, member_src, n_forward=-1):
     print(f"[save] {out_path}: {xy.shape[0]} tracks (median obs {int(np.median(obs))} max {int(obs.max())})")
 
 
+
+
+# --- legacy hue-quality helpers (moved here from visualize_tracks_2d.py, which replaced them with
+# the median-reference filter; this merge path keeps the ORIGINAL behaviour bit-for-bit) ---
+def _sample_track_hue(xy, occ, image_paths, T, patch=2):
+    """Sample each track's hue/saturation at ITS OWN visible 2D positions (patch-median BGR -> HSV).
+    Input = the 2D track + the frame images only. Returns (hue[Q,T], sat[Q,T]) with NaN where unsampled."""
+    Q = xy.shape[0]
+    vis = (~occ) & np.isfinite(xy).all(-1)
+    hue = np.full((Q, T), np.nan, np.float32)
+    sat = np.full((Q, T), np.nan, np.float32)
+    p = int(patch)
+    for t in range(min(T, len(image_paths))):
+        idx = np.where(vis[:, t])[0]
+        if idx.size == 0:
+            continue
+        img = cv2.imread(image_paths[t])
+        if img is None:
+            continue
+        H, W = img.shape[:2]
+        bgr = np.zeros((idx.size, 3), np.uint8)
+        for r, q in enumerate(idx.tolist()):                          # patch-median BGR at the track's pixel
+            x = int(np.clip(round(xy[q, t, 0]), 0, W - 1)); y = int(np.clip(round(xy[q, t, 1]), 0, H - 1))
+            win = img[max(y - p, 0):y + p + 1, max(x - p, 0):x + p + 1].reshape(-1, 3)
+            bgr[r] = np.median(win, axis=0)
+        hsv = cv2.cvtColor(bgr[None], cv2.COLOR_BGR2HSV)[0]
+        hue[idx, t] = hsv[:, 0]; sat[idx, t] = hsv[:, 1]
+    return hue, sat
+
+
+def _score_hue(hue, sat, thresh, pct=90, sat_min=40, min_obs=5):
+    """GOOD/not-good from the sampled colours: saturation-gate (specular/white pixels have unstable hue),
+    reference = the track's circular-median hue, score = p<pct> circular deviation over its observations.
+    GOOD = score <= thresh (deg, 0..90). A track with enough samples but too few SATURATED ones lives on a
+    COLOURLESS surface -- that is consistent appearance (no evidence of colour drift), so it is ACCEPTED as
+    good. Only tracks with fewer than min_obs samples overall stay UNSCORED. -> (good, scored)."""
+    from edg_viz_common import _circ_hue_median
+    Q = hue.shape[0]
+    good = np.zeros(Q, bool); scored = np.zeros(Q, bool)
+    for q in range(Q):
+        fin = np.isfinite(hue[q])
+        m = fin & (np.nan_to_num(sat[q], nan=-1.0) >= sat_min)
+        if int(m.sum()) >= int(min_obs):                              # enough saturated samples: judge by hue
+            ref = _circ_hue_median(hue[q, m])
+            d = np.abs(hue[q, m] - ref); d = np.minimum(d, 180.0 - d)  # circular dist, deg (0..90)
+            scored[q] = True
+            good[q] = float(np.percentile(d, pct)) <= float(thresh)
+        elif int(fin.sum()) >= int(min_obs):                          # colourless surface: ACCEPT (no drift
+            scored[q] = True                                          # evidence; hue can't testify either way)
+            good[q] = True
+    return good, scored
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--window", type=int, default=10, help="search A's last `window` visible frames for a continuation")
@@ -741,7 +795,6 @@ def main():
     # consistency; BREAK a not-good track into its member_src fragments, re-filter those, DROP fragments
     # that still fail (colour-drifting tracking errors), keep the rest as separate tracks.
     if args.good_thresh > 0:
-        from visualize_tracks_2d import _sample_track_hue, _score_hue
         hue, sat = _sample_track_hue(xy_final, occ_final, image_paths, T)
         good, scored = _score_hue(hue, sat, args.good_thresh)
         notgood = scored & ~good

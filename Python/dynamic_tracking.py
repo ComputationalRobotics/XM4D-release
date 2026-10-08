@@ -1062,16 +1062,19 @@ for t in range(T):
 # chosen as an EDG node.
 DYN_OFFMASK_MAX_FRAC = dataset_config.get_float("DYN_OFFMASK_MAX_FRAC", 0.2, env="DYN_OFFMASK_MAX_FRAC")
 occluded_dynamic = occluded.copy()
-_seen = (~occluded[0]) & np.isfinite(tracks_xy[0]).all(-1)        # visible observations we could test
-_off = _seen & (~dynamic_obs_mask)
-_den = _seen.sum(1)
-_ratio = np.divide(_off.sum(1), _den, out=np.zeros(len(_den), np.float64), where=_den > 0)
-_drop = _ratio > DYN_OFFMASK_MAX_FRAC
-occluded_dynamic[0] |= ~dynamic_obs_mask                          # (ii) per-observation
-occluded_dynamic[0][_drop] = True                                 # (i)  whole track
-print(f"[dyn-mask] off-mask filter (> {DYN_OFFMASK_MAX_FRAC:.0%} of visible obs outside the mask): "
-      f"{int(_drop.sum())}/{len(_den)} tracks dropped entirely, "
-      f"{int((_off & ~_drop[:, None]).sum())} further observations dropped")
+if DYN_OFFMASK_MAX_FRAC >= 0:                                     # < 0 disables the filter entirely
+    _seen = (~occluded[0]) & np.isfinite(tracks_xy[0]).all(-1)    # visible observations we could test
+    _off = _seen & (~dynamic_obs_mask)
+    _den = _seen.sum(1)
+    _ratio = np.divide(_off.sum(1), _den, out=np.zeros(len(_den), np.float64), where=_den > 0)
+    _drop = _ratio > DYN_OFFMASK_MAX_FRAC
+    occluded_dynamic[0] |= ~dynamic_obs_mask                      # (ii) per-observation
+    occluded_dynamic[0][_drop] = True                             # (i)  whole track
+    print(f"[dyn-mask] off-mask filter (> {DYN_OFFMASK_MAX_FRAC:.0%} of visible obs outside the mask): "
+          f"{int(_drop.sum())}/{len(_den)} tracks dropped entirely, "
+          f"{int((_off & ~_drop[:, None]).sum())} further observations dropped")
+else:
+    print("[dyn-mask] off-mask filter DISABLED (DYN_OFFMASK_MAX_FRAC < 0)")
 
 # if EDGE_ERODE_PX > 0:
 #     edge_obs_mask = np.zeros((Q, T), dtype=bool)
