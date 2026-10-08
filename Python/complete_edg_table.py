@@ -625,7 +625,12 @@ def complete(D, args, device):
     print("[scales] " + "  ".join(f"{k}={v:.4g}" for k, v in sig.items()) + f"  (scene~{scene:.4g})")
 
     lam = dict(obs=args.lambda_obs, arap=args.lambda_arap, vel=args.lambda_vel,
-               acc=args.lambda_acc, init=args.lambda_init, p2d=args.lambda_2d)
+               acc=args.lambda_acc, init=args.lambda_init, p2d=args.lambda_2d,
+               arap_rest=args.lambda_arap_rest, temp=args.lambda_temp)
+    # rest frame of the paper's (DYN) objective: the frame with the most originally-observed node cells
+    t0 = int(np.argmax(filled.sum(0)))
+    print(f"[dyn-loss] paper ARAP (eq:arap) + temporal (eq:temp) terms: rest frame t0={t0}, "
+          f"lambda_arap_rest={args.lambda_arap_rest:g} lambda_temp={args.lambda_temp:g}")
     opt = torch.optim.Adam([c, r6], lr=args.lr)
 
     def losses():
@@ -675,6 +680,19 @@ def complete(D, args, device):
         oma = om[:, 1:] - om[:, :-1]
         L["acc"] = (acc.pow(2).sum() / (sig["ac"] ** 2) + rm * oma.pow(2).sum() / (sig["aR"] ** 2)) \
             / max((M * (T - 2)) * 6, 1)
+        # paper (DYN) terms. R is world-from-local per node, so the rest->t rotation of node j is
+        # R_{j,t} R_{j,t0}^T (independent of each node's own gauge); rest positions g = c[:, t0].
+        # eq:arap  r_jk,t = R_{j,t}(g_k - g_j) + g_j + p_{j,t} - g_k - p_{k,t}, both edge directions
+        Rrel = R @ R[:, t0:t0 + 1].transpose(-1, -2)                       # [M,T,3,3]
+        e0 = (c[en, t0] - c[em, t0])[:, None, :]                          # [E,1,3] rest edge
+        dt_e = c[en] - c[em]                                              # [E,T,3]
+        r_m = torch.einsum("etij,etj->eti", Rrel[em], e0.expand_as(dt_e)) - dt_e
+        r_n = torch.einsum("etij,etj->eti", Rrel[en], -e0.expand_as(dt_e)) + dt_e
+        L["arap_rest"] = (r_m.pow(2).sum() + r_n.pow(2).sum()) / (sig["coord"] ** 2) \
+            / max(2 * E * T * 3, 1)
+        # eq:temp  ||R_{j,t} - R_{j,t+1}||_F^2 + ||p_{j,t} - p_{j,t+1}||^2   (p = c - g, so dp = dc)
+        L["temp"] = ((R[:, 1:] - R[:, :-1]).pow(2).sum() / (sig["vR"] ** 2)
+                     + dc.pow(2).sum() / (sig["vc"] ** 2)) / max(M * (T - 1) * 12, 1)
         total = sum(lam[k] * L[k] for k in L)
         return total, L
 
@@ -803,6 +821,12 @@ def main():
     ap.add_argument("--lambda-vel", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_VEL", 0.1))
     ap.add_argument("--lambda-acc", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_ACC", 0.0))
     ap.add_argument("--lambda-init", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_INIT", 10.0))
+    ap.add_argument("--lambda-arap-rest", type=float,
+                    default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_ARAP_REST", 0.02),
+                    help="weight of the paper's rest-frame ARAP term (eq:arap) in the completion")
+    ap.add_argument("--lambda-temp", type=float,
+                    default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_TEMP", 0.01),
+                    help="weight of the paper's temporal term (eq:temp, Frobenius on rotations)")
     ap.add_argument("--lambda-2d", type=float, default=dataset_config.get_float("EDG_COMPLETE_LAMBDA_2D", 1.0),
                     help="2D reprojection loss (dyn warped points + EDG nodes vs their pixel tracks); 0 = off")
     ap.add_argument("--p2d-node-mult", type=float,
