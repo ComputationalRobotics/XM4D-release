@@ -16,7 +16,7 @@ The solver and everything downstream are deterministic given these inputs. Each 
 (dynamic tracks), and for DyCheck `cow_skeleton.npz`. Running the runners on these seeds reproduces the
 tables below to within TTO-eval noise (±0.9 dB per scene, unseeded). Regenerating the seeds from raw video
 also works but solver-sensitive scenes can drift dB-scale — demonstrated twice in this campaign:
-DyCheck/wheel 15.0→17.8 and NVIDIA/Truck 27.4→(record) purely by restoring the shipped camera solve.
+DyCheck/wheel 15.0→17.76 and NVIDIA/Truck 27.44→29.36 purely by restoring the shipped camera solve.
 
 ## Commands
 ```bash
@@ -54,20 +54,17 @@ The novel-PSNR gain over the paper reflects eval/trainer fixes that postdate it 
 per-frame depth-scale in the dyn lift) — the paper numbers were correct for their code vintage.
 
 ## NVIDIA — fixed-v000 novel view, split0 appearance (vs the 26.90 record)
-| scene | record | this repo | Δ |
-|---|---|---|---|
-| Balloon1 | 23.53 | 23.58 | +0.05 |
-| Balloon2 | 27.80 | 27.81 | +0.01 |
-| Jumping | 25.72 | 25.40 | −0.32 |
-| Playground | 26.36 | 26.62 | +0.26 |
-| Skating | 32.80 | 34.39 | +1.59 (documented σ≈0.78 scene) |
-| Truck | 29.38 | 29.36 | −0.02 |
-| Umbrella | 22.68 | 22.68 | ±0.00 |
-
-**mean 27.12 vs record 26.90 (+0.22).** Truck initially measured 27.44 on a camera solve left by a
-later from-scratch pass; restoring the shipped record solve recovered 29.36 — together with
-DyCheck/wheel (15.0 → 17.76 by the same fix) these are the two case studies behind the seeded-inputs
-contract above.
+The record stored only mPSNR; mSSIM/mLPIPS below are from this campaign's `nvidia_eval/summary.json`.
+| scene | record mPSNR | mPSNR | mSSIM | mLPIPS | Δ PSNR |
+|---|---|---|---|---|---|
+| Balloon1 | 23.53 | 23.58 | 0.822 | 0.087 | +0.05 |
+| Balloon2 | 27.80 | 27.81 | 0.890 | 0.036 | +0.01 |
+| Jumping | 25.72 | 25.40 | 0.827 | 0.085 | −0.32 |
+| Playground | 26.36 | 26.62 | 0.921 | 0.038 | +0.26 |
+| Skating | 32.80 | 34.39 | 0.951 | 0.026 | +1.59 (documented σ≈0.78 scene) |
+| Truck | 29.38 | 29.36 | 0.908 | 0.055 | −0.02 |
+| Umbrella | 22.68 | 22.68 | 0.748 | 0.112 | ±0.00 |
+| **mean** | **26.90** | **27.12** | **0.867** | **0.063** | **+0.22** |
 
 ## Per-scene runtime (stage medians, seeded inputs, one GPU)
 | dataset | pre-train (merge→dataset) | train | eval | total |
