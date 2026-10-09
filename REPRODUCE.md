@@ -79,3 +79,23 @@ atomic-add-nondeterministic (NVIDIA/Skating σ≈0.78). Camera accuracy and the 
 given the seeds; `optimize_dynamic_tracks` outputs are bitwise reproducible and stamped with their depth
 variant (`depth_variant` key; loaders warn on mismatch — heed it, a wrong `XM_DEPTH_VARIANT` silently
 changes the whole EDG).
+
+## Update 2026-10-08 — v2 rerun on the current release code (`2995748`)
+
+All 22 scenes rerun with the paper-exact EDG rules (eq:track-accept node suppression with the
+n_min floor; skinning within 2 hops with nearest-node fallback), the completion's paper ARAP and
+temporal terms (weights 0.02 / 0.01), and fast Syn4D training (12k steps, 200k points). Result
+directories carry the `_v2` suffix (`RUN_TAG=_v2`); the certified runs above are untouched.
+
+| benchmark | certified (above) | v2 | Δ |
+|---|---|---|---|
+| DyCheck mPSNR/mSSIM/mLPIPS | 19.46 / 0.725 / 0.166 | **19.51 / 0.725 / 0.163** | +0.05 |
+| Syn4D novel PSNR/SSIM/LPIPS | 21.33 / 0.807 / 0.160 | **21.73 / 0.822 / 0.148** | +0.40 |
+| Syn4D train (alpha-0.8 protocol) | 31.93 / 0.968 / 0.030 | **32.57 / 0.959 / 0.045** | +0.64 |
+| NVIDIA PSNR/SSIM/LPIPS | 27.12 / 0.867 / 0.063 | **27.01 / 0.867 / 0.063** | −0.11 |
+| camera ATE (all scenes) | — | identical | 0 |
+
+Every per-scene change on DyCheck and NVIDIA is within evaluation noise (max |Δ| 0.43 dB, on
+Skating, whose seed spread is σ≈0.78). On Syn4D the novel-view gain coincides with the switch to
+12k-step training, so it is not attributed to the EDG changes alone. Per-scene runtime (median,
+one GPU): DyCheck 46 min, NVIDIA 24 min, Syn4D 11 min. The paper tables now carry the v2 numbers.
