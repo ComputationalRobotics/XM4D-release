@@ -9,6 +9,7 @@
 # Usage: bash bashes/run_nvidia_seeded.sh <scene> [gpu]
 set -euo pipefail
 SCENE=${1:?scene}; GPU=${2:-0}
+TAG=${RUN_TAG:-}   # optional suffix for the result dirs
 cd "$(dirname "$0")/../Python"
 REPO="$(cd .. && pwd)"; SD="$REPO/datasets/NVIDIA/$SCENE"
 export XM_DATASET_CAT=NVIDIA XM_DATASET_NAME=$SCENE XM_DEPTH_SOURCE=da3
@@ -26,7 +27,8 @@ run complete  conda run -n tapnet --no-capture-output python complete_edg_table.
 
 PREP_LOG=$(mktemp)
 run dataset conda run -n XM --no-capture-output python train_4dgs_edg.py --dyn-source edg-good \
-    --dyn-min-points 100000 --dyn-jitter 0.25 | tee "$PREP_LOG" > /dev/null
+    --dyn-min-points 100000 --dyn-jitter 0.25 --gsplat-result-dir "$SD/outputs/gsplat_edg_target_0000${TAG}" \
+    | tee "$PREP_LOG" > /dev/null
 TRAIN=$(grep -A1 "Recommended gsplat 4DGS training command" "$PREP_LOG" | tail -1)
 TRAIN=${TRAIN//--data-factor 1/--data-factor 2}
 TRAIN=$(echo "$TRAIN" | sed "s/CUDA_VISIBLE_DEVICES=[0-9]*/CUDA_VISIBLE_DEVICES=$GPU/")
@@ -40,8 +42,10 @@ for p in sorted(glob.glob(gs+"/images/*")):
                 cv2.resize(im, (im.shape[1]//2, im.shape[0]//2), interpolation=cv2.INTER_AREA))
 EOF
 run train conda run -n gsplat --no-capture-output bash -c "$TRAIN --steps_scaler 1.0 --disable-viewer"
-run eval  conda run -n gsplat --no-capture-output python estimate_nvidia.py
+run eval  conda run -n gsplat --no-capture-output python estimate_nvidia.py \
+    --gaussians "$SD/outputs/gsplat_edg_target_0000${TAG}/ckpts/final_rank0.pt" \
+    --output-dir "$SD/outputs/nvidia_eval${TAG}" --output-json "$SD/outputs/nvidia_eval${TAG}/summary.json"
 python3 -c "
-import json; d=json.load(open('$SD/outputs/nvidia_eval/summary.json'))
+import json; d=json.load(open('$SD/outputs/nvidia_eval${TAG}/summary.json'))
 k=[x for x in ('novel_psnr','mPSNR','psnr') if x in d]
 print(f\"RELDONE NVIDIA $SCENE {json.dumps({x: d[x] for x in list(d)[:6]})}\")"

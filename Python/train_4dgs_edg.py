@@ -2349,7 +2349,8 @@ def prepare_4dgs_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare 4DGS dataset from EDG outputs")
     parser.add_argument("--target-frame", type=int, default=DEFAULT_TARGET_FRAME)
-    parser.add_argument("--max-points", type=int, default=MAX_CANONICAL_POINTS)
+    parser.add_argument("--max-points", type=int,
+                        default=dataset_config.get_int("GS_MAX_POINTS", MAX_CANONICAL_POINTS))
     parser.add_argument("--k-neighbors", type=int, default=K_NEIGHBORS)
     parser.add_argument("--seed", type=int, default=POINT_SAMPLE_SEED)
     parser.add_argument("--output-dir", type=str, default=str(utils.definitions.output_dir))
@@ -2390,7 +2391,7 @@ def main() -> None:
     parser.add_argument(
         "--dyn-min-points",
         type=int,
-        default=50000,
+        default=dataset_config.get_int("GS_DYN_MIN_POINTS", 50000),
         help="(--dyn-source edg-good) UPSAMPLE the good dynamic cloud to at least this many points by "
              "replicating each point with a small jitter (sigma = --dyn-jitter x median NN distance); each "
              "replica gets its own EDG binding. <=0 disables the upsampling.",

@@ -9,6 +9,7 @@
 # Usage: bash bashes/run_dycheck_fast.sh <scene> [gpu] [steps_scaler]
 set -euo pipefail
 SCENE=${1:?scene}; GPU=${2:-0}; SCALER=${3:-0.7142857142857143}
+TAG=${RUN_TAG:-}   # optional suffix for the result dirs (keeps earlier runs intact)
 cd "$(dirname "$0")/../Python"
 REPO="$(cd .. && pwd)"; SD="$REPO/datasets/Dycheck/$SCENE"; O="$SD/outputs"
 export XM_DATASET_CAT=Dycheck XM_DATASET_NAME=$SCENE XM_DEPTH_VARIANT=lidar_filled
@@ -22,11 +23,11 @@ run edg_solve conda run -n XM     --no-capture-output python EDG_test_fast.py --
 run complete  conda run -n tapnet --no-capture-output python complete_edg_table.py --tracks tracks_dynamic_merged_lift.npz
 run dataset   conda run -n XM     --no-capture-output python train_4dgs_edg.py --dyn-source edg-good --dyn-lift-per-frame
 run train     conda run -n gsplat --no-capture-output python "$REPO/deps/gsplat/examples/simple_trainer.py" default \
-    --data-dir "$O/gs_edg_target_0000" --result-dir "$O/gsplat_fast" --data-factor 1 \
+    --data-dir "$O/gs_edg_target_0000" --result-dir "$O/gsplat_fast${TAG}" --data-factor 1 \
     --edg-results "$O/results_all.npz" --edg-target-frame 0 --max-steps 35000 --steps-scaler "$SCALER" --disable-viewer
-rm -f "$O"/gsplat_fast/ckpts/ckpt_*.pt
+rm -f "$O"/gsplat_fast${TAG}/ckpts/ckpt_*.pt
 run eval      conda run -n gsplat --no-capture-output python estimate_ours_render_tto.py \
-    --gaussians "$O/gsplat_fast/ckpts/final_rank0.pt" --output-dir "$O/ours_render_eval_fast" --use-covisible-mask
+    --gaussians "$O/gsplat_fast${TAG}/ckpts/final_rank0.pt" --output-dir "$O/ours_render_eval_fast${TAG}" --use-covisible-mask
 python3 -c "
-import json; d=json.load(open('$O/ours_render_eval_fast/metrics_tto.json'))['novel']
+import json; d=json.load(open('$O/ours_render_eval_fast${TAG}/metrics_tto.json'))['novel']
 print(f\"RELDONE Dycheck $SCENE mPSNR {d['mPSNR']:.3f} mSSIM {d['mSSIM']:.3f} mLPIPS {d['mLPIPS']:.3f}\")"

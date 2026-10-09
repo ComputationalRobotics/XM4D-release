@@ -859,19 +859,26 @@ def _nanq_cols(x, q):
 
 
 def select_edg_nodes_2d(xy, Vs, Ocount, near_px, overlap_frac=0.5, max_nodes=100, min_node_frames=20,
-                        quantile=0.90, nsamp=30, verbose=True, return_suppressed=False):
+                        quantile=0.90, nsamp=30, verbose=True, return_suppressed=False,
+                        xy2=None, near2=None, min_overlap=0):
     """Length-priority NMS EDG-node selection using the 2D IMAGE persistent-distance metric (see block
     comment). `xy` is (Q, nS, 2) image px aligned to Vs' (nS, Q) time axis; ranks tracks by reliable
     length; selects the longest survivor; DELETES every still-alive track whose persistent 2D distance to
     the node -- the `quantile` (p90) of per-frame px distance over co-visible reliable frames -- is
     <= near_px AND that temporally overlaps the node by > overlap_frac of the shorter track's length.
     Only tracks reliable in > min_node_frames frames are eligible. Returns node global ids (and, if
-    return_suppressed, the per-node list of deleted global ids). `near_px` is the range knob."""
+    return_suppressed, the per-node list of deleted global ids). `near_px` is the range knob.
+    Paper rule (eq:track-accept): with `xy2`/`near2` a track is ALSO suppressed when its persistent
+    distance in that second space (3D world <-> 2D image) is <= near2 -- "close in 3D OR in the image";
+    `min_overlap` adds the n_min floor on the number of co-visible frames."""
     Q = xy.shape[0]; T = Vs.shape[0]
     has = np.where(Ocount > int(min_node_frames))[0]
     if has.size == 0:
         return (np.zeros(0, np.int64), []) if return_suppressed else np.zeros(0, np.int64)
     idx_per, tree_per = _frame_trees_2d(xy, Vs, T)
+    use2 = xy2 is not None and near2 is not None and near2 > 0
+    if use2:
+        idx_per2, tree_per2 = _frame_trees_2d(xy2, Vs, T)
     order = has[np.argsort(-Ocount[has])]                    # global ids, longest first
     alive = np.zeros(Q, bool); alive[has] = True
     nodes, suppressed = [], []
@@ -889,6 +896,11 @@ def select_edg_nodes_2d(xy, Vs, Ocount, near_px, overlap_frac=0.5, max_nodes=100
                 b = int(idx_per[t][h])
                 if b != g and alive[b]:
                     cand.add(b)
+            if use2 and tree_per2[t] is not None:            # candidates close in the second space too
+                for h in tree_per2[t].query_ball_point(xy2[g, t], near2):
+                    b = int(idx_per2[t][h])
+                    if b != g and alive[b]:
+                        cand.add(b)
         supp = np.zeros(0, np.int64)
         if cand:
             cand = np.fromiter(cand, np.int64)
@@ -899,8 +911,15 @@ def select_edg_nodes_2d(xy, Vs, Ocount, near_px, overlap_frac=0.5, max_nodes=100
             pdist = np.full(cand.size, np.inf)               # persistent 2D distance = p<quantile>
             has_ov = n_ov >= 1
             pdist[has_ov] = np.nanquantile(d_co[has_ov], quantile, axis=1)   # SAME metric as the edge builder
+            close = pdist <= near_px
+            if use2:                                         # ... OR close in the second space
+                d2 = np.linalg.norm(xy2[cand] - xy2[g][None], axis=2)
+                d2_co = np.where(co.T, d2, np.nan)
+                pdist2 = np.full(cand.size, np.inf)
+                pdist2[has_ov] = np.nanquantile(d2_co[has_ov], quantile, axis=1)
+                close = close | (pdist2 <= near2)
             min_len = np.minimum(Ocount[g], Ocount[cand])
-            kill = cand[(n_ov > overlap_frac * min_len) & (pdist <= near_px)]
+            kill = cand[(n_ov >= int(min_overlap)) & (n_ov > overlap_frac * min_len) & close]
             alive[kill] = False
             supp = kill.astype(np.int64)
         alive[g] = False
@@ -916,7 +935,8 @@ def select_edg_nodes_2d(xy, Vs, Ocount, near_px, overlap_frac=0.5, max_nodes=100
 
 
 def select_edg_nodes_covering(xy, Vs, Ocount, near_px0, overlap_frac=0.5, max_nodes=200,
-                              min_node_frames=20, quantile=0.90, nsamp=30, verbose=True):
+                              min_node_frames=20, quantile=0.90, nsamp=30, verbose=True,
+                              xy2=None, near2=None, min_overlap=0):
     """FULL-COVERAGE node selection within a node budget, two stages:
     (1) run the NMS WITHOUT an upper bound at the base radius -> the natural full-coverage node set
         (every eligible track is a node or within near_px0 of one);
@@ -927,7 +947,8 @@ def select_edg_nodes_covering(xy, Vs, Ocount, near_px0, overlap_frac=0.5, max_no
     Spread (coverage) first, track quality second. Any dropped node -- hence any eligible track --
     stays within ~(near_px0 + final spread radius) of a kept node. Returns (nodes, near_px0)."""
     nodes = select_edg_nodes_2d(xy, Vs, Ocount, near_px0, overlap_frac, 10**9,
-                                min_node_frames, quantile, nsamp, verbose=False)
+                                min_node_frames, quantile, nsamp, verbose=False,
+                                xy2=xy2, near2=near2, min_overlap=min_overlap)
     if verbose:
         print(f"[EDG-cover] uncapped NMS at near_px={near_px0:.1f}: {nodes.size} nodes (budget {max_nodes})")
     if nodes.size <= max_nodes:
@@ -966,7 +987,7 @@ def select_edg_nodes_covering(xy, Vs, Ocount, near_px0, overlap_frac=0.5, max_no
 def build_edg_graph(edges, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_frac=0.5,
                     edge_hops=6, max_nodes=100, min_node_frames=20, max_edge_factor=0.0,
                     quantile=0.90, min_degree=4, verbose=True, nodes_3d=False, near_frac=0.16,
-                    edge_min_max_ratio=0.5, person_id=None):
+                    edge_min_max_ratio=0.5, person_id=None, min_overlap=0, legacy=False):
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import dijkstra
     # --- NODE SELECTION: full-coverage NMS. EDG_NODES_3D=1 -> 3D world (Ps) distance for GT/LiDAR depth;
@@ -979,6 +1000,18 @@ def build_edg_graph(edges, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_frac=0
             print(f"[EDG] node selection: 3D world distance (radius={near_sel:.4f}, near_frac={near_frac})")
     else:
         pts_sel, near_sel = xy, near_px
+    # paper rule: suppress if close in 3D OR in the image (eq:track-accept) + the n_min overlap floor.
+    # legacy=True reproduces the pre-2026-10-08 single-metric rule (certified release numbers).
+    if legacy:
+        sel2 = dict(xy2=None, near2=None, min_overlap=0)
+    else:
+        P3 = np.transpose(Ps, (1, 0, 2))
+        sel2 = (dict(xy2=xy, near2=float(near_px), min_overlap=int(min_overlap)) if nodes_3d else
+                dict(xy2=P3, near2=float(thr * (near_frac / 0.16)), min_overlap=int(min_overlap)))
+        if verbose:
+            print(f"[EDG] node rule: {'3D' if nodes_3d else '2D'} p90<= {near_sel:.4g} OR "
+                  f"{'2D' if nodes_3d else '3D'} p90<= {sel2['near2']:.4g}; co-visible >= {int(min_overlap)} "
+                  f"frames and > {overlap_frac:.0%} of the shorter track")
     # MULTI-BODY SEPARATION: with >1 physical body, run the SAME coverage-NMS selection once PER BODY
     # (each gets its own full max_nodes budget, so a body with fewer/shorter tracks is never starved by
     # a bigger one) instead of once globally. Tracks with unresolved person_id (-1) are excluded from
@@ -989,14 +1022,14 @@ def build_edg_graph(edges, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_frac=0
         for b in bodies:
             Ocount_b = np.where(person_id == b, Ocount, 0)
             nb, _ = select_edg_nodes_covering(pts_sel, Vs, Ocount_b, near_sel, overlap_frac, max_nodes,
-                                              min_node_frames, quantile, verbose=verbose)
+                                              min_node_frames, quantile, verbose=verbose, **sel2)
             if verbose:
                 print(f"[EDG] body {b}: {nb.size} nodes")
             node_list.append(nb)
         nodes = np.concatenate(node_list) if node_list else np.zeros(0, np.int64)
     else:
         nodes, _ = select_edg_nodes_covering(pts_sel, Vs, Ocount, near_sel, overlap_frac, max_nodes,
-                                             min_node_frames, quantile, verbose=verbose)
+                                             min_node_frames, quantile, verbose=verbose, **sel2)
     if nodes.size == 0 or edges.shape[0] == 0:
         return nodes, np.zeros((0, 2), np.int64), np.zeros((0, 2), np.int64), np.zeros((0, 2), np.int64)
 
@@ -1182,7 +1215,7 @@ def _augment_edg_min_degree(edg_edges, nodes, P90, blue_adj, min_degree, verbose
 
 def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, min_conn=2,
                            max_factor=3.0, cand_k=8, quantile=90, verbose=True, hop_limit=20,
-                           max_dist_factor=3.0, min_max_ratio=0.5, person_id=None):
+                           max_dist_factor=3.0, min_max_ratio=0.5, person_id=None, legacy=False):
     """Attach each DYNAMIC point (track) to its `min_conn` EDG nodes (ORANGE edges), chosen so the
     connection stays SPATIALLY CLOSE ACROSS ALL co-visible frames. The skinning weight is set once and
     used for every frame (global), so a node that is near at one frame but far at others would corrupt
@@ -1224,12 +1257,13 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
     if Dn is not None:
         big = np.where(np.isfinite(Dn), Dn, np.inf)
         sub = big[:, dyn_ids]                                # (K, n_dyn)
-        kk = int(min(max(int(cand_k), int(min_conn)), K))
-        part = np.argpartition(sub, min(kk, K - 1), axis=0)[:kk]          # (kk, n_dyn) geodesic-nearest
-        for c, q in enumerate(dyn_ids.tolist()):
-            for nl in part[:, c].tolist():
-                if np.isfinite(sub[nl, c]):
-                    cand[q].add(int(nl))
+        if legacy:                                           # legacy: also the cand_k hop-nearest nodes
+            kk = int(min(max(int(cand_k), int(min_conn)), K))
+            part = np.argpartition(sub, min(kk, K - 1), axis=0)[:kk]      # (kk, n_dyn) geodesic-nearest
+            for c, q in enumerate(dyn_ids.tolist()):
+                for nl in part[:, c].tolist():
+                    if np.isfinite(sub[nl, c]):
+                        cand[q].add(int(nl))
         if max_hop >= 1:                                     # also everything within < hop_lt hops
             ni, qi = np.where((Dn >= 1) & (Dn <= max_hop) & np.isfinite(Dn))
             keep = ~node_mask[qi]
@@ -1311,6 +1345,25 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
         else:
             n_dropped += 1                                    # every candidate far / varying -> no link
 
+    n_fallback = 0
+    if not legacy:
+        # paper rule: a dynamic point with NO node within the hop limit (or none surviving the filters)
+        # falls back to its single nearest node by p<quantile> co-visible 3D distance over ALL nodes.
+        orphans = np.array([q for q in dyn_ids.tolist() if not conn.get(q)], np.int64)
+        if orphans.size:
+            best_d = np.full(orphans.size, np.inf); best_n = np.full(orphans.size, -1, np.int64)
+            for nl in range(K):
+                n_gid = int(edg_nodes[nl])
+                covis = Vs[:, orphans] & Vs[:, n_gid][:, None]
+                d = np.where(covis, np.linalg.norm(Ps[:, orphans, :] - Ps[:, n_gid][:, None, :], axis=2), np.nan)
+                with np.errstate(all="ignore"):
+                    rob = np.nanpercentile(d, quantile, axis=0)
+                better = np.isfinite(rob) & (rob < best_d)
+                best_d[better] = rob[better]; best_n[better] = n_gid
+            for q, n_gid in zip(orphans.tolist(), best_n.tolist()):
+                if n_gid >= 0:
+                    conn[q].add(int(n_gid)); n_fallback += 1
+            n_dropped = int((best_n < 0).sum())             # only never-co-visible points stay unlinked
     if not conn:
         return np.zeros((0, 2), np.int64)
     trk = np.fromiter((t for t, nds in conn.items() for _ in nds), dtype=np.int64)
@@ -1322,7 +1375,7 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
               f"({min_conn} nearest by robust p{quantile} co-visible dist; scale {scale:.4f}, p90-cap "
               f"{cap:.4f} (x{max_factor:g}), max-cap {max_cap:.4f} (x{max_dist_factor:g})). Dropped links: "
               f"{n_capped} over p90-cap, {n_far} max-dist too large, {n_vary} varying(min<{min_max_ratio:g}max); "
-              f"{n_dropped} points left unlinked; nodes/pt min={int(deg.min())} med={int(np.median(deg))} "
+              f"{n_fallback} points fell back to their nearest node; {n_dropped} points left unlinked; nodes/pt min={int(deg.min())} med={int(np.median(deg))} "
               f"max={int(deg.max())})")
     return und.astype(np.int64)
 
@@ -1507,6 +1560,11 @@ def main():
                     default=dataset_config.get_int("EDG_MIN_FRAMES", 20),
                     help="EDG node must be reliably observed in MORE than this many frames (length floor). "
                          "MUST be < number of frames T, else 0 nodes. (config EDG_MIN_FRAMES)")
+    ap.add_argument("--legacy-topology", action=argparse.BooleanOptionalAction,
+                    default=dataset_config.get_bool("EDG_LEGACY_TOPOLOGY", False),
+                    help="pre-2026-10-08 node/skinning rules (single-metric node suppression without the "
+                         "n_min floor; skinning candidates incl. the 8 hop-nearest nodes, no nearest-node "
+                         "fallback). Reproduces the certified release topology. (config EDG_LEGACY_TOPOLOGY)")
     ap.add_argument("--edg-min-degree", type=int, default=3,
                     help="Guarantee every EDG NODE connects to >= this many nearest co-visible nodes "
                          "(kNN fallback after the hop graph). Fixes disconnected deformation graphs on "
@@ -1614,7 +1672,8 @@ def main():
             min_node_frames=args.edg_min_frames, max_edge_factor=args.edg_max_edge_factor,
             quantile=args.edg_dist_quantile, min_degree=args.edg_min_degree,
             edge_min_max_ratio=args.edg_min_max_ratio,
-            person_id=D.get("person_id"))
+            person_id=D.get("person_id"), min_overlap=args.min_overlap_frames,
+            legacy=args.legacy_topology)
 
     # dynamic-point -> EDG node edges (ORANGE): nodes within < dyn_edg_hop_lt hops, unioned with each
     # point's dyn_edg_min nearest nodes AT ITS FIRST APPEARING FRAME (every appearing point gets >= that many).
@@ -1624,7 +1683,8 @@ def main():
                         hop_lt=args.dyn_edg_hop_lt, min_conn=args.dyn_edg_min,
                         max_factor=args.dyn_edg_max_factor,
                         max_dist_factor=args.dyn_edg_max_dist_factor,
-                        min_max_ratio=args.dyn_edg_min_max_ratio, person_id=D.get("person_id"))
+                        min_max_ratio=args.dyn_edg_min_max_ratio, person_id=D.get("person_id"),
+                        legacy=args.legacy_topology)
                      if edg_nodes.size else np.zeros((0, 2), np.int64))
 
     # save the topology result: EDG nodes/edges + dynamic-point (track) edges + dynamic->EDG edges

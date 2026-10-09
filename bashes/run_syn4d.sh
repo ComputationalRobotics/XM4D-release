@@ -9,6 +9,7 @@
 # Usage: bash bashes/run_syn4d.sh <scene> [gpu]
 set -euo pipefail
 SCENE=${1:?scene}; GPU=${2:-0}
+TAG=${RUN_TAG:-}   # optional suffix for the result dirs
 cd "$(dirname "$0")/../Python"
 REPO="$(cd .. && pwd)"; SD="$REPO/datasets/Syn4D/$SCENE"; O="$SD/outputs"
 export XM_DATASET_CAT=Syn4D XM_DATASET_NAME=$SCENE
@@ -23,29 +24,29 @@ run complete  conda run -n tapnet --no-capture-output python complete_edg_table.
 
 PREP_LOG=$(mktemp)
 run dataset conda run -n XM --no-capture-output python train_4dgs_edg.py --dyn-source edg-good \
-    --dyn-lift-per-frame --gsplat-result-dir "$O/gsplat_rel" | tee "$PREP_LOG" > /dev/null
+    --dyn-lift-per-frame --gsplat-result-dir "$O/gsplat_rel${TAG}" | tee "$PREP_LOG" > /dev/null
 TRAIN=$(grep -A1 "Recommended gsplat 4DGS training command" "$PREP_LOG" | tail -1)
 TRAIN=$(echo "$TRAIN" | sed "s/CUDA_VISIBLE_DEVICES=[0-9]*/CUDA_VISIBLE_DEVICES=$GPU/")
 run train conda run -n gsplat --no-capture-output bash -c "$TRAIN --disable-viewer"
-rm -f "$O"/gsplat_rel/ckpts/ckpt_*.pt 2>/dev/null || true
+rm -f "$O"/gsplat_rel${TAG}/ckpts/ckpt_*.pt 2>/dev/null || true
 
-OUT=$O/ours_render_eval_rel
+OUT=$O/ours_render_eval_rel${TAG}
 run eval conda run -n gsplat --no-capture-output python estimate_ours_render_tto.py \
-    --gaussians "$O/gsplat_rel/ckpts/final_rank0.pt" --no-use-covisible-mask \
+    --gaussians "$O/gsplat_rel${TAG}/ckpts/final_rank0.pt" --no-use-covisible-mask \
     --output-dir "$OUT" --output-json "$OUT/metrics_tto.json"
 run accuracy conda run -n XM --no-capture-output python eval_xm.py --gt-type syn4d \
     --scene-dir "$SD" --sparse-dir "$O/result_XM.npz" --json \
-    > "$O/eval_xm_rel.txt" 2>&1 || true
+    > "$O/eval_xm_rel${TAG}.txt" 2>&1 || true
 python3 - <<PYEOF
 import json, glob, re
 nov=json.load(open("$OUT/metrics_tto.json"))["novel"]
 tr=None
-vals=glob.glob("$O/gsplat_rel/stats/val_step*.json")
+vals=glob.glob("$O/gsplat_rel${TAG}/stats/val_step*.json")
 if vals:
     best=max(vals, key=lambda q: int(re.search(r"step(\d+)", q).group(1)))   # numeric, not lexical
     tr=json.load(open(best)).get("psnr")
-acc=open("$O/eval_xm_rel.txt").read() if __import__("os").path.exists("$O/eval_xm_rel.txt") else ""
+acc=open("$O/eval_xm_rel${TAG}.txt").read() if __import__("os").path.exists("$O/eval_xm_rel${TAG}.txt") else ""
 m=re.search(r"ATE[-_ ]?T[^0-9]*([0-9.eE+-]+)", acc)
 print(f"RELDONE Syn4D $SCENE novel_mPSNR {nov['mPSNR']:.3f} train_PSNR {tr if tr is None else round(tr,2)} "
-      f"ATE_T {m.group(1) if m else 'see eval_xm_rel.txt'}")
+      f"ATE_T {m.group(1) if m else 'see eval_xm_rel${TAG}.txt'}")
 PYEOF

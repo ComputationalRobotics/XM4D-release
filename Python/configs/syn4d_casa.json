@@ -35,5 +35,8 @@
   "EDG_ROT_MODE": "kabsch",
   "EDG_ARAP_MARK_MAX": -1,
   "EDG_COMPLETE_BAD_NODE_FRAC": 0.3,
-  "DYN_OFFMASK_MAX_FRAC": -1
+  "DYN_OFFMASK_MAX_FRAC": -1,
+  "steps_scaler": 0.4,
+  "GS_MAX_POINTS": 200000,
+  "GS_DYN_MIN_POINTS": 20000
 }
