@@ -23,6 +23,10 @@ ROOT_DIR = Path(__file__).parent.resolve()
 SCENE_DIR = ROOT_DIR / "../datasets/Lab/Capture1_clip01"
 DEFAULT_RESULT_XM = SCENE_DIR / "outputs" / "result_XM.npz"
 DATASET_CAT = "lab"  # replica, sintel, syn4d, lab, tum
+# GT camera centres that do not move (mean spread below this; Sintel ambush_2/ambush_7/bandage_1/bandage_2/shaman_2
+# are <= 3e-6, every moving scene >= 4e-2) leave the similarity alignment's scale undetermined, so the translation
+# errors are meaningless there: ATE-T and RPE-T are reported as 0.0.
+STATIC_GT_SPREAD = 1e-4
 
 
 def parse_args() -> argparse.Namespace:
@@ -487,6 +491,8 @@ def compute_our_metrics(
 		"gt_motion_scale": float(cov_t_gt),
 		"translation_normalizer_offset": float(covariance_offset),
 	}
+	if cov_t_gt < STATIC_GT_SPREAD:
+		metrics["ATE_T"] = metrics["RPE_T"] = 0.0
 
 	return metrics, (s, R_align, t_align)
 

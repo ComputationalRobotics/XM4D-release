@@ -1,7 +1,8 @@
-# --- Data: never commit ---
-datasets/
-# gsplat example data (360_v2 datasets, images, COLMAP .bin) — ~13 GB, not code
-deps/
+# --- Data and results: never commit ---
+# datasets/ holds the preprocessed inputs (downloaded separately, see datasets/README.md); only its README is tracked
+datasets/*
+!datasets/README.md
+results/
 
 # --- Run logs & Python caches ---
 *.log
@@ -30,5 +31,6 @@ __pycache__/
 *.jpeg
 *.h5
 
-# keep the prebuilt XM solver (.so) — the Python imports it; source is in the XM-code repo
+# XM/build/ holds CMake build files when XM is built from source; keep only our compiled binding (.so)
+XM/build/*
 !XM/build/*.so
