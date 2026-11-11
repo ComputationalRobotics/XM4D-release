@@ -7,9 +7,6 @@ from scipy.sparse import coo_matrix, csr_matrix, dia_matrix, lil_matrix, bmat, h
 
 from utils.io import save_matrix_to_bin
 
-# will use it in final release, not now for simplicity just comment
-# import cupy
-# import cupyx
 
 from scipy.io import savemat
 

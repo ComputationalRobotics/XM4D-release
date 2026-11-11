@@ -88,8 +88,6 @@ bool checkeig(opt_var &C,
 
     const size_s m = 5*n + 1;
 
-    // nnz: trace column = 3*n*o,
-    // plus 5n columns each with 2*o nnz => 10*n*o
     const size_l nnz_cap = (3*n*o) + (10*n*o) + 64;
 
     std::vector<int>      Acellrow(nnz_cap, 0);
@@ -194,12 +192,6 @@ bool checkeig(opt_var &C,
     AcellCSC.SynchronizeHostToDevice(AcellcolCSC.data(),Acellrow.data(),Acellval.data());
     CSC2CSR(CUOPT_sparse_handle,AcellCSC,AcellCSR);
 
-    // Z = C;
-    //         for i = 1:n-1
-    //             Z(3*i+1,3*i+1) = Z(3*i+1,3*i+1) + 2 * lam * (X(3*i+1,3*i+1)-1);
-    //         end
-    // Right = Z*sR_est';
-    // Right = Right(:);
     opt_var Z(C);
     ConstructZmatrixKernal<<<(n + 1024 - 1) / 1024,1024>>>(Z.vals,sR.vals,n,o,lam);
     opt_var Right({3*n,o});
@@ -287,7 +279,6 @@ bool checkeig(opt_var &C,
     
     count = 0;
 
-    // y[0] is trace multiplier: subtract y0 * I
     for (size_s d_idx = 0; d_idx < sphere_idx.size(); ++d_idx) {
         size_s d = sphere_idx[d_idx];
         Z.vals_host[3 * d + 3 * d * 3 * n] -= y[count];
@@ -564,9 +555,6 @@ bool checkeig_noscale(opt_var &C,
     // Z = C (+ optional augmentation), Right = Z*sR, b = vec(Right)
     opt_var Z(C);
 
-    // OPTIONAL (keep behavior similar to your original code):
-    // If you don't want augmented term, set lam=0 or comment the kernel call.
-    // ConstructZmatrixKernal_6n<<<(n + 1024 - 1) / 1024, 1024>>>(Z.vals, sR.vals, n, o, lam);
 
     opt_var Right({3 * n, o});
     DnMatDnMat(CUOPT_blas_handle, Right, Z, sR);
@@ -664,7 +652,6 @@ bool checkeig_noscale(opt_var &C,
     W.SynchronizeDevicetoHost();
     printf("The min eig is: %1.3e \n", W.vals_host[0]);
 
-    // Keep your original behavior for v
     CHECK_CUDA(cudaMemcpy(v.vals, Z.vals, v.total_size * sizeof(datatype), cudaMemcpyDeviceToDevice));
 
     // ---- Dual value / gap ----
@@ -677,7 +664,6 @@ bool checkeig_noscale(opt_var &C,
     }
     std::cout << "Dual value: " << dual_value << std::endl;
 
-    // Keep your lam-based extra term as-is (uses x11 only; valid if sR block is scaled rotation)
     std::vector<double> xii(n, 0.0);
     for (size_s i = 0; i < n; ++i) {
         for (size_s j = 0; j < o; ++j) {

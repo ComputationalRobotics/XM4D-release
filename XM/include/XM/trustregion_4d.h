@@ -58,7 +58,6 @@ void XMtrustregion(opt_var &C,
         return;
     }
 
-    // Manifold dimension: product of N SO(3) blocks => 3N
     size_s dim = n * (3 * o - 6); // = 3N when o=3
     double delta_bar = sqrt((double)dim);
     double delta = delta_bar / 8.0;

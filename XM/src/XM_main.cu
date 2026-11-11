@@ -96,8 +96,6 @@ void solve_Ronly(const std::string& dataset_path,
             break;
         }
 
-        // Bring R to host if your checkeig expects host-side access elsewhere.
-        // (If checkeig operates on device opt_var, you can omit this.)
         R.SynchronizeDevicetoHost();
 
 
@@ -107,8 +105,6 @@ void solve_Ronly(const std::string& dataset_path,
         std::cout << "+++++++++++++++++++++++++++++++++" << std::endl;
 
         // IMPORTANT: now we check using R directly (equivalent to s = 1)
-        // If your checkeig signature is checkeig(C, sR, lam, v, primal),
-        // pass lam=0.0 and use R as "sR".
         if (checkeig_noscale(C, R, /*lam=*/0.0, v, primal, output_path)) {
             o += 1;
 
@@ -344,7 +340,6 @@ void solve_mixed(const std::string& dataset_path,
     opt_var C({3 * n, 3 * n});
     C.SynchronizeHostToDevice(Q_h.data());
 
-    // select top 10% by diagonal block trace to be on sphere (include first index)
     const size_s rows = 3 * n;
     std::vector<std::pair<double, size_s>> traces;
     traces.reserve(n);

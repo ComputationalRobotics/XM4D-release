@@ -82,15 +82,13 @@ void XMtrustregion(opt_var &C,
                    const opt_var &s0,
                    opt_var &R_result,
                    opt_var &s_result,
-                   const double lam,          // UNUSED now (sphere manifold handles constraint directly)
+                   const double lam,
                    const double sphere_norm,  // radius of sphere for s
                    double &gradtol,
                    double linesearch_step,
                    opt_var &v,
                    double* primal_value,
                    const double maxtime) {
-
-    // (void)lam; // sphere manifold: no penalty term
 
     DeviceBlasHandle CUOPT_blas_handle;
     CUOPT_blas_handle.activate();
@@ -429,7 +427,7 @@ void XMtrustregion(opt_var &C,
     opt_var r_R({o, 3 * n});
     opt_var r_s({n});
     opt_var p_R({o, 3 * n});
-    opt_var p_s({n});              // <-- FIX: DECLARE p_s
+    opt_var p_s({n});
     opt_var p_R_T({3 * n, o});
 
     auto start = high_resolution_clock::now();
@@ -463,7 +461,7 @@ void XMtrustregion(opt_var &C,
         CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_r.total_size, rgrad_r.vals, 1, r_R.vals, 1));
         CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_s.total_size, rgrad_s.vals, 1, r_s.vals, 1));
         CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_r.total_size, rgrad_r.vals, 1, p_R.vals, 1));
-        CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_s.total_size, rgrad_s.vals, 1, p_s.vals, 1)); // <-- now defined
+        CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_s.total_size, rgrad_s.vals, 1, p_s.vals, 1));
 
         double neg_one = -1.0;
         CHECK_CUBLAS(cublasDscal(CUOPT_blas_handle.cublas_handle, p_R.total_size, &neg_one, p_R.vals, 1));

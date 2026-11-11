@@ -21,7 +21,6 @@
 
 using namespace std::chrono;
 
-// Debug dump helpers removed.
 
 // =============================================================
 // Mixed manifold helpers: sphere on selected indices + positive manifold
@@ -331,7 +330,6 @@ void XMtrustregion_mixed(opt_var &C,
             mask_h[idx] = 1.0;
         }
     }
-    // Keep the first frame eligible for sphere selection.
     double sphere_norm = std::sqrt(static_cast<double>(m));
 
     opt_var sphere_mask({n});
@@ -473,7 +471,6 @@ void XMtrustregion_mixed(opt_var &C,
     opt_var pos_egrad({n});
     opt_var pos_ehess({n});
     opt_var pos_eta({n});
-    // Debug buffers removed.
 
     auto ehess2rhess = [&CUOPT_blas_handle,
                         &RTgradR, &RTgradR_sym,
@@ -789,7 +786,6 @@ void XMtrustregion_mixed(opt_var &C,
 
     auto start = high_resolution_clock::now();
 
-    // Debug dump paths removed.
 
     for (size_s k = 0; k < max_outer_iter; ++k) {
 
@@ -822,7 +818,6 @@ void XMtrustregion_mixed(opt_var &C,
 
         // No anchoring of the first frame.
 
-        // Debug finite-difference checks removed.
 
         CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_r.total_size, rgrad_r.vals, 1, r_R.vals, 1));
         CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, rgrad_s.total_size, rgrad_s.vals, 1, r_s.vals, 1));
@@ -884,10 +879,8 @@ void XMtrustregion_mixed(opt_var &C,
             transpose(hrT.vals, hr.vals, hr.dimensions[0], hr.dimensions[1]);
             ehess2rhess(hrT, hs, grad_r_T, grad_s, R_T, s, p_R, p_s);
 
-            // Debug dumps removed.
 
             double denom = MixedProductManifoldInner(CUOPT_blas_handle, tmp_a, tmp_b, p_R, rhr, p_s, rhs, s, sphere_mask, sphere_norm);
-            // Debug finite-difference and dump logic removed.
             if (!std::isfinite(denom) || denom <= 0.0) {
                 double vdotv = vdotv_record[i];
                 double vdotp = vdotp_record[i];
@@ -992,7 +985,6 @@ void XMtrustregion_mixed(opt_var &C,
         totalite += i + 1;
 
         // Note: Manopt returns the boundary/negative-curvature step directly; no fallback.
-         // Debug dumps removed.
 
          double loss_qu = MixedProductManifoldInner(CUOPT_blas_handle, tmp_a, tmp_b, v_R, hv_R, v_s, hv_s, s, sphere_mask, sphere_norm) / 2.0
              + MixedProductManifoldInner(CUOPT_blas_handle, tmp_a, tmp_b, v_R, rgrad_r, v_s, rgrad_s, s, sphere_mask, sphere_norm);

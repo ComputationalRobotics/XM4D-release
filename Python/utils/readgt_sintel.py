@@ -5,7 +5,6 @@ from pathlib import Path
 # This is a script only for Sintel dataset
 # If you are loading your own dataset, please write you own script
 # If you are not comparing with groud truth, R and t is not neccessary, but OTHER is needed
-# TODO: don't know intrinsics
 
 TAG_FLOAT = 202021.25
 TAG_CHAR  = b'PIEH'

@@ -28,7 +28,7 @@ class _Tee:
 
 
 def install_script_logger(stage: str, output_dir: str | Path) -> Path:
-    """Tee stdout/stderr to <output_dir>/logs/<stage>_timestamp.log and record runtime."""
+    """Tee stdout/stderr to <output_dir>/logs/<stage>.log and record runtime."""
     out_dir = Path(output_dir)
     log_dir = out_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -57,6 +57,16 @@ def install_script_logger(stage: str, output_dir: str | Path) -> Path:
         old_excepthook(exc_type, exc, tb)
 
     sys.excepthook = _excepthook
+
+    # sys.exit(n) raises SystemExit, which bypasses the excepthook: record its status too.
+    old_exit = sys.exit
+
+    def _exit(code=None):
+        if code not in (None, 0):
+            state["status"] = code if isinstance(code, int) else 1
+        old_exit(code)
+
+    sys.exit = _exit
 
     def _finish() -> None:
         if state["finished"]:

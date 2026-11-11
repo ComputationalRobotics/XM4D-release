@@ -15,8 +15,6 @@ def delete_thereshold(min_threshold, M, data):
 def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
                    frame_min_points=10):
     # delete and reindex the frames whose number of observations is <= frame_min_points.
-    # Raise frame_min_points to drop weakly-observed frames (e.g. IMC gate), which are
-    # often the cameras with the largest pose error.
     max_frame, N, indices_frame = delete_thereshold(frame_min_points, N, edges[:,0]-1)
 
     # exchange the first frame
@@ -34,8 +32,6 @@ def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
     landmarks = landmarks[~indices]
     rgbs = rgbs[~indices]
 
-    # delete and reindex the landmarks that contains one frame
-    # Note: change the thereshold higher if you do not get good result, e.g. IMC gate
     _, M, indices_landmarks = delete_thereshold(0, M, edges[:,1]-1)
     edges[:,1] = indices_landmarks[edges[:,1]-1].copy() + 1
     

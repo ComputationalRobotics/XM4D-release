@@ -51,7 +51,6 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
 
     print("s_real: ", s_real)
     
-    # because of anchoring
     R1 = R_real[:,:3]
     R_real = R1.T @ R_real
 
@@ -106,9 +105,6 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
     t_est = y_est[:, :N]
     p_est = y_est[:, N:]
     
-    # previous 2 lines changed to:
-    #t_est = y_est[:, 1:N+1]   # Skip the zero column
-    #p_est = y_est[:, N+1:]
 
     if return_rank:
         return R_real, s_real, p_est, t_est, optimal_rank

@@ -23,7 +23,6 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run the static XM solver with configurable heuristic settings."
     )
-    parser.add_argument("--mode", type=int, choices=[1, 2], default=1)
     parser.add_argument("--weight-mode", type=int, choices=[1, 2, 3], default=2)
     parser.add_argument("--sphere-ratio", type=float, default=0.9)
     parser.add_argument(
@@ -65,11 +64,7 @@ def parse_args():
 
 args = parse_args()
 
-MODE = args.mode  # 1 for new and 2 for old
-if MODE == 1:
-    sys.path.append(os.path.join(os.path.dirname(__file__), '../XM/build/'))
-elif MODE == 2:
-    sys.path.append(os.path.join(os.path.dirname(__file__), '../XM_old/build/'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../XM/build/'))
 
 weight_mode = args.weight_mode
 sphere_ratio = args.sphere_ratio
@@ -114,11 +109,7 @@ USE_CERES_REGULARIZATION = dataset_config.get_bool(
 CERES_REGULARIZATION_THERESHOLD = dataset_config.get_float(
     "CERES_REGULARIZATION_THRESHOLD", 0.1, env="CERES_REGULARIZATION_THRESHOLD"
 )
-# Optionally let Ceres refine a single shared camera focal during bundle adjustment
-# (self-calibration). The 2D landmarks are normalized by the initial intrinsic, so
-# this refines a global focal-correction factor around 1.0, bounded to avoid the
-# focal/depth gauge from running away. Off by default; helps scenes where the
-# predicted (DA3) focal is poor.
+
 CERES_OPTIMIZE_INTRINSICS = dataset_config.get_bool(
     "CERES_OPTIMIZE_INTRINSICS", False, env="CERES_OPTIMIZE_INTRINSICS"
 )
@@ -141,10 +132,6 @@ STATIC_TRACK_DEPTH_JUMP_THRESHOLD = (
     else env_float("STATIC_TRACK_DEPTH_JUMP_THRESHOLD", 0.0)
 )
 
-# Intrinsics come from a single source: outputs/depth_anything_3/intrinsics.npy,
-# written by get_depths_clean.py. That file already encodes the GT-vs-DA3 choice, so
-# the solver never re-decides it here -- it just loads and uses that K everywhere.
-
 DA3_SCALE_MIN = env_float("DA3_SCALE_MIN", 0.25)
 DA3_SCALE_MAX = env_float("DA3_SCALE_MAX", 4.0)
 DA3_SCALE_LEVELS = env_int("DA3_SCALE_LEVELS", 5)
@@ -159,19 +146,14 @@ DA3_SCALE_REVERSE_KEEP_PERCENTILE = env_float("DA3_SCALE_REVERSE_KEEP_PERCENTILE
 DA3_SCALE_REVERSE_WEIGHT = env_float("DA3_SCALE_REVERSE_WEIGHT", 0.25)
 DA3_SCALE_LOG_SCALE_REG = env_float("DA3_SCALE_LOG_SCALE_REG", 0.0)
 DA3_SCALE_REFERENCE_KEEP_PERCENTILE = env_float("DA3_SCALE_REFERENCE_KEEP_PERCENTILE", 98.0)
-# Speed: only the top-K best-forward candidates per level pay the (expensive)
-# reverse-Chamfer KD-tree rebuild. Frames after the first use a narrow local
-# search around the running-median log-scale (all frames share a similar scale).
+
 DA3_SCALE_REVERSE_TOPK = env_int("DA3_SCALE_REVERSE_TOPK", 3)
 DA3_SCALE_LOCAL_RADIUS = env_float("DA3_SCALE_LOCAL_RADIUS", 0.35)  # log-scale half-width
 DA3_SCALE_LOCAL_LEVELS = env_int("DA3_SCALE_LOCAL_LEVELS", 3)
 DA3_SCALE_LOCAL_CANDIDATES = env_int("DA3_SCALE_LOCAL_CANDIDATES", 9)
-# The grid only locates the basin (a flat Chamfer loss quantizes to grid nodes);
-# a closed-form ICP-style refinement then gives a continuous, sub-grid per-frame
-# scale: s = sum(dir . (nn - center)) / sum(dir . dir) over trimmed correspondences.
+
 DA3_SCALE_REFINE_ITERS = env_int("DA3_SCALE_REFINE_ITERS", 4)
-# KD-tree query threads. workers=-1 spawns a thread per core (huge overhead for the
-# many tiny per-frame queries on a big machine); 1 is fastest for these sizes.
+
 DA3_SCALE_QUERY_WORKERS = env_int("DA3_SCALE_QUERY_WORKERS", 1)
 RESULT_POINT_MAX_NORM = env_float("XM_RESULT_POINT_MAX_NORM", 2.0)
 
@@ -454,13 +436,7 @@ def run_ceres_refine(
     neighbor_window,
     penalty_t_acc,
 ):
-    try:
-        from utils.ceresforXM import XM_Ceres_interface
-    except ModuleNotFoundError as exc:
-        if exc.name in {"pyceres", "pycolmap"}:
-            print(f"[Ceres] skipped: optional dependency '{exc.name}' is not installed.")
-            return R_real, t_est, p_est, 0.0, None
-        raise
+    from utils.ceresforXM import XM_Ceres_interface
 
     return XM_Ceres_interface(
         edges,
@@ -668,10 +644,7 @@ def _unproject(x, y, z, K):
 
 def _load_intrinsics_npy(t_expected):
     """The single solver intrinsic source: outputs/depth_anything_3/intrinsics.npy.
-
-    get_depths_clean.py writes this file with the chosen intrinsic already applied
-    (GT when USE_DA3_INTRINSICS is off, DA3's own when on), so the solver just reads
-    it -- no flag, no second decision. Returns K_all (T, 3, 3), or None if absent.
+    Returns K_all (T, 3, 3), or None if absent.
     """
     intrinsics_path = Path(utils.definitions.da3_depth_dir) / "intrinsics.npy"
     if not intrinsics_path.exists():
@@ -1613,9 +1586,6 @@ def lift_2d_tracks_to_solver_input(
             "Use gt, da3, vggt, spatracker, or unidepth."
         )
 
-    # Single intrinsic source: for DA3-family depth, lift with intrinsics.npy
-    # (get_depths_clean.py already baked the GT-vs-DA3 choice into it). Only the "gt"
-    # depth source keeps GT colmap K (handled per-frame below).
     da3_K_all = None
     if depth_source in {"da3", "depth_anything", "depthanything", "depth_anything_3"}:
         da3_K_all = _load_intrinsics_npy(T_depth)
@@ -1819,11 +1789,13 @@ def ate_teaser_c2w_headless(R_est, t_est, R_gt, t_gt):
 
     print(f"ATE TEASER: scale1={scale1}, scale2={scale2}, ratio={scale1/scale2}")
 
+    # A trajectory whose spread is negligible next to its distance from the origin (e.g. a static GT
+    # camera) cannot be normalized for TEASER: keep the scale ratio (~0 for a static GT), fit R, t by SVD.
     if (
         not np.isfinite(scale1)
         or not np.isfinite(scale2)
-        or scale1 <= 1e-12
-        or scale2 <= 1e-12
+        or scale1 <= 1e-6 * max(1.0, float(np.linalg.norm(dst_avg)))
+        or scale2 <= 1e-6 * max(1.0, float(np.linalg.norm(src_avg)))
         or src.shape[1] < 3
     ):
         print("[ATE] Degenerate TEASER inputs; using SVD rigid-alignment fallback.")
@@ -1851,14 +1823,6 @@ def ate_teaser_c2w_headless(R_est, t_est, R_gt, t_gt):
         idx = np.random.choice(src_norm.shape[1], 5000, replace=False)
         src_norm = src_norm[:, idx]
         dst_norm = dst_norm[:, idx]
-
-    if teaserpp_python is None:
-        print("[ATE] teaserpp_python is not installed; using SVD rigid-alignment fallback.")
-        rotation, translation = rigid_align(src_norm, dst_norm)
-        target = rotation @ src_norm + translation
-        error = np.linalg.norm(target - dst_norm, axis=0)
-        print("Fallback alignment error:", np.linalg.norm(error))
-        return scale1 / scale2, rotation, scale1 * translation.reshape(3, 1)
 
     solver_params = teaserpp_python.RobustRegistrationSolver.Params()
     solver_params.cbar2 = 1
@@ -2024,13 +1988,6 @@ def eval_mosca_style_with_evo(R_real, t_est, s_real, R_gt, t_gt, apply_coordinat
 
     return ate, rpe_trans, rpe_rot
 
-############################
-# For experiment in paper only
-# download the dataset from:
-# https://drive.google.com/drive/folders/13_2mcKGKVU0ibWck2n4ajUrN2MaDfR7y?usp=sharing
-# and put it in the folder './assets/Experiment/**'
-############################
-
 ### S0: CONFIG
 dataset_cat = utils.definitions.dataset_cat
 dataset_path = str(utils.definitions.rootpath)
@@ -2075,6 +2032,26 @@ elif dataset_cat == "Dycheck":
 else:
     raise ValueError(f"Unsupported dataset_cat '{dataset_cat}'")
 
+# Ceres refinement and the TEASER++ alignment are part of the method and the scoring: running without
+# them would give much worse numbers, so stop before solving if they are not installed.
+_missing = []
+if args.use_ceres:
+    for _module in ("pyceres", "pycolmap"):
+        try:
+            __import__(_module)
+        except ImportError:
+            _missing.append(_module)
+if EVLUATION and teaserpp_python is None:
+    _missing.append("teaserpp_python")
+if _missing:
+    print(
+        f"WARNING: {', '.join(_missing)} not installed (needed for the Ceres refinement / TEASER++ alignment). "
+        "Install them as in the README (pip install -r requirements.txt; pip install ./deps/TEASER-plusplus) "
+        "or activate the right environment. Stopping.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 data = np.load(os.path.join(output_path, f'output_tapnet_{utils.definitions.depth_source}.npz'))
 if "landmarks" in data.files and "edges" in data.files and "weights" in data.files:
     edges = data['edges']
@@ -2101,9 +2078,6 @@ else:
         "(edges, weights, landmarks) or new 2D keys (tracks_xy, occluded)."
     )
 
-# Observation-weight normalization, i.e. solver configurations (5) omega_it/w and (6) omega_it/sqrt(w)
-# of the paper (weight_mode 2 and 3; weight_mode 1 leaves the weights raw).
-
 frame_ids = edges[:, 0].astype(np.int64)
 weight_per_frame = np.bincount(
     frame_ids,
@@ -2127,26 +2101,10 @@ landmarks = landmarks[unique_indices,:]
 edges = edges[:, [1,0]] + 1
 rgbs = np.zeros((edges.shape[0], 3))
 
-# delete_depth = landmarks[:, 2] > np.percentile(landmarks[:, 2], 90)  # remove points with depth larger than 99.5 percentile
-# edges = edges[~delete_depth]
-# weights = weights[~delete_depth]
-# landmarks = landmarks[~delete_depth,:]
-# rgbs = rgbs[~delete_depth,:]
-
-# assert np.max(edges[:,0]) == len(image_list)
-
-# # only preserve camera < 3
-# indices = np.isin(edges[:, 0], np.linspace(41, 50, 10))
-# edges = edges[indices]
-# rgbs = rgbs[indices]
-# weights = weights[indices]
-# landmarks = landmarks[indices]
-
 N = int(np.max(edges[:, 0]))
 M = int(np.max(edges[:, 1]))
 
 # Drop frames whose observation count is <= FRAME_MIN_POINTS in checklandmarks.
-# Raise it to remove weakly-observed cameras (often the largest-error ones).
 FRAME_MIN_POINTS = dataset_config.get_int("FRAME_MIN_POINTS", 10, env="XM_FRAME_MIN_POINTS")
 
 PENALTY_T_MULT = dataset_config.get_float("PENALTY_T_MULT", 0.0, env="XM_PENALTY_T_MULT")
@@ -2214,10 +2172,7 @@ if LANDMARK_MIN_VIEWS > 1:
     print(f"[landmark-filter] LANDMARK_MIN_VIEWS={LANDMARK_MIN_VIEWS}: keep {int(keep.sum())}/{keep.shape[0]} observations")
     edges, landmarks, weights, rgbs = edges[keep], landmarks[keep], weights[keep], rgbs[keep]
 
-if MODE == 1:
-    edges, landmarks, weights, rgbs, indices_all = checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=False, frame_min_points=FRAME_MIN_POINTS)
-elif MODE == 2:
-    edges, landmarks, weights, rgbs, indices_all = checklandmarks(edges, landmarks, weights, rgbs, N, M, frame_min_points=FRAME_MIN_POINTS)
+edges, landmarks, weights, rgbs, indices_all = checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=False, frame_min_points=FRAME_MIN_POINTS)
 
 
 N = int(np.max(edges[:, 0]))
@@ -2225,23 +2180,25 @@ M = int(np.max(edges[:, 1]))
 
 # interface to create the matrix given the edges, weights and landmarks
 create_matrix(weights, edges, landmarks, output_path, penalty_t=PENALTY_T)
+#   LAMBDA   : weight of the scale penalty lambda * sum_i (s_i^2 - 1)^2, used only in the first XM solve.
+#              That solve only serves to find outliers: its residuals choose the observations the XM^2
+#              trim removes, and the second solve, which gives the final poses, starts from scratch with
+#              lambda = 0. (With USE_XM2 off there is no second solve and lambda shapes the final poses.)
 LAMBDA = dataset_config.get_float("LAMBDA", 10.0, env="LAMBDA")
 # Solver-acceleration knobs (config-driven; defaults reproduce the original behaviour):
-#   RANK     : max rank searched by the mixed solver (lower = faster; IMC static rank is 3).
+#   RANK     : max rank of the Riemannian staircase (lower = faster, but a cap below the rank a
+#              solve needs stops the staircase early and leaves that solve uncertified).
 #   USE_XM2  : run the second XM^2 solve (outlier-removal + resolve). False ~halves solver time.
 RANK = dataset_config.get_int("RANK", 5, env="XM_RANK")
 USE_XM2 = dataset_config.get_bool("USE_XM2", True, env="XM_USE_XM2")
-#   XM_MAX_ITERS : max Burer-Monteiro / trust-region iterations of the XM solve (the trailing
-#                  arg of XM.solve / solve_mixed). Raise for hard long sequences that need more
-#                  iterations to converge; default 30 reproduces the original behaviour.
-XM_MAX_ITERS = dataset_config.get_int("XM_MAX_ITERS", 30, env="XM_MAX_ITERS")
+#   XM_MAX_TIME : wall-clock limit in SECONDS for each trust-region solve (the `max_time` arg of
+#                 XM.solve_mixed). There is one solve per staircase rank, and the clock restarts when
+#                 the rank increases. A solve that reaches it logs "Terminate because of time limit".
+XM_MAX_TIME = dataset_config.get_float("XM_MAX_TIME", 30.0, env="XM_MAX_TIME")
 tol = 1e-4
 solver_time = 0.0
 solver_start = time.perf_counter()
-if MODE == 1:
-    XM.solve_mixed(output_path,RANK,1e-6,LAMBDA,XM_MAX_ITERS,sphere_ratio)
-elif MODE == 2:
-    XM.solve(output_path, RANK, 1e-4, LAMBDA, XM_MAX_ITERS)
+XM.solve_mixed(output_path,RANK,1e-6,LAMBDA,XM_MAX_TIME,sphere_ratio)
 solver_time += time.perf_counter() - solver_start
 
 # visualize the camera poses
@@ -2253,7 +2210,6 @@ Q,_ = load_matrix_from_bin(output_path + '/Q.bin')
 print("S1 is", s[0])
 
 # recover p and t
-# details refer to our paper
 R_real, s_real, p_est, t_est, optimal_rank = recover_XM(Q, R, s, Abar, LAMBDA, return_rank=True)
 R_real = np.asarray(R_real, dtype=np.float64)
 s_real = np.asarray(s_real, dtype=np.float64)
@@ -2299,11 +2255,6 @@ if USE_XM2:
 
   indices_to_remove = np.where(error > threshold)[0]
 
-  # threshold = np.percentile(error, 100)  # 90th percentile
-
-  # indices_to_remove_2 = np.where(error > threshold)[0] 
-  # print("different: ", np.setxor1d(indices_to_remove, indices_to_remove_2))
-
   edges = np.delete(edges, indices_to_remove, axis=0)
   weights = np.delete(weights, indices_to_remove)
   rgbs = np.delete(rgbs, indices_to_remove, axis=0)
@@ -2323,10 +2274,7 @@ if USE_XM2:
   # )
 
   # second run
-  if MODE == 1:
-      edges, landmarks, weights, rgbs, indices = checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=False, frame_min_points=FRAME_MIN_POINTS)
-  elif MODE == 2:
-      edges, landmarks, weights, rgbs, indices = checklandmarks(edges, landmarks, weights, rgbs, N, M, frame_min_points=FRAME_MIN_POINTS)
+  edges, landmarks, weights, rgbs, indices = checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=False, frame_min_points=FRAME_MIN_POINTS)
   N_old = np.where(indices_all > -1)[0].shape[0]
   indices_all_copy = indices_all.copy()
   for i in range(N_old):
@@ -2338,10 +2286,7 @@ if USE_XM2:
   create_matrix(weights, edges, landmarks, output_path, penalty_t=PENALTY_T)
 
   solver_start = time.perf_counter()
-  if MODE == 1:
-      XM.solve_mixed(output_path, RANK,1e-4, 0.0, XM_MAX_ITERS, sphere_ratio)
-  elif MODE == 2:
-      XM.solve(output_path, RANK, 1e-4, 0.0, XM_MAX_ITERS)
+  XM.solve_mixed(output_path, RANK,1e-4, 0.0, XM_MAX_TIME, sphere_ratio)
   solver_time += time.perf_counter() - solver_start
 
   Abar,_ = load_matrix_from_bin(output_path + '/Abar.bin')
@@ -2349,8 +2294,8 @@ if USE_XM2:
   s,_ = load_matrix_from_bin(output_path + '/s.bin')
   Q,_ = load_matrix_from_bin(output_path + '/Q.bin')        
 
-  # recover p and t
-  R_real, s_real, p_est, t_est, optimal_rank = recover_XM(Q, R, s, Abar, LAMBDA, return_rank=True)
+  # recover p and t (the second solve ran with lambda = 0)
+  R_real, s_real, p_est, t_est, optimal_rank = recover_XM(Q, R, s, Abar, 0.0, return_rank=True)
   R_real = np.asarray(R_real, dtype=np.float64)
   s_real = np.asarray(s_real, dtype=np.float64)
   p_est = np.asarray(p_est, dtype=np.float64)
@@ -2436,10 +2381,12 @@ if args.use_ceres:
     #         )
     #     else:
     #         print("[depth-bend] skipped: no kept Ceres points.")
-    if np.any(ceres_point_keep_mask):
+    if ceres_point_keep_mask is not None and np.any(ceres_point_keep_mask):
         p_est = p_est[:, ceres_point_keep_mask]
     else:
-        print("[Ceres point scale] no Ceres points survived residual filtering; keeping finite/norm-filtered points.")
+        # The keep mask only exists when the point-scale fit above runs; otherwise keep the finite points.
+        if ceres_point_keep_mask is not None:
+            print("[Ceres point scale] no Ceres points survived residual filtering; keeping all finite points.")
         finite_p = np.isfinite(p_est).all(axis=0)
         p_est = p_est[:, finite_p]
     sR_real = build_sR_real(R_real, s_real, N)
@@ -2484,7 +2431,6 @@ for i in range(N):
 # only visualize the camera poses
 # print(extrinsics)
 
-# uncomment this if you need to check the accuracy
 # calculate accuracy
 
 result_metrics = {
@@ -2658,8 +2604,7 @@ result = {
     "dataset_name": Path(dataset_path).name,
     "dataset_path": dataset_path,
     "depth_source": utils.definitions.depth_source,
-    "mode": MODE,
-    "sphere_ratio": sphere_ratio if MODE == 1 else None,
+    "sphere_ratio": sphere_ratio,
     "weight_mode": weight_mode,
     "use_ceres": bool(args.use_ceres),
     "penalty_t": float(PENALTY_T),

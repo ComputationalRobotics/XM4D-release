@@ -7,7 +7,6 @@ import numpy as np
 # This is a script only for Replica dataset
 # If you are loading your own dataset, please write you own script
 # If you are not comparing with groud truth, R and t is not neccessary, but OTHER is needed
-# TODO: don't know intrinsics
 
 REPLICA_K = np.array([[600, 0, 599.5], [0, 600, 339.5], [0, 0, 1]], dtype=np.float64)
 REPLICA_DEPTH_SCALE = float(os.environ.get("XM_REPLICA_DEPTH_SCALE", "6553.5"))

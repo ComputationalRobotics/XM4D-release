@@ -121,9 +121,6 @@ def XM_Ceres_interface(
         points0.append(p_XM[:, i])
 
     options = pyceres.SolverOptions()
-    # Direct SPARSE_SCHUR + monotonic steps: deterministic and (for these
-    # problem sizes) faster than the iterative/non-monotonic combo, which was
-    # non-reproducible and occasionally wandered into bad local minima.
     options.linear_solver_type = getattr(
         pyceres.LinearSolverType,
         os.environ.get("XM_CERES_LINEAR_SOLVER", "ITERATIVE_SCHUR"),
@@ -134,9 +131,8 @@ def XM_Ceres_interface(
     options.num_threads = int(os.environ.get("XM_CERES_NUM_THREADS", "100"))
     options.max_num_iterations = 1000
     options.eta = 1e-2
-    # Per-dataset (Python/configs/*.json), env-overridable. Defaults keep Ceres'
-    # convergence tolerance (1e-6) and the previous 60s cap, so other datasets are
-    # unchanged; Sintel sets a looser 1e-5 tolerance + a 20s cap for faster solves.
+    # Per-dataset (Python/configs/*.json), env-overridable. Defaults: Ceres' 1e-6 tolerance
+    # and a 60 s wall-clock limit.
     options.function_tolerance = dataset_config.get_float(
         "CERES_FUNCTION_TOLERANCE", 1e-6, env="CERES_FUNCTION_TOLERANCE"
     )
@@ -145,8 +141,6 @@ def XM_Ceres_interface(
     )
 
     def add_translation_regularization(prob, t_blocks, t_ref):
-        # 1. Anchor the first and last frame distance:
-        #    ||t_0 - t_end|| = ||t_0_ref - t_end_ref||
         scale = np.linalg.norm(t_ref[-1] - t_ref[0])
         if float(penalty_t_rel) > 0.0 and N >= 2:
             anchor_target = float(
@@ -222,7 +216,6 @@ def XM_Ceres_interface(
             for i in range(N):
                 prob.set_parameter_block_constant(quat[i])
 
-        # Regularization is only added in the first pass.
         if use_regularization:
             add_translation_regularization(prob, t, t_init)
 
@@ -271,10 +264,6 @@ def XM_Ceres_interface(
         obs_keep, quat0, t0, points0, use_regularization=False
     )
 
-    # Second pass:
-    # 1. Measure per-point reprojection error from the first-pass solution.
-    # 2. Remove the top 10% worst 3D points.
-    # 3. Solve again without any regularization.
     point_err_sum, point_err_cnt = compute_point_reprojection_stats(
         quat, t, points, obs_keep
     )

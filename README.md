@@ -10,8 +10,7 @@ Gaussian training) will be added to this branch next.
 
 | path | what |
 |---|---|
-| `Python/static_solver.py` | XM static solver: camera poses + static points from 2D tracks and monocular depth |
-| `Python/eval_xm.py` | pose evaluation (TEASER++ similarity alignment, ATE / RPE) |
+| `Python/static_solver.py` | XM static solver: camera poses + static points from 2D tracks and monocular depth; scores the poses against the GT (TEASER++ similarity alignment, ATE / RPE) |
 | `Python/configs/<dataset>.json` | per-dataset parameters, selected automatically from the dataset name |
 | `Python/utils/` | GT readers, problem construction, Ceres refinement |
 | `XM/` | XM solver core: CUDA source (`src/`, `include/`, CMake) and our compiled Python binding `XM/build/XM.cpython-310-x86_64-linux-gnu.so` |
@@ -65,15 +64,21 @@ are written to `metrics.json` there. The dataset averages are also written to `r
 
 ## Expected results
 
-Dataset averages from `bash scripts/run_camera.sh all` (one RTX 6000 Ada, about 35 min in total):
+Dataset averages from `bash scripts/run_camera.sh all` (one RTX 6000 Ada, about 40 min in total):
 
 | dataset | scenes | ATE-T | RPE-T | RPE-R |
 |---|---|---|---|---|
-| Sintel | 23 | 0.017 | 0.025 | 0.041 |
+| Sintel | 23 | 0.017 | 0.026 | 0.040 |
 | Replica | 8 | 0.002 | 0.002 | 0.001 |
 | TUM | 6 | 0.006 | 0.008 | 0.006 |
 | Syn4D | 8 | 0.002 | 0.002 | 0.003 |
 | NVIDIA | 7 | 0.038 | 0.056 | 0.005 |
-| DyCheck | 7 | 0.008 | 0.010 | 0.010 |
-| IMC | 6 | 0.042 | 0.067 | 0.042 |
+| DyCheck | 7 | 0.008 | 0.011 | 0.010 |
+| IMC | 6 | 0.046 | 0.076 | 0.048 |
+
+Per-scene numbers can differ slightly between runs: the Ceres refinement is multi-threaded and not bit-for-bit
+repeatable, and the solves stop at wall-clock limits (`XM_MAX_TIME`, `CERES_MAX_SOLVE_TIME` in the configs).
+IMC varies the most. Its row is the mean of three runs, whose averages spanned ATE-T 0.044–0.051.
+`XM_MAX_TIME` limits each rank of the staircase separately. IMC uses 40 s: `gate_01` needs 34 s at rank 4, and with
+the default 30 s it is cut off and fails about half the time. On a slower GPU, raise `XM_MAX_TIME`.
 

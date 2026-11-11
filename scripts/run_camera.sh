@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# Camera benchmark (paper table "Camera accuracy averaged per dataset", column Ours): solve every scene with the
-# XM static solver and score it with the paper's protocol.
+# Camera benchmark
 #   bash scripts/run_camera.sh all                    # all 7 datasets, 65 scenes
 #   bash scripts/run_camera.sh Sintel [scene ...]     # one dataset: Sintel Replica TUM Syn4D NVIDIA Dycheck IMC
 # Inputs are read from datasets/<Dataset>/<scene>/ and never written: each scene is solved in
 # results/camera/<Dataset>/<scene>/ (links to the inputs + the solver outputs), its metrics go to metrics.json there.
 # At the end the average of every dataset with results is printed and written to results/camera/averages.txt.
-# Protocol: Sintel/Replica/TUM/Syn4D are scored by eval_xm.py, NVIDIA/Dycheck/IMC by the solver's own metrics.
-# Env: PYTHON (default python, i.e. the activated xm4d env), GPU (default 0).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PYTHON:-python}
 GPU=${GPU:-0}
-# one OpenMP/MKL thread: multi-threaded Ceres and TEASER++ (max clique) are not repeatable
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 declare -A SCENES=(
   [Sintel]="alley_1 alley_2 ambush_2 ambush_4 ambush_5 ambush_6 ambush_7 bamboo_1 bamboo_2 bandage_1 bandage_2 cave_2 cave_4 market_2 market_5 market_6 mountain_1 shaman_2 shaman_3 sleeping_1 sleeping_2 temple_2 temple_3"
@@ -36,18 +32,12 @@ solve() {
   local t0=$SECONDS
   (cd "$ROOT/Python" && XM_DATASET_ROOT=$out XM_DATASET_CAT=$cat XM_DATASET_NAME=$scene XM_DEPTH_SOURCE=$depth \
      CUDA_VISIBLE_DEVICES=$GPU $PY static_solver.py $flags) > "$out/solve.log" 2>&1
-  local log=$out/solve.log protocol=static_solver
-  case $cat in Sintel|Replica|TUM|Syn4D)
-    (cd "$ROOT/Python" && XM_DATASET_CAT=$cat XM_DATASET_NAME=$scene $PY eval_xm.py --scene-dir "$out" \
-       --sparse-dir "$out/outputs/result_XM.npz" --gt-type "${cat,,}" --json) > "$out/eval.log" 2>&1
-    log=$out/eval.log; protocol=eval_xm ;;
-  esac
-  $PY - "$log" "$out/metrics.json" "$protocol" $((SECONDS - t0)) <<'EOF'
+  $PY - "$out/solve.log" "$out/metrics.json" $((SECONDS - t0)) <<'EOF'
 import json, sys
-log, out, protocol, secs = sys.argv[1:]
+log, out, secs = sys.argv[1:]
 r = json.loads([l for l in open(log) if l.startswith("RESULT_JSON")][-1].split(":", 1)[1])
 m = {k: r[k] for k in ("ATE_T", "RPE_T", "RPE_R", "ATE_R")}
-json.dump(dict(m, protocol=protocol, seconds=int(secs)), open(out, "w"), indent=1)
+json.dump(dict(m, seconds=int(secs)), open(out, "w"), indent=1)
 print(" ".join(f"{k} {v:.4f}" for k, v in m.items()))
 EOF
 }
@@ -60,8 +50,13 @@ elif [ -n "${1:-}" ]; then
   [ $# -gt 0 ] || set -- ${SCENES[$cat]}
   set -- $(for s in "$@"; do echo "$cat/$s"; done)
 else
-  sed -n '2,10p' "$0"; exit 1
+  awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 1
 fi
+$PY -c "import pyceres, pycolmap, teaserpp_python" 2>/dev/null || {
+  echo "WARNING: pyceres / pycolmap / teaserpp_python not importable with $PY (needed for the Ceres refinement and"
+  echo "TEASER++ alignment). Install them as in the README or set PYTHON to the right interpreter. Stopping."
+  exit 1
+}
 for cs in "$@"; do
   echo -n "${cs}: "
   solve "${cs%%/*}" "${cs#*/}" || echo "FAILED (see results/camera/$cs/solve.log)"
