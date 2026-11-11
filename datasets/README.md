@@ -32,3 +32,30 @@ Every scene also has `images/`. All scenes except Replica and IMC also have `mas
   SIFT matches chained by the GLOMAP view graph, lifted with UniDepth depth and the GT intrinsics.
 
 Sintel `mountain_1` and `shaman_2` take their `cameras/` from the MPI-Sintel depth training set (`camdata_left`).
+
+# Preprocessed inputs for the rendering benchmark
+
+`datasets/render/<Dataset>/<scene>/` holds the inputs of `scripts/run_render.sh` for the 22 rendering scenes (Syn4D 8,
+NVIDIA 7, Dycheck 7). They are the inputs the paper's rendering numbers were produced from: everything up to and
+including the merged dynamic tracks, plus the camera solve of that run. The rendering run starts from these files, not
+from the outputs of `scripts/run_camera.sh`.
+
+## Per-scene contents
+
+| dataset | scene folder | `outputs/` |
+|---|---|---|
+| Syn4D | `images/`, `masks/`, `colmap/` (GT cameras), `novel/` (held-out views) | common files |
+| NVIDIA | `images/`, `masks/`, `poses_bounds.npy` (GT cameras), `novel_orig/` (held-out views) | common files, without `results_all.npz` |
+| Dycheck | `images/`, `masks/`, `cameras/` (GT cameras), `depth/` (iPhone LiDAR), `frame_map.txt`, `novel/` (held-out views) | common files + `depths/` |
+
+Common files in `outputs/`:
+
+- **`tracks_dynamic_merged.npz`**: the merged 2D tracks on the dynamic objects. The EDG stages start from these.
+- **`tracks_dynamic_only.npz`**: the dynamic tracks before merging.
+- **`result_XM.npz`**: the camera solve of the rendering run (XM static solver).
+- **`output_tapnet_da3.npz`**: the static 2D tracks that camera solve used.
+- **`depth_anything_3/`**: Depth Anything 3 depth, confidence and intrinsics per frame.
+- **`results_all.npz`**: static landmarks and the lifted dynamic tracks from the stages before the EDG. The completion
+  stage writes the EDG into a copy of it.
+- **`depths/`** (Dycheck only): the depth variants. The rendering run lifts with `lidar_filled`, the iPhone LiDAR depth
+  with holes filled.

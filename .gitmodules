@@ -1,3 +1,6 @@
 [submodule "deps/TEASER-plusplus"]
 	path = deps/TEASER-plusplus
 	url = https://github.com/MIT-SPARK/TEASER-plusplus.git
+[submodule "deps/gsplat"]
+	path = deps/gsplat
+	url = https://github.com/nerfstudio-project/gsplat.git
