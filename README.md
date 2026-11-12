@@ -2,7 +2,7 @@
 
 **Haoyu Han, Jack Benarroch Jedlicki, Jiahui Lei, Heng Yang**
 
-[Project page](https://computationalrobotics.seas.harvard.edu/XM4D/) · [arXiv](https://arxiv.org/abs/2611.07902)
+### [Project page](https://computationalrobotics.seas.harvard.edu/XM4D/) · [arXiv](https://arxiv.org/abs/2611.07902)
 
 XM4D splits 4D reconstruction into a static and a dynamic stage, and solves each one with a certifiably globally optimal
 GPU solver before any photometric training.
