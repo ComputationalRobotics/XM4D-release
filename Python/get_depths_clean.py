@@ -11,7 +11,10 @@ from scipy.spatial.transform import Rotation
 from scipy.stats import trim_mean
 
 import open3d as o3d
+from check_masks import require_masks
 from utils import dataset_config
+
+require_masks()  # step 0: the scene's moving-object masks must exist (make_masks_sam3.ipynb)
 
 # DA3 predicts poorly on extreme aspect ratios (e.g. Sintel's 2.35:1). Optionally cap the
 # input aspect before inference so it stays near DA3's training distribution; the depth is
