@@ -37,6 +37,7 @@ import XM
 ########################################################################
 
 output_dir = utils.definitions.output_dir
+np.random.seed(0)  # farthest-point sampling (utils/edg.py) starts from a random point
 
 BUILD_EDG_SEGMENR_LENGTH = 11  # step in tracking + 1 to include last frame
 # Cap total EDG node count. The segment solver is ~O(M^3) in node count M, and

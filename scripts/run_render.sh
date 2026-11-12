@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Rendering benchmark (EDG + 4D Gaussians), from the merged dynamic tracks on
+# Rendering benchmark (EDG + 4D Gaussians), from the camera solve of scripts/run_camera.sh on
 #   bash scripts/run_render.sh all                    # Syn4D, NVIDIA, Dycheck: 22 scenes
 #   bash scripts/run_render.sh Dycheck [scene ...]    # one dataset: Syn4D NVIDIA Dycheck
 # Run it in the xm4d env (EDG stages); the 4D Gaussian training and evaluation run in the xm4d-gs env (GS_ENV).
-# Inputs are read from datasets/render/<Dataset>/<scene>/ and never written: each scene runs in
-# results/render/<Dataset>/<scene>/ (links to the inputs, copies of the files a stage rewrites, all outputs); its
-# novel-view metrics go to metrics.json there. At the end the dataset averages are printed and written to
-# results/render/averages.txt.
+# Inputs are datasets/<Dataset>/<scene>/ (never written) and results/camera/<Dataset>/<scene>/outputs/result_XM.npz:
+# each scene runs in results/render/<Dataset>/<scene>/ (links to the inputs, copies of the files a stage rewrites,
+# all outputs); its novel-view metrics go to metrics.json there. At the end the dataset averages are printed and
+# written to results/render/averages.txt.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PYTHON:-python}
@@ -24,15 +24,16 @@ gs() { conda run -n "$GS_ENV" --no-capture-output "$@"; }
 run() { local n=$1; shift; local t0=$SECONDS; "$@" || { echo "STAGE $n FAILED"; exit 1; }; echo "STAGE $n $((SECONDS - t0))s"; }
 
 # results/render/<Dataset>/<scene>: inputs linked, except the files a stage rewrites in place, which are copied
-# (complete_edg_table writes into results_all.npz; train_4dgs_edg copies the active depth into depth_anything_3/).
+# (train_4dgs_edg copies the active depth into depth_anything_3/), plus a copy of the camera solve.
 setup_scene() {
-  local src=$1 out=$2
+  local src=$1 out=$2 cam=$3
   rm -rf "$out"; mkdir -p "$out/outputs/depth_anything_3"
+  cp "$cam" "$out/outputs/result_XM.npz"
   for e in "$src"/*; do [ "$(basename "$e")" = outputs ] || ln -s "$e" "$out/"; done
   for e in "$src"/outputs/*; do
     case $(basename "$e") in
       depth_anything_3) ;;
-      result_XM.npz|output_tapnet_da3.npz|tracks_dynamic_merged.npz|results_all.npz)
+      output_tapnet_da3.npz|tracks_dynamic_merged.npz)
         cp "$e" "$out/outputs/" ;;
       *) ln -s "$e" "$out/outputs/" ;;
     esac
@@ -49,6 +50,7 @@ recommended_train() { grep -A1 "Recommended gsplat 4DGS training command" "$1" |
 render_syn4d() {
   local O=$1/outputs log=$1/prepare.log
   run smooth    $PY optimize_dynamic_tracks.py --input tracks_dynamic_merged.npz
+  run edg_old   $PY EDG_old.py
   run build_edg $PY build_edg.py --gt-depth
   run edg_solve $PY EDG_test_fast.py --merged --seg-len 10 --n-seg 2 --n-runs 50
   run complete  $PY complete_edg_table.py --merged
@@ -88,6 +90,7 @@ render_dycheck() {
   local O=$1/outputs
   export XM_DEPTH_VARIANT=lidar_filled
   run lift      $PY optimize_dynamic_tracks.py --input tracks_dynamic_merged.npz --iters 0 --output tracks_dynamic_merged_lift.npz
+  run edg_old   $PY EDG_old.py
   run build_edg $PY build_edg.py --gt-depth --tracks tracks_dynamic_merged_lift.npz
   run edg_solve $PY EDG_test_fast.py --tracks tracks_dynamic_merged_lift.npz
   run complete  $PY complete_edg_table.py --tracks tracks_dynamic_merged_lift.npz
@@ -104,9 +107,11 @@ render_dycheck() {
 
 render() {
   local cat=$1 scene=$2
-  local src=$ROOT/datasets/render/$cat/$scene out=$ROOT/results/render/$cat/$scene
+  local src=$ROOT/datasets/$cat/$scene out=$ROOT/results/render/$cat/$scene
+  local cam=$ROOT/results/camera/$cat/$scene/outputs/result_XM.npz
   [ -d "$src" ] || { echo "missing $src (see datasets/README.md)"; return 1; }
-  setup_scene "$src" "$out"
+  [ -f "$cam" ] || { echo "missing $cam: run scripts/run_camera.sh $cat $scene first"; return 1; }
+  setup_scene "$src" "$out" "$cam"
   local t0=$SECONDS
   (cd "$ROOT/Python" && export XM_DATASET_ROOT=$out XM_DATASET_CAT=$cat XM_DATASET_NAME=$scene &&
      case $cat in Syn4D) render_syn4d "$out" ;; NVIDIA) render_nvidia "$out" ;; Dycheck) render_dycheck "$out" ;; esac

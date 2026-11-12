@@ -27,11 +27,14 @@ solve() {
   rm -rf "$out"; mkdir -p "$out/outputs"
   for e in "$src"/*; do [ "$(basename "$e")" = outputs ] || ln -s "$e" "$out/"; done
   for e in "$src"/outputs/*; do ln -s "$e" "$out/outputs/"; done
-  local depth=da3 flags="--no-da3-scale --json"
+  # the rendering datasets also fit the per-frame depth scale (it does not change the poses; the 4D Gaussian
+  # training lifts depth with it); Dycheck solves on the LiDAR depth that the rendering uses too
+  local depth=da3 flags="--no-da3-scale --json" variant=aligned_da3
+  case $cat in Syn4D|NVIDIA) flags="--json" ;; Dycheck) flags="--json" variant=lidar_filled ;; esac
   [ "$cat" = IMC ] && { depth=unidepth; flags="--use-ceres --no-visualize --json"; }
   local t0=$SECONDS
   (cd "$ROOT/Python" && XM_DATASET_ROOT=$out XM_DATASET_CAT=$cat XM_DATASET_NAME=$scene XM_DEPTH_SOURCE=$depth \
-     CUDA_VISIBLE_DEVICES=$GPU $PY static_solver.py $flags) > "$out/solve.log" 2>&1
+     XM_DEPTH_VARIANT=$variant CUDA_VISIBLE_DEVICES=$GPU $PY static_solver.py $flags) > "$out/solve.log" 2>&1
   $PY - "$out/solve.log" "$out/metrics.json" $((SECONDS - t0)) <<'EOF'
 import json, sys
 log, out, secs = sys.argv[1:]
