@@ -2,12 +2,20 @@
 
 ## Download
 
-Download link: **TODO**.
+[Google Drive folder](https://drive.google.com/drive/folders/1j1M6_MA6fdwu9S6mOCl-iGKQvYR1UkIU?usp=sharing): one
+archive per dataset (`Sintel`, `Replica`, `TUM`, `Syn4D`, `NVIDIA`, `Dycheck`, `IMC`; 19 GB in total) and
+`SHA256SUMS`. The rendering benchmark needs only `Syn4D`, `NVIDIA` and `Dycheck`.
 
 ## Where to put it
 
-Unpack it into this folder, `datasets/`, so that the layout below exists. The runners only read from here and write
-everything to `results/`.
+Put the archives into this folder, `datasets/`, and unpack them there, so that the layout below exists. The runners
+only read from here and write everything to `results/`.
+
+```bash
+cd datasets
+sha256sum -c --ignore-missing SHA256SUMS      # optional: checks the downloaded archives
+for f in *.tar.gz; do tar -xzf "$f"; done
+```
 
 ## Expected structure
 
