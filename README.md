@@ -6,19 +6,35 @@ Reproduces the XM4D camera-accuracy and novel-view-rendering results from prepro
 
 Requirements: Linux x86-64, an NVIDIA GPU with a driver for CUDA 12, a CUDA 12.x toolkit, conda, and a C++ compiler.
 
-### Camera env (`xm4d`)
+Two conda envs: `xm4d` runs everything except the 4D Gaussian training and evaluation, which `run_render.sh` runs in
+`xm4d-gs` (newer PyTorch, gsplat). Keep PyTorch 2.9.1 in `xm4d`: the EDG completion reproduces our run only on this
+version.
 
 ```bash
 git clone --recursive -b reproduce https://github.com/ComputationalRobotics/XM4D-release.git
 cd XM4D-release
+
 conda create -n xm4d python=3.10 eigen=3.4.0 cmake -c conda-forge -y
 conda activate xm4d
 pip install -r requirements.txt
 pip install ./deps/TEASER-plusplus
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
 
 export CUDA_HOME=/usr/local/cuda-12.4      # your CUDA 12.x toolkit
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+conda create -n xm4d-gs python=3.10 -y
+conda activate xm4d-gs
+pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements-gs.txt
+pip install --no-build-isolation git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5
+pip install --no-build-isolation -e deps/gsplat        # compiles gsplat's CUDA kernels (CUDA_HOME as above)
+bash scripts/setup_gsplat.sh
+conda activate xm4d
 ```
+
+`scripts/setup_gsplat.sh` copies gsplat's `examples/` to `build/gsplat_examples/` and puts our two modified files from
+`gsplat_patch/examples/` over it; the `deps/gsplat` submodule stays unmodified.
 
 The compiled XM binding `XM/build/XM.cpython-310-x86_64-linux-gnu.so` (Python 3.10, CUDA 12.4) works as it is. To
 build it yourself instead (needs CUDA 12 `nvcc` and CMake ≥ 3.18):
@@ -33,31 +49,6 @@ Check:
 ```bash
 cd Python && python -c "import sys; sys.path.append('../XM/build'); import XM, teaserpp_python, pyceres, pycolmap; print('ok')" && cd ..
 ```
-
-### Rendering envs
-
-PyTorch in `xm4d` for the EDG stages. Keep 2.9.1: the EDG completion reproduces our run only on this version.
-
-```bash
-conda activate xm4d
-pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
-```
-
-A second env, `xm4d-gs`, for the 4D Gaussian training and evaluation:
-
-```bash
-conda create -n xm4d-gs python=3.10 -y
-conda activate xm4d-gs
-pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements-gs.txt
-pip install --no-build-isolation git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5
-pip install --no-build-isolation -e deps/gsplat        # compiles gsplat's CUDA kernels (CUDA_HOME as above)
-bash scripts/setup_gsplat.sh
-conda activate xm4d
-```
-
-`scripts/setup_gsplat.sh` copies gsplat's `examples/` to `build/gsplat_examples/` and puts our two modified files from
-`gsplat_patch/examples/` over it; the `deps/gsplat` submodule stays unmodified.
 
 ### Data
 
