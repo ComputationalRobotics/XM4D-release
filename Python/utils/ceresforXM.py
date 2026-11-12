@@ -134,9 +134,8 @@ def XM_Ceres_interface(
     options.num_threads = int(os.environ.get("XM_CERES_NUM_THREADS", "100"))
     options.max_num_iterations = 1000
     options.eta = 1e-2
-    # Per-dataset (Python/configs/*.json), env-overridable. Defaults keep Ceres'
-    # convergence tolerance (1e-6) and the previous 60s cap, so other datasets are
-    # unchanged; Sintel sets a looser 1e-5 tolerance + a 20s cap for faster solves.
+    # config.json values, env-overridable. Defaults keep Ceres' convergence tolerance (1e-6)
+    # and a 60s cap.
     options.function_tolerance = dataset_config.get_float(
         "CERES_FUNCTION_TOLERANCE", 1e-6, env="CERES_FUNCTION_TOLERANCE"
     )

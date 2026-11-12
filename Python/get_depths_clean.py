@@ -21,10 +21,8 @@ require_masks()  # step 0: the scene's moving-object masks must exist (make_mask
 # resized back afterwards, and because the resize is per-axis linear the intrinsic rescaling
 # (sx=W_orig/W_pred, sy=H_orig/H_pred) still maps DA3's predicted K back correctly.
 #
-# These depth-stage knobs are per-dataset config values (Python/configs/*.json), so only the
-# datasets that set them are affected. Defaults are DA3's originals -- no aspect cap,
-# process_res 504, per-frame intrinsics -- so other datasets reproduce unchanged and don't
-# OOM on wide images. Env vars still override. Enabled for Sintel in configs/sintel.json.
+# These depth-stage knobs are config values (config.json at the repo root); env vars still override.
+# Defaults are DA3's originals -- no aspect cap, process_res 504, per-frame intrinsics.
 #   DA3_ASPECT_CAP        <= 1.0 disables; e.g. 2.0 caps the long side to 2:1
 #   DA3_PROCESS_RES       DA3 internal inference resolution (default 504)
 #   DA3_PROCESS_RES_METHOD "upper_bound_resize" (default) or "upper_bound_crop"

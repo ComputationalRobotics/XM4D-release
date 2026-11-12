@@ -20,70 +20,95 @@ GPU solver before any photometric training.
 
 ## Install
 
-Requirements: Linux x86-64, an NVIDIA GPU with a driver for CUDA 12, and conda.
+Requirements: Linux x86-64, an NVIDIA GPU with a driver that supports CUDA 12.8, conda, git, wget, and a C++ compiler
+(to build TEASER++).
 
 ```bash
 git clone https://github.com/ComputationalRobotics/XM4D-release.git
 cd XM4D-release
-
-# third-party code goes in deps/ (not tracked)
-git clone https://github.com/google-deepmind/tapnet.git deps/tapnet
-mkdir -p deps/tapnet/checkpoints
-wget -P deps/tapnet/checkpoints https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt
-git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git deps/Depth-Anything-3
-git clone https://github.com/MIT-SPARK/TEASER-plusplus.git deps/TEASER-plusplus
-git clone https://github.com/facebookresearch/sam3.git ~/sam3
 ```
 
-Each stage runs in its own conda environment. The runner scripts in `Python/bashes/` activate them by these names:
-
-| env | stage | what it needs |
-|---|---|---|
-| `sam3` | 0. masks | [SAM 3](https://github.com/facebookresearch/sam3) installed per its README, plus `jupyter ipympl`. The `facebook/sam3` weights on Hugging Face are gated: request access, then `hf auth login` |
-| `da3` | 1. depth | [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) installed per its README (`pip install -e deps/Depth-Anything-3`), plus `opencv-python open3d scipy` |
-| `tapnet` | 2. tracking | `torch torchvision einops opencv-python scipy tqdm`. The scripts import TAPNext from `deps/tapnet` directly |
-| `XM` | 3–5. solver, deformation graph, 4DGS data | see below |
-
-The `XM` environment runs the XM solver. Its compiled binding `XM/build/XM.cpython-310-x86_64-linux-gnu.so` (Python
-3.10, CUDA 12.4) ships with this repo:
+Each stage of the pipeline runs in its own conda environment, with its own install script. A script clones its
+third-party code into `deps/` at the tested commit, creates the environment with pinned versions, and ends with a check
+that the environment can run its stage: the imports, the GPU and the model weights. A ready environment prints
+`[check_env] <env>: ready`. Run the check again at any time:
 
 ```bash
-conda create -n XM python=3.10 eigen=3.4.0 cmake -c conda-forge -y
-conda activate XM
-pip install numpy scipy opencv-python open3d networkx pyceres pycolmap pandas matplotlib tqdm viser
-pip install ./deps/TEASER-plusplus
-
-export CUDA_HOME=/usr/local/cuda-12.4      # your CUDA 12.x toolkit
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+conda activate <env> && python install/check_env.py <env>
 ```
 
-The exact package versions behind the paper's numbers are pinned in the `reproduce` branch's `requirements.txt`.
+The scripts never modify an existing environment. Set `ENV=<name>` to install under another name.
+
+### 1. `sam3`: masks (step 0)
+
+> [!WARNING]
+> **The SAM 3 checkpoint is gated: request access yourself.** Open [huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3),
+> request access to the weights and wait for the approval. Then log in with your Hugging Face token. Without access, the
+> check below fails at "SAM 3 weights".
+
+```bash
+bash install/sam3.sh
+conda activate sam3 && hf auth login          # once, with your Hugging Face token
+python install/check_env.py sam3
+```
+
+Installs [SAM 3](https://github.com/facebookresearch/sam3) (`deps/sam3`) with PyTorch 2.10 and Jupyter. The
+checkpoint (3.5 GB) is downloaded on the first run of the mask notebook.
+
+### 2. `da3`: depth (step 1)
+
+```bash
+bash install/da3.sh
+```
+
+Installs [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) (`deps/Depth-Anything-3`) with
+PyTorch 2.9. The model (DA3NESTED-GIANT-LARGE-1.1, 6.8 GB) is downloaded from Hugging Face on the first run.
+
+### 3. `tapnet`: tracking (step 2)
+
+```bash
+bash install/tapnet.sh
+```
+
+Installs the [TAPNet](https://github.com/google-deepmind/tapnet) code (`deps/tapnet`) and the TAPNext++ checkpoint
+(2.5 GB) with PyTorch 2.9. The check runs TAPNext++ on the GPU.
+
+### 4. `XM`: solver, deformation graph and 4DGS data (steps 3–5)
+
+```bash
+bash install/XM.sh
+```
+
+Installs the environment for the XM solver, which ships compiled in `XM/build` (Python 3.10, CUDA 12.4). Its CUDA
+libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and COLMAP bindings, and
+[TEASER++](https://github.com/MIT-SPARK/TEASER-plusplus) (`deps/TEASER-plusplus`, built from source).
 
 ## Usage
 
-Put the frames of a video in a scene folder:
+Put the frames of your video in a scene folder:
 
 ```
-datasets/<Category>/<scene>/images/     frames, sorted by the number in the file name
+datasets/<scene>/images/     frames (.jpg or .png), sorted by the number in the file name
 ```
 
-Use `Custom` (`.jpg` frames) for your own videos. The other categories (`DAVIS`, `Dycheck`, `NVIDIA`, `Sintel`,
-`Syn4D`, `TUM`, `Replica`, `IMC`, `Lab`) set the frame pattern in `Python/utils/definitions.py` and the parameters in
-`Python/configs/<category>.json`, on top of `Python/configs/default.json`.
+Then set the scene in `config.json` at the repo root. The scene can also be an absolute path to a folder anywhere.
+The same file holds every parameter of the pipeline; change them there.
 
-Every step runs from `Python/` and reads the scene from the same environment variables:
-
-```bash
-cd Python
-export XM_DATASET_CAT=Custom XM_DATASET_NAME=my_scene   # -> datasets/Custom/my_scene
-# or point at a scene folder anywhere:  export XM_DATASET_ROOT=/path/to/my_scene
+```json
+{
+  "scene": "my_scene",
+  "no_masks": false,
+  ...
+}
 ```
+
+Every step runs from `Python/` and reads `config.json`; no environment variables are needed.
 
 ### Step 0: masks of the moving objects
 
-XM starts from a mask of everything that moves. Open `make_masks_sam3.ipynb` in the `sam3` environment, with the
-variables above set before Jupyter starts or in the notebook's first cell. For each moving object, give SAM 3 a few
-clicked points or a text prompt. SAM 3 tracks the object through the whole video; check the result and save it:
+XM starts from a mask of everything that moves. Open `Python/make_masks_sam3.ipynb` in the `sam3` environment. For
+each moving object, give SAM 3 a few clicked points or a text prompt. SAM 3 tracks the object through the whole video;
+check the result and save it:
 
 ```python
 track_points("dog", frame=0, points=[(420, 310)])   # points on the object (labels=[1, 0, ...] marks negatives)
@@ -99,11 +124,14 @@ Each object is saved in its own folder, and every save rebuilds the combined mas
 <scene>/masks/<frame>.png             all objects combined
 ```
 
-Step 1 stops with a warning while these masks are missing. For a scene without any moving object, set `XM_NO_MASKS=1`.
+Step 1 stops with a warning while these masks are missing. For a scene without any moving object, set
+`"no_masks": true` in `config.json`.
 
 ### Steps 1–5
 
 ```bash
+cd Python
+
 conda activate da3
 python get_depths_clean.py           # 1. monocular depth (Depth Anything 3) -> outputs/depth_anything_3/
 
@@ -114,12 +142,13 @@ python dynamic_tracking.py           #    and of the moving objects -> outputs/t
 conda activate XM
 python static_solver.py              # 3. cameras + static points (XM solver) -> outputs/result_XM.npz
 python EDG_old.py                    # 4. embedded deformation graph + dynamic 3D tracks -> outputs/results_all.npz
-python train_4dgs_edg.py             # 5. 4D Gaussian training data -> outputs/gs_edg_target_0000/
+python train_4dgs_edg.py --dynamic-init-source depth   # 5. 4D Gaussian training data -> outputs/gs_edg_target_0000/
 ```
 
-Set `EDG_NO_VIZ=1` to skip the Open3D window at the end of step 4. Step 5 writes the training set and prints the
-matching training command for a modified gsplat `simple_trainer.py` (`--edg-results`). That trainer is not included
-in this repository yet.
+Set `EDG_NO_VIZ=1` to skip the Open3D window at the end of step 4. Step 5 lifts the moving points from the depth and
+the masks (`--dynamic-init-source depth`; without it, step 5 expects a shape prior). It writes the training set and
+prints the matching training command for a modified gsplat `simple_trainer.py` (`--edg-results`). That trainer is not
+included in this repository yet.
 
 ## Citation
 

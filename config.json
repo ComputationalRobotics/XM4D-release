@@ -1,4 +1,7 @@
 {
+  "scene": "my_scene",
+  "no_masks": false,
+
   "MOVE_DELETE_FLOW_ERROR_THRESHOLD": 10.0,
   "ONLINE_RESAMPLE_GRID": 60,
   "ONLINE_RESAMPLE_RADIUS": 4.0,

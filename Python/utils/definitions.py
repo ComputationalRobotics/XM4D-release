@@ -4,63 +4,28 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MPI_SINTEL_TRAINING_ROOT = Path(
-    os.environ.get(
-        "XM_MPI_SINTEL_ROOT",
-        REPO_ROOT / "datasets" / "MPI-Sintel-depth-training-20150305" / "training",
-    )
-)
 
-dataset_cat = os.environ.get("XM_DATASET_CAT", "Syn4D")  # "Sintel", "DAVIS", "TUM", "Replica", "Syn4D", "Lab", "IMC", "NVIDIA" or "Custom"
-dataset_name = os.environ.get("XM_DATASET_NAME", "bear1")  # e.g. "alley_2" for Sintel, "bear" for DAVIS, "rgbd_dataset_freiburg1_desk" for TUM
+# ---- the scene and every parameter: config.json at the repo root ----
+# "scene" is a folder in datasets/ (or an absolute path) holding the video frames in images/. The other keys are the
+# tracking / solver / training parameters, read through utils.dataset_config (an environment variable of the same
+# name still overrides a parameter).
+CONFIG_PATH = REPO_ROOT / "config.json"
+active_config = json.loads(CONFIG_PATH.read_text())
+active_config_name = CONFIG_PATH.name
+rootpath = Path(active_config["scene"])
+if not rootpath.is_absolute():
+    rootpath = REPO_ROOT / "datasets" / rootpath
+dataset_cat = "Custom"   # own video: no ground truth; the intrinsics come from Depth Anything 3
+dataset_name = rootpath.name
 depth_source = os.environ.get("XM_DEPTH_SOURCE", "da3")
-
-# ---- per-dataset parameter config (Python/configs/*.json) ----
-# Selected from dataset_cat/dataset_name above, so changing the dataset here
-# automatically switches the tracking+solver parameters. Syn4D splits by scene
-# prefix (casa* vs bear*). dataset_config.py exposes these values (env vars win).
-CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
-
-
-def _config_key(cat, name):
-    if cat == "Syn4D":
-        return "syn4d_casa" if str(name).lower().startswith("casa") else "syn4d_bear"
-    return str(cat).lower()
-
-
-active_config_name = _config_key(dataset_cat, dataset_name)
-
-
-def _load_active_config():
-    cfg = {}
-    for fname in ("default.json", f"{active_config_name}.json"):
-        path = CONFIG_DIR / fname
-        if path.exists():
-            cfg.update(json.loads(path.read_text()))
-    return cfg
-
-
-active_config = _load_active_config()
-print(f"[config] {dataset_cat}/{dataset_name} -> configs/{active_config_name}.json")
-
-rootpath = Path(
-    os.environ.get(
-        "XM_DATASET_ROOT",
-        str(REPO_ROOT / "datasets" / dataset_cat / dataset_name),
-    )
-)
+print(f"[config] {CONFIG_PATH} -> scene {rootpath}")
 
 output_dir = (rootpath / "outputs").absolute()
 tracks_dynamics_path = rootpath / "outputs" / "tracks_dynamic_only.npz"
 video_dir = rootpath / "images"
 mask_dir = rootpath / os.environ.get("XM_MASK_SUBDIR", "masks")
 
-if dataset_cat == "Sintel":
-    _local_gt_depth_dir = rootpath / "depths"
-    _fallback_gt_depth_dir = MPI_SINTEL_TRAINING_ROOT / "depth" / dataset_name
-    gt_depth_dir = _local_gt_depth_dir if _local_gt_depth_dir.exists() else _fallback_gt_depth_dir
-else:
-    gt_depth_dir = rootpath / "depths"
+gt_depth_dir = rootpath / "depths"
 
 da3_depth_dir = rootpath / "outputs" / "depth_anything_3"
 vggt_output_dir = rootpath / "output_vggt"
@@ -88,33 +53,6 @@ print(f"[depth] variant={depth_variant} -> {active_depth_dir}"
 
 segment_length = 10  # number of frames per segment for tracking
 
-if dataset_cat == "DAVIS":
-    image_pattern = "*.jpg"
-    mask_pattern = "*.png"
-elif dataset_cat == "TUM":
-    image_pattern = "*.png"
-    mask_pattern = "*.png"
-elif dataset_cat == "Sintel":
-    image_pattern = "*.png"
-    mask_pattern = "*.png"
-elif dataset_cat == "Replica":
-    image_pattern = "*.jpg"
-    mask_pattern = "*.png"
-elif dataset_cat == "Syn4D":
-    image_pattern = "*.jpg"
-    mask_pattern = "*.png"
-elif dataset_cat == "Lab":
-    image_pattern = "*.jpg"
-    mask_pattern = "*.png"
-elif dataset_cat == "IMC":
-    image_pattern = "*.jpg"
-    mask_pattern = "*.png"
-elif dataset_cat == "NVIDIA":
-    image_pattern = "*.png"
-    mask_pattern = "*.png"
-elif dataset_cat == "Dycheck":
-    image_pattern = "*.png"
-    mask_pattern = "*.png"
-elif dataset_cat == "Custom":
-    image_pattern = "*.jpg"
-    mask_pattern = "*.png"
+# frames: .jpg, or .png when the scene has no .jpg frames
+image_pattern = "*.jpg" if any(video_dir.glob("*.jpg")) else "*.png"
+mask_pattern = "*.png"

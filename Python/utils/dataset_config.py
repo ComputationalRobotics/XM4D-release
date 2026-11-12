@@ -1,13 +1,8 @@
-"""Accessor for the per-dataset parameter config.
-
-The config file itself is chosen and loaded in ``utils.definitions`` (from
-``XM_DATASET_CAT`` / ``XM_DATASET_NAME``), so changing the dataset there switches
-the parameters automatically. This module just exposes those values with
-environment-variable overrides.
+"""Accessor for the parameters in config.json at the repo root (loaded in ``utils.definitions``).
 
 Resolution order for every parameter (first hit wins):
-    1. environment variable (manual override, keeps existing run scripts working)
-    2. the active dataset config (definitions.active_config: dataset json over default.json)
+    1. environment variable (manual override)
+    2. config.json (definitions.active_config)
     3. the hard-coded ``default`` passed at the call site
 """
 
