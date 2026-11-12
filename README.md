@@ -153,6 +153,12 @@ the masks (`--dynamic-init-source depth`; without it, step 5 expects a shape pri
 prints the matching training command for a modified gsplat `simple_trainer.py` (`--edg-results`). That trainer is not
 included in this repository yet.
 
+## License
+
+The code is released under the [MIT License](LICENSE). The example scene `datasets/sintel_alley_2` comes from MPI
+Sintel (© Blender Foundation, CC BY 3.0; see its README). The third-party code and models installed into `deps/` keep
+their own licenses, e.g. SAM 3 under Meta's SAM License.
+
 ## Citation
 
 ```bibtex
