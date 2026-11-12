@@ -83,6 +83,19 @@ Installs the environment for the XM solver, which ships compiled in `XM/build` (
 libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and COLMAP bindings, and
 [TEASER++](https://github.com/MIT-SPARK/TEASER-plusplus) (`deps/TEASER-plusplus`, built from source).
 
+### One environment instead (optional)
+
+The four environments above are the reference setup. Alternatively, everything installs into one environment `xm4d`
+(Python 3.10, PyTorch 2.9 for every stage). The script runs all four checks:
+
+```bash
+bash install/xm4d.sh
+```
+
+Then use `conda activate xm4d` wherever the steps below activate `sam3`, `da3`, `tapnet` or `XM`. On our tests it gives
+the same results as the four environments within their run-to-run variation. The one consistent difference is that the
+SAM 3 masks differ in fewer than 0.1% of the mask pixels (PyTorch 2.9 instead of 2.10).
+
 ## Usage
 
 The repo ships an example scene, `datasets/sintel_alley_2`: 10 frames of MPI Sintel `alley_2` with the mask of the
