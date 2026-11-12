@@ -1,5 +1,5 @@
 {
-  "scene": "my_scene",
+  "scene": "sintel_alley_2",
   "no_masks": false,
 
   "MOVE_DELETE_FLOW_ERROR_THRESHOLD": 10.0,

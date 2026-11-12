@@ -85,7 +85,10 @@ libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and C
 
 ## Usage
 
-Put the frames of your video in a scene folder:
+The repo ships an example scene, `datasets/sintel_alley_2`: 10 frames of MPI Sintel `alley_2` with the mask of the
+running girl. `config.json` points to it, so every step below runs on it as it is.
+
+For your own video, put its frames in a scene folder:
 
 ```
 datasets/<scene>/images/     frames (.jpg or .png), sorted by the number in the file name
