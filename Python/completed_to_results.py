@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert the NEW-pipeline EDG result (outputs/edg_test/edg_completed.npz, from complete_edg_table.py)
-into the results_all.npz format consumed by train_4dgs_edg.py + deps/gsplat simple_trainer (the EDG_old
-contract): the dict-style `edg_reconstruct` / `edg_rotation` / `dynamics_points_reconstruct` are REPLACED
+into the results_all.npz format consumed by train_4dgs_edg.py + deps/gsplat simple_trainer:
+the dict-style `edg_reconstruct` / `edg_rotation` / `dynamics_points_reconstruct` are REPLACED
 from the completed solve; every other key (static_landmarks, prior_*, da3_frame_scale, ...) is carried
 over unchanged from a BASE results_all npz (the static/prior side of the pipeline is untouched).
 
@@ -63,7 +63,8 @@ def convert(completed_path, base_path, out_path):
             dyn_tracks[int(gid)] = p
 
     base = np.load(str(base_path), allow_pickle=True)
-    n_base_keys = len(base.files)
+    n_carried = len(set(base.files) - {"edg_reconstruct", "edg_rotation", "dynamics_points_reconstruct",
+                                       "edg_edges_union"})
     out = {k: base[k] for k in base.files}                            # materialise before any overwrite
     base.close()
     out["edg_reconstruct"] = np.array(edg_tracks, dtype=object)
@@ -76,7 +77,7 @@ def convert(completed_path, base_path, out_path):
     T = er.shape[1]
     print(f"[convert] {out_path}: {len(edg_tracks)} EDG nodes (hold-filled {n_filled} node-frames), "
           f"{len(dyn_tracks)} dyn tracks, T={T}; base keys carried: "
-          f"{n_base_keys - 3} (from {Path(base_path).name})")
+          f"{n_carried} (from {Path(base_path).name})")
     return len(edg_tracks), len(dyn_tracks)
 
 

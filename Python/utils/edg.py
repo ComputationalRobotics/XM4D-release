@@ -60,20 +60,6 @@ def scatter_solved_frame_vector(rt, name, T, default=1.0):
 	return out
 
 
-def farthest_point_sample(points: np.ndarray, num_samples: int) -> np.ndarray:
-	"""Farthest point sampling on NxD points, returning selected indices."""
-	if points.shape[0] <= num_samples:
-		return np.arange(points.shape[0])
-	chosen = np.zeros(num_samples, dtype=int)
-	chosen[0] = np.random.randint(points.shape[0])
-	dist = np.full(points.shape[0], np.inf)
-	for i in range(1, num_samples):
-		last_pt = points[chosen[i - 1]]
-		dist = np.minimum(dist, np.sum((points - last_pt) ** 2, axis=1))
-		chosen[i] = np.argmax(dist)
-	return chosen
-
-
 def draw_dynamic_graph(
 	frame: np.ndarray,
 	pts: np.ndarray,
@@ -162,57 +148,6 @@ def visualize_2d_trajectories_on_images(
 		out_frames.append(img)
 
 	return out_frames
-
-
-def build_initial_edg_graph(
-	tracks_xy_candidate: np.ndarray,
-	valid_mask_global: np.ndarray,
-	seed_frame: int,
-	graph_samples: int = 30,
-	graph_knn: int = 6,
-) -> dict[str, Any]:
-	"""Build initial EDG nodes/edges at a selected seed frame.
-
-	Returns only candidate-local graph node indices and edge list.
-	"""
-	if tracks_xy_candidate.ndim != 4 or tracks_xy_candidate.shape[0] != 1:
-		raise ValueError(
-			f"Expected tracks_xy_candidate shape [1,N,T,2], got {tracks_xy_candidate.shape}"
-		)
-	if valid_mask_global.ndim != 2:
-		raise ValueError(f"Expected valid_mask_global shape [N,T], got {valid_mask_global.shape}")
-	if valid_mask_global.shape[0] != tracks_xy_candidate.shape[1]:
-		raise ValueError(
-			f"Shape mismatch: valid_mask_global {valid_mask_global.shape} vs tracks_xy_candidate {tracks_xy_candidate.shape}"
-		)
-	if seed_frame < 0 or seed_frame >= tracks_xy_candidate.shape[2]:
-		raise ValueError(f"seed_frame {seed_frame} out of range for T={tracks_xy_candidate.shape[2]}")
-
-	pts0 = tracks_xy_candidate[0, :, seed_frame, :]
-	mask0 = valid_mask_global[:, seed_frame]
-	init_idx = np.where(mask0)[0]
-	if init_idx.size == 0:
-		raise RuntimeError("No dynamic points in selected seed frame for initial EDG.")
-
-	n0 = min(graph_samples, init_idx.size)
-	seed_local = farthest_point_sample(pts0[init_idx], n0)
-	graph_indices = init_idx[seed_local].tolist()  # candidate-local ids
-
-	edges = set()
-	if len(graph_indices) > 1:
-		P0 = tracks_xy_candidate[0, graph_indices, seed_frame, :]
-		d2 = np.sum((P0[:, None, :] - P0[None, :, :]) ** 2, axis=2)
-		k0 = min(graph_knn, len(graph_indices) - 1)
-		for i in range(len(graph_indices)):
-			nn = np.argsort(d2[i])[1 : k0 + 1]
-			for j in nn:
-				a, b = (i, j) if i < j else (j, i)
-				edges.add((a, b))
-
-	return {
-		"graph_indices": graph_indices,
-		"graph_edges": sorted(edges),
-	}
 
 
 def smoothness_metric(traj_LD: np.ndarray, mask_L: np.ndarray, frame_ids: np.ndarray) -> float:

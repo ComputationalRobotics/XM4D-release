@@ -14,7 +14,7 @@ def load_davis_gt(dataset_path):
 
     # DAVIS has no GT cameras; use DA3 intrinsics instead.
     intrinsics_candidates = [
-        os.path.join(dataset_path, "outputs", "depth_anything_3", "intrinsics.npy"),
+        os.path.join(dataset_path, "outputs", "depth", "intrinsics.npy"),
     ]
     intrinsics_path = next((p for p in intrinsics_candidates if os.path.isfile(p)), None)
     if intrinsics_path is None:

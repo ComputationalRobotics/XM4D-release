@@ -4,14 +4,14 @@
 Reads a merged dynamic-tracks npz for its 2D observations only (tracks_xy, occluded, dynamic_obs_mask) -- the
 merge is 2D-only, so the 3D is (re)LIFTED HERE from the depth selected in utils.definitions
 (definitions.depth_variant -> active_depth_maps, default 'aligned_da3'; override with XM_DEPTH_VARIANT). It lifts
-each 2D obs to camera frame from that depth, then to WORLD via the solved camera poses (EDG_old.py:104:
-X_world = s*R @ x_cam + t), then optimizes each track's per-frame WORLD position with three losses (weights
+each 2D obs to camera frame from that depth, then to WORLD via the solved camera poses
+(X_world = s*R @ x_cam + t), then optimizes each track's per-frame WORLD position with three losses (weights
 DECREASE, reproj most important):
   1. reprojection: project(X_t) close to the 2D observation  -> keeps X on the camera ray   (--w-reproj)
   2. smoothness  : ||X_t - X_{t-1}||^2 small                  -> temporal smoothness          (--w-smooth)
   3. prior       : ||X_t - X_init_t||^2 small                 -> stay near the lifted init     (--w-prior)
-Finally converts the smoothed WORLD tracks back to per-frame CAMERA frame (inverse of EDG_old.py:104:
-x_cam = (1/s) R^T (X_world - t)) and writes tracks_dynamic_smoothed.npz (same schema; tracks_xy/occluded/
+Finally converts the smoothed WORLD tracks back to per-frame CAMERA frame
+(x_cam = (1/s) R^T (X_world - t)) and writes tracks_dynamic_smoothed.npz (same schema; tracks_xy/occluded/
 dynamic_obs_mask copied from source). EDG then consumes it via  EDG_TRACKS_PATH=.../tracks_dynamic_smoothed.npz.
 
 Scene is selected by XM_DATASET_CAT / XM_DATASET_NAME (via utils.definitions).
@@ -287,7 +287,7 @@ def main():
                            args.w_reproj, args.w_smooth, args.w_prior, args.iters, args.lr, args.device)
     print(f"  smoothed {Q} tracks: reproj RMSE={rmse:.3f}px (w {args.w_reproj}/{args.w_smooth}/{args.w_prior})")
 
-    # WORLD -> per-frame CAMERA frame (inverse of EDG_old.py:104): x_cam = (1/s) R^T (X_world - t)
+    # WORLD -> per-frame CAMERA frame: x_cam = (1/s) R^T (X_world - t)
     invR_over_s = np.transpose(R_raw, (0, 2, 1)) / s_raw[:, None, None]
     xyz_cam_new = np.einsum("tij,qtj->qti", invR_over_s, X_opt - t_raw[None, :, :])
     xyz_cam_new[~vis] = xyz_cam[~vis]                                # keep invalid entries as-is

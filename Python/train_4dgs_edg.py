@@ -47,7 +47,7 @@ DYNA_MAX_POINTS = 100000  # <=0 keeps all dynamic prior points
 DYNA_MASK_DILATE_PX = 0
 DYNAMIC_INIT_SOURCE = "prior"  # "prior" or "depth"
 DEPTH_SOURCE = "da3"  # "da3" or "gt"
-# Intrinsics come from one source: outputs/depth_anything_3/intrinsics.npy (written by
+# Intrinsics come from one source: outputs/depth/intrinsics.npy (written by
 # get_depths_clean.py with the GT-or-DA3 choice already applied). Used for cameras.txt
 # and the dense static lift, so the whole pipeline stays on one intrinsic.
 DEPTH_MAX = 10.0      # GT-depth static filter only; DA3 static lift uses outlier removal plus per-frame scaling
@@ -1015,7 +1015,7 @@ def _compute_depth_grad(depth: np.ndarray) -> np.ndarray:
 
 
 def _load_da3_intrinsics_for_depth_lifting(rootpath: Path, T: int) -> np.ndarray:
-    intrinsics_path = Path(rootpath) / "outputs" / "depth_anything_3" / "intrinsics.npy"
+    intrinsics_path = Path(rootpath) / "outputs" / "depth" / "intrinsics.npy"
     if not intrinsics_path.exists():
         raise FileNotFoundError(f"Missing DA3 intrinsics for solver-camera lifting: {intrinsics_path}")
     K_all = np.load(intrinsics_path).astype(np.float64)
@@ -1661,7 +1661,7 @@ def _load_depth_maps_for_static_lifting(
     """
     src = depth_source.strip().lower()
     if src == "da3":
-        depth_path = rootpath / "outputs" / "depth_anything_3" / "depth_maps.npy"
+        depth_path = rootpath / "outputs" / "depth" / "depth_maps.npy"
         if not depth_path.exists():
             return None, str(depth_path)
         depth_maps = np.load(str(depth_path)).astype(np.float64)
@@ -1674,7 +1674,7 @@ def _load_depth_maps_for_static_lifting(
         # coverage. LiDAR uint16 PNGs live in <scene>/depth/ (singular). DA3 is already at solver
         # scale and cross-frame consistent, so convert LiDAR to solver units via the per-scene
         # median DA3/LiDAR ratio, then use LiDAR where valid and DA3 elsewhere.
-        da3_path = rootpath / "outputs" / "depth_anything_3" / "depth_maps.npy"
+        da3_path = rootpath / "outputs" / "depth" / "depth_maps.npy"
         if not da3_path.exists():
             return None, str(da3_path)
         da3 = np.load(str(da3_path)).astype(np.float64)
@@ -1791,7 +1791,7 @@ def prepare_4dgs_dataset(
     """Prepare the COLMAP text dataset consumed by gsplat simple_trainer.py."""
     output_dir = Path(output_dir)
 
-    # Keep the da3 slot (depth_anything_3/depth_maps.npy) = the depth variant selected in utils.definitions,
+    # Keep the da3 slot (depth/depth_maps.npy) = the depth variant selected in utils.definitions,
     # so BOTH the static lift below AND simple_trainer's depth loss (both read that slot) use the SAME depth
     # as the dynamic tracks (optimize_dynamic_tracks reads definitions.active_depth_maps). Single source of
     # truth = definitions.depth_variant across the whole 4DGS stage.

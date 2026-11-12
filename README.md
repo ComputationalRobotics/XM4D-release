@@ -36,7 +36,7 @@ cd Python && python -c "import sys; sys.path.append('../XM/build'); import XM, t
 
 ### Rendering envs
 
-PyTorch in `xm4d` for the EDG stages. Keep 2.9.1: the EDG completion is bit-exact with our run only on this version.
+PyTorch in `xm4d` for the EDG stages. Keep 2.9.1: the EDG completion reproduces our run only on this version.
 
 ```bash
 conda activate xm4d

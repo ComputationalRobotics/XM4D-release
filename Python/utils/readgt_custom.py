@@ -47,7 +47,7 @@ def load_custom_gt(dataset_path: str | Path):
     if not image_paths:
         raise FileNotFoundError(f"No Custom images found in {image_dir}")
 
-    intrinsics_path = root / "outputs" / "depth_anything_3" / "intrinsics.npy"
+    intrinsics_path = root / "outputs" / "depth" / "intrinsics.npy"
     intrinsics = None
     if intrinsics_path.is_file():
         intrinsics = np.load(intrinsics_path).astype(np.float64)

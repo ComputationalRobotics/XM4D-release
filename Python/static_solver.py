@@ -643,7 +643,7 @@ def _unproject(x, y, z, K):
 
 
 def _load_intrinsics_npy(t_expected):
-    """The single solver intrinsic source: outputs/depth_anything_3/intrinsics.npy.
+    """The single solver intrinsic source: outputs/depth/intrinsics.npy.
     Returns K_all (T, 3, 3), or None if absent.
     """
     intrinsics_path = Path(utils.definitions.da3_depth_dir) / "intrinsics.npy"

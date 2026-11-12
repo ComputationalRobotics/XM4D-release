@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""EDG_test.py -- per-segment EDG solve with the SAME solver + carryover logic as EDG_old.py, but with
+"""EDG_test.py -- per-segment EDG solve, chained across segments, with
 the EDG topology AND dynamic skinning taken from build_edg.py (outputs/edg_topology.npz). Visualizes
 after each segment.
 
-Kept identical to EDG_old.py:
+Solver and chaining:
   * 11-frame segment windows with a 1-frame OVERLAP; rest frame = FIRST frame of the window; the WHOLE
     window is solved (so the last/overlap frame is always present -- that is what chains segments).
   * world lift with the XM solver scale "s":  X_world = s_t * R_t @ x_cam + t_t.
@@ -11,9 +11,9 @@ Kept identical to EDG_old.py:
     rest anchored (trev=1, R=I, p=0).
   * CROSS-SEGMENT PRESERVATION: a persistent per-node global-rotation store (init identity) spans the
     whole video. Each segment reads rest_global = store[node, rest_frame] -- written by the PREVIOUS
-    segment at the shared overlap frame -- and composes R_global = rest_global @ R_local before storing
-    (EDG_old's _compose_global_rotations). So a node's rotation ACCUMULATES across segments instead of
-    resetting; positions are re-anchored to observations at each rest (exactly as EDG_old).
+    segment at the shared overlap frame -- and composes R_global = rest_global @ R_local before storing.
+    So a node's rotation ACCUMULATES across segments instead of
+    resetting; positions are re-anchored to observations at each rest.
 
 Swapped in from build_edg.py (edg_topology.npz):
   * EDG nodes + edges = the FIXED global topology, restricted per segment to nodes valid at the rest frame.
@@ -41,8 +41,8 @@ import XM
 
 # ------------------------------------------------------------------------------ load tracks + topology
 def load_all(tracks_path=None):
-    """Load tracks (same npz as EDG_old, or the merged tracks if tracks_path is given), world-lift with
-    scale 's' (EDG_old convention), and load the fixed EDG topology + dynamic->EDG skinning assignment
+    """Load tracks (outputs/tracks_dynamic_only.npz, or the merged tracks if tracks_path is given), world-lift
+    with scale 's' (X_world = s R x_cam + t), and load the fixed EDG topology + dynamic->EDG skinning assignment
     produced by build_edg.py. tracks_path MUST match what build_edg used (same track id space)."""
     root = Path(utils.definitions.rootpath)
     data = np.load(tracks_path or utils.definitions.tracks_dynamics_path, allow_pickle=True)
@@ -92,13 +92,12 @@ def load_all(tracks_path=None):
 
 # ------------------------------------------------------------------------------- per-segment solver glue
 def build_segment_inputs(D, seg_frames, edg_pos, max_dyn=None, rng=None):
-    """Assemble solver inputs for one segment (EDG_old convention: rest = first frame; the WHOLE window is
-    solved). None if unsolvable.
+    """Assemble solver inputs for one segment (rest = first frame; the WHOLE window is solved). None if unsolvable.
 
     EDG nodes present in this segment = (nodes OBSERVED at the rest frame) UNION (nodes CARRIED from a
     previous segment -- i.e. already holding a finite pose at this rest/overlap frame in `edg_pos`). A
     carried node that is NOT observed at the rest frame keeps its carried REST POSE as g_i, so it stays in
-    the graph and keeps being solved (EDG_old's seed-missing-nodes behaviour). Because every previous-
+    the graph and keeps being solved. Because every previous-
     segment node writes its pose at the shared overlap frame, the node set grows monotonically.
 
     Skinning neighbours = each dynamic point's assigned nodes (dyn_edg_edges) that are present, inverse-
@@ -348,7 +347,7 @@ def visualize_segment(edg_deformed, R_global_seg, dyn_mapped, inp, node_r, seg_i
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--seg-len", type=int, default=11, help="segment window length (EDG_old: 11, 1-frame overlap)")
+    ap.add_argument("--seg-len", type=int, default=11, help="segment window length (consecutive windows overlap by 1 frame)")
     ap.add_argument("--w-arap", type=float, default=0.2)
     ap.add_argument("--w-smooth", type=float, default=0.2)
     ap.add_argument("--max-segments", type=int, default=0, help="stop after N segments (0 = all; for testing)")
@@ -371,7 +370,7 @@ def main():
     diag = float(np.linalg.norm(gp.max(0) - gp.min(0))) if gp.size else 1.0
     node_r = max(1e-4, 0.006 * diag)
 
-    # persistent global stores over the whole video (chained across segments, like EDG_old)
+    # persistent global stores over the whole video (chained across segments)
     edg_rot = {}   # gid -> [T,3,3] global rotation (init identity; carries across the overlap frame)
     edg_pos = {}   # gid -> [T,3] deformed EDG-node position
     dyn_pos = {}   # gid -> [T,3] deformed dynamic-point position
@@ -400,7 +399,7 @@ def main():
             edg_deformed, R_edg, dyn_mapped, unique_kps = solve_segment(inp, out_dir, args.w_arap, args.w_smooth)
             present, frames, rest = inp["present"], inp["frames"], inp["rest"]
 
-            # --- CHAIN (EDG_old): compose this segment's local rotations onto the global rotation carried
+            # --- CHAIN: compose this segment's local rotations onto the global rotation carried
             #     at the rest/overlap frame from the previous segment; scatter global R + positions. ---
             R_global_seg = np.empty_like(R_edg)                    # [M,T_rev,3,3] composed, for viz/save
             for j, gid in enumerate(present.tolist()):
@@ -428,7 +427,7 @@ def main():
             break
         if end >= T:
             break
-        current = end - 1                      # EDG_old: 1-frame overlap (next rest = this window's last frame)
+        current = end - 1                      # 1-frame overlap (next rest = this window's last frame)
         seg_id += 1
 
     # save the chained global trajectories (rotation accumulates across segments; positions per frame)

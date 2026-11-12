@@ -650,7 +650,7 @@ class Dataset:
         # EDG_DEPTH_MAPS_FILE lets the depth-loss target be swapped (e.g. a LiDAR+DA3 hybrid already
         # in solver units) instead of the raw DA3 depth_maps.npy. Default keeps DA3 behavior.
         _depth_fname = os.environ.get("EDG_DEPTH_MAPS_FILE", "depth_maps.npy")
-        depth_path = Path(parser.data_dir).parent / "depth_anything_3" / _depth_fname
+        depth_path = Path(parser.data_dir).parent / "depth" / _depth_fname
         if self.load_depths and depth_path.exists():
             self.da3_depth_maps = np.load(depth_path).astype(np.float32)
             if self.da3_depth_maps.ndim != 3:

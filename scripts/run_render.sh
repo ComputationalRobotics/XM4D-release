@@ -24,23 +24,23 @@ gs() { conda run -n "$GS_ENV" --no-capture-output "$@"; }
 run() { local n=$1; shift; local t0=$SECONDS; "$@" || { echo "STAGE $n FAILED"; exit 1; }; echo "STAGE $n $((SECONDS - t0))s"; }
 
 # results/render/<Dataset>/<scene>: inputs linked, except the files a stage rewrites in place, which are copied
-# (train_4dgs_edg copies the active depth into depth_anything_3/), plus a copy of the camera solve.
+# (train_4dgs_edg copies the active depth into depth/), plus a copy of the camera solve.
 setup_scene() {
   local src=$1 out=$2 cam=$3
-  rm -rf "$out"; mkdir -p "$out/outputs/depth_anything_3"
+  rm -rf "$out"; mkdir -p "$out/outputs/depth"
   cp "$cam" "$out/outputs/result_XM.npz"
   for e in "$src"/*; do [ "$(basename "$e")" = outputs ] || ln -s "$e" "$out/"; done
   for e in "$src"/outputs/*; do
     case $(basename "$e") in
-      depth_anything_3) ;;
+      depth) ;;
       output_tapnet_da3.npz|tracks_dynamic_merged.npz)
         cp "$e" "$out/outputs/" ;;
       *) ln -s "$e" "$out/outputs/" ;;
     esac
   done
-  for e in "$src"/outputs/depth_anything_3/*; do
-    if [ "$(basename "$e")" = depth_maps.npy ]; then cp "$e" "$out/outputs/depth_anything_3/"
-    else ln -s "$e" "$out/outputs/depth_anything_3/"; fi
+  for e in "$src"/outputs/depth/*; do
+    if [ "$(basename "$e")" = depth_maps.npy ]; then cp "$e" "$out/outputs/depth/"
+    else ln -s "$e" "$out/outputs/depth/"; fi
   done
 }
 
@@ -50,7 +50,7 @@ recommended_train() { grep -A1 "Recommended gsplat 4DGS training command" "$1" |
 render_syn4d() {
   local O=$1/outputs log=$1/prepare.log
   run smooth    $PY optimize_dynamic_tracks.py --input tracks_dynamic_merged.npz
-  run edg_old   $PY EDG_old.py
+  run init      $PY init_results_all.py
   run build_edg $PY build_edg.py --gt-depth
   run edg_solve $PY EDG_test_fast.py --merged --seg-len 10 --n-seg 2 --n-runs 50
   run complete  $PY complete_edg_table.py --merged
@@ -64,7 +64,7 @@ render_syn4d() {
 render_nvidia() {
   local O=$1/outputs log=$1/prepare.log
   run smooth    $PY optimize_dynamic_tracks.py --input tracks_dynamic_merged.npz
-  run edg_old   $PY EDG_old.py
+  run init      $PY init_results_all.py
   run build_edg $PY build_edg.py --merged --horizon-only --no-2d
   run edg_solve $PY EDG_test_fast.py --merged --seg-len 6 --n-seg 2 --n-runs 50
   run complete  $PY complete_edg_table.py --merged
@@ -88,9 +88,8 @@ EOF
 
 render_dycheck() {
   local O=$1/outputs
-  export XM_DEPTH_VARIANT=lidar_filled
   run lift      $PY optimize_dynamic_tracks.py --input tracks_dynamic_merged.npz --iters 0 --output tracks_dynamic_merged_lift.npz
-  run edg_old   $PY EDG_old.py
+  run init      $PY init_results_all.py
   run build_edg $PY build_edg.py --gt-depth --tracks tracks_dynamic_merged_lift.npz
   run edg_solve $PY EDG_test_fast.py --tracks tracks_dynamic_merged_lift.npz
   run complete  $PY complete_edg_table.py --tracks tracks_dynamic_merged_lift.npz
@@ -102,7 +101,6 @@ render_dycheck() {
   rm -f "$O"/gsplat/ckpts/ckpt_*.pt
   run eval      gs python estimate_ours_render_tto.py --gaussians "$O/gsplat/ckpts/final_rank0.pt" \
                   --output-dir "$O/render_eval" --use-covisible-mask
-  unset XM_DEPTH_VARIANT
 }
 
 render() {

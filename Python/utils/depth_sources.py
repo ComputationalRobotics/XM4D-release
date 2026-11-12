@@ -136,7 +136,7 @@ def load_depth_source(depth_source: str, definitions) -> tuple[np.ndarray, np.nd
     source = depth_source.strip().lower()
     if source in {"da3", "depth_anything", "depthanything", "depth_anything_3"}:
         # Honor the selected depth variant (definitions.active_depth_maps -> outputs/depths/<depth_variant>/
-        # depth_maps.npy); falls back to the da3 slot (depth_anything_3/depth_maps.npy) when no variant
+        # depth_maps.npy); falls back to the da3 slot (depth/depth_maps.npy) when no variant
         # catalog exists, so non-Dycheck datasets are unchanged.
         depth_path = Path(getattr(definitions, "active_depth_maps",
                                   Path(definitions.da3_depth_dir) / "depth_maps.npy"))

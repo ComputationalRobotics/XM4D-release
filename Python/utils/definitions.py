@@ -75,7 +75,7 @@ if dataset_cat == "Sintel":
 else:
     gt_depth_dir = rootpath / "depths"
 
-da3_depth_dir = rootpath / "outputs" / "depth_anything_3"
+da3_depth_dir = rootpath / "outputs" / "depth"
 vggt_output_dir = rootpath / "output_vggt"
 vggt_depth_dir = vggt_output_dir / "depths"
 vggt_conf_dir = vggt_output_dir / "depth_conf"
@@ -90,7 +90,7 @@ unidepth_depth_dir = Path(os.environ.get("XM_UNIDEPTH_DEPTH_DIR", str(unidepth_o
 # One of the folders built by build_depth_variants.py under outputs/depths/<variant>/ :
 #   raw_da3 | aligned_da3 | lidar | lidar_filled
 # Default: aligned_da3 (raw DepthAnything-3 per-frame scale+shift aligned to LiDAR). Override: XM_DEPTH_VARIANT.
-# Falls back to the da3 slot (depth_anything_3/) if the variant catalog hasn't been built for this scene yet.
+# Falls back to the da3 slot (depth/) if the variant catalog hasn't been built for this scene yet.
 depth_variant = os.environ.get("XM_DEPTH_VARIANT", "aligned_da3")
 _variant_dir = rootpath / "outputs" / "depths" / depth_variant
 active_depth_dir = _variant_dir if (_variant_dir / "depth_maps.npy").exists() else da3_depth_dir

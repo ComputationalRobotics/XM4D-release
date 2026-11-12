@@ -1621,7 +1621,7 @@ class Runner:
         self.da3_depth_maps = None
         dm_path = _find_upwards(
             Path(cfg.data_dir),
-            ["depth_anything_3/depth_maps.npy", "outputs/depth_anything_3/depth_maps.npy"],
+            ["depth/depth_maps.npy", "outputs/depth/depth_maps.npy"],
             max_depth=4,
         )
         if dm_path is not None:

@@ -503,7 +503,7 @@ def _colmap_sparse_candidates(scene_dir: Path) -> list[Path]:
     candidates.extend([
         scene_dir / "outputs" / "gs_edg_target_0000" / "sparse" / "0",
         scene_dir / "outputs" / "gs_edg_target_0000" / "sparse",
-        scene_dir / "outputs" / "depth_anything_3" / "sparse",
+        scene_dir / "outputs" / "depth" / "sparse",
         scene_dir / "colmap" / "sparse" / "0",
         scene_dir / "colmap" / "sparse",
         scene_dir / "sparse",
