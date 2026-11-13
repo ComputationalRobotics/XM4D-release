@@ -131,17 +131,19 @@ track_points("dog", frame=0, points=[(420, 310)])   # points on the object (labe
 track_text("people", "person")                      # or a text prompt
 preview_video("dog")                                 # check it
 save("dog")
+merge_masks()                                        # at the end: all objects into the mask the pipeline reads
 ```
 
-Each object is saved in its own folder, and every save rebuilds the combined mask that the pipeline reads:
+Each object is saved in its own folder; `merge_masks()` (in `Python/check_masks.py`, callable outside the notebook
+too) writes their union, the mask that the pipeline reads:
 
 ```
 <scene>/masks/<object>/<frame>.png    one folder per object (white = object)
-<scene>/masks/<frame>.png             all objects combined
+<scene>/masks/<frame>.png             all objects merged
 ```
 
-Step 1 stops with a warning while these masks are missing. For a scene without any moving object, set
-`"no_masks": true` in `config.json`.
+Step 1 merges the object folders itself when they are not merged yet, and stops with a warning while masks are missing.
+For a scene without any moving object, set `"no_masks": true` in `config.json`.
 
 ### Steps 1–5
 
