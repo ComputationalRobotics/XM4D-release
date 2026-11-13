@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Conda env for step 0 without a notebook (Python/make_masks_gmos.py): GMOS finds the moving objects automatically.
-# usage: bash install/gmos.sh      (ENV=<name> bash install/gmos.sh to use another env name)
+# usage: bash install/gmos.sh [env name]      (default env name: gmos)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-ENV="${ENV:-gmos}"
+ENV="${1:-gmos}"
 
 clone https://github.com/Jyxarthur/gmos.git "$ROOT/deps/gmos" 2411284
 CK="$ROOT/deps/gmos/checkpoints"

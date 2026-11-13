@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Conda env for step 1, monocular depth (Python/get_depths_clean.py): Depth Anything 3.
-# usage: bash install/da3.sh      (ENV=<name> bash install/da3.sh to use another env name)
+# usage: bash install/da3.sh [env name]      (default env name: da3)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-ENV="${ENV:-da3}"
+ENV="${1:-da3}"
 
 clone https://github.com/ByteDance-Seed/Depth-Anything-3.git "$ROOT/deps/Depth-Anything-3" 2c21ea8
 new_env "$ENV" python=3.10

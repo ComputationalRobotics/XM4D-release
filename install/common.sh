@@ -5,7 +5,8 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 
 new_env() {  # new_env <name> <conda create args...>: create and activate; never touches an existing env
     if conda env list | awk '{print $1}' | grep -qx "$1"; then
-        echo "conda env '$1' already exists: remove it first (conda env remove -n $1) or set ENV=<new name>" >&2
+        echo "conda env '$1' already exists: remove it first (conda env remove -n $1)" \
+             "or install under another name: bash $0 <name>" >&2
         exit 1
     fi
     conda create -n "$1" "${@:2}" -y

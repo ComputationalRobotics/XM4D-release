@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Alternative to the four per-stage envs: ONE conda env for every stage (masks, depth, tracking, XM solver).
 # Python 3.10 and PyTorch 2.9 for all; the per-stage envs stay the reference (see README, "One environment instead").
-# usage: bash install/xm4d.sh      (ENV=<name> bash install/xm4d.sh to use another env name)
+# usage: bash install/xm4d.sh [env name]      (default env name: xm4d)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-ENV="${ENV:-xm4d}"
+ENV="${1:-xm4d}"
 
 clone https://github.com/facebookresearch/sam3.git "$ROOT/deps/sam3" 32f5f81
 clone https://github.com/ByteDance-Seed/Depth-Anything-3.git "$ROOT/deps/Depth-Anything-3" 2c21ea8

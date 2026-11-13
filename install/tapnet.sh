@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Conda env for step 2, 2D tracking (Python/static_tracking_online.py, dynamic_tracking.py): AllTracker (default)
 # and TAPNext++ (optional, config "TRACKER": "tapnext").
-# usage: bash install/tapnet.sh      (ENV=<name> bash install/tapnet.sh to use another env name)
+# usage: bash install/tapnet.sh [env name]      (default env name: tapnet)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-ENV="${ENV:-tapnet}"
+ENV="${1:-tapnet}"
 
 clone https://github.com/google-deepmind/tapnet.git "$ROOT/deps/tapnet" ceedd60  # imported from deps/tapnet, not installed
 CKPT="$ROOT/deps/tapnet/checkpoints/tapnextpp_ckpt.pt"

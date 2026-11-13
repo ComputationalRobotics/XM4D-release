@@ -2,7 +2,7 @@
 stage's scripts, the GPU and the model weights. Run it with any Python 3 that has conda on the PATH (e.g. conda's base):
     python install/check_env.py                 # every stage in its env: sam3 (or gmos), da3, tapnet, XM
     python install/check_env.py --env xm4d      # the one-environment install (install/xm4d.sh)
-    python install/check_env.py tapnet=mytap    # a stage installed under another env name (ENV=<name>)
+    python install/check_env.py tapnet=mytap    # a stage installed under another env name (bash install/tapnet.sh mytap)
 Step 0 is checked with sam3, with gmos when sam3 is not installed (both when both are), and gives a warning when neither
 is installed. Exits 1 if a stage fails or is missing."""
 import importlib
