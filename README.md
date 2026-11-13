@@ -55,6 +55,16 @@ python install/check_env.py sam3
 Installs [SAM 3](https://github.com/facebookresearch/sam3) (`deps/sam3`) with PyTorch 2.10 and Jupyter. The
 checkpoint (3.5 GB) is downloaded on the first run of the mask notebook.
 
+### 1b. `gmos`: masks without a notebook (optional)
+
+```bash
+bash install/gmos.sh
+```
+
+Installs [GMOS](https://github.com/Jyxarthur/gmos) (`deps/gmos`) with PyTorch 2.5 and its weights: Pi3 (3.8 GB),
+SAM 2.1 (0.9 GB) and the GMOS proposer (0.1 GB, from Google Drive). It replaces the `sam3` notebook where no notebook
+can run, e.g. on a workstation (see step 0). It is not part of the one-environment install below.
+
 ### 2. `da3`: depth (step 1)
 
 ```bash
@@ -150,6 +160,21 @@ Where objects overlap, the pixel goes to the rigid object first, then hand, then
 to the object added first. `save_object()` and `remove_object()` in `Python/check_masks.py` save and delete objects
 outside the notebook.
 
+Without a notebook, e.g. on a workstation, [GMOS](https://github.com/Jyxarthur/gmos) finds the moving objects
+automatically instead, in the `gmos` environment:
+
+```bash
+cd Python
+conda activate gmos
+python make_masks_gmos.py --fps 24     # the frame rate of the frames in images/
+```
+
+GMOS separates the moving objects and tracks each one through the video. Each is saved as its own object,
+`masks/other_gmos<k>/`, with the category `other` for now, and merged as above. Objects saved with the notebook stay;
+a new GMOS run replaces the objects of the previous one. GMOS compares frames about half a second apart, so give the
+frame rate of your frames (default 24). On our test videos of up to 150 frames it used 12–19 GB of GPU memory;
+`--offload-cpu` lowers that for long videos.
+
 Step 1 merges the object folders itself when they are not merged yet, and stops with a warning while masks are missing.
 For a scene without any moving object, set `"no_masks": true` in `config.json`.
 
@@ -180,7 +205,7 @@ included in this repository yet.
 
 The code is released under the [MIT License](LICENSE). The example scene `datasets/sintel_alley_2` comes from MPI
 Sintel (© Blender Foundation, CC BY 3.0; see its README). The third-party code and models installed into `deps/` keep
-their own licenses, e.g. SAM 3 under Meta's SAM License.
+their own licenses, e.g. SAM 3 under Meta's SAM License and GMOS under Apache 2.0.
 
 ## Citation
 

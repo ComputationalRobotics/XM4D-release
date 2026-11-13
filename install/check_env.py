@@ -1,5 +1,5 @@
 """Check that a conda env can run its XM4D stage: the imports of the stage's scripts, the GPU, and the model weights.
-usage (inside the env):  python install/check_env.py {sam3,da3,tapnet,XM}
+usage (inside the env):  python install/check_env.py {sam3,gmos,da3,tapnet,XM}
 The install scripts run it at the end; run it again any time. Exits 1 if something is missing."""
 import importlib
 import sys
@@ -10,12 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # what the stage's scripts import (they add deps/tapnet, deps/Depth-Anything-3/src and XM/build to sys.path themselves)
 MODULES = {
     "sam3": ["numpy", "PIL", "cv2", "matplotlib", "torch", "ipykernel", "ipympl", "sam3.model_builder"],
+    "gmos": ["numpy", "PIL", "torch", "safetensors", "hydra", "mediapy", "inference_gmos"],
     "da3": ["numpy", "scipy", "PIL", "cv2", "pandas", "open3d", "torch", "depth_anything_3.api"],
     "tapnet": ["numpy", "PIL", "cv2", "pandas", "tqdm", "torch", "einops", "tapnet.tapnext.tapnext_torch"],
     "XM": ["numpy", "scipy", "cv2", "pandas", "matplotlib", "networkx", "open3d", "pyceres", "pycolmap",
            "teaserpp_python", "XM"],
 }
 PATHS = {
+    "gmos": [ROOT / "deps" / "gmos"],
     "da3": [ROOT / "deps" / "Depth-Anything-3" / "src"],
     "tapnet": [ROOT / "deps" / "tapnet"],
     "XM": [ROOT / "XM" / "build"],
@@ -51,6 +53,17 @@ def sam3_weights():
     return "access ok, sam3.pt cached" if cached else "access ok, sam3.pt (3.5 GB) downloads on first use"
 
 
+def gmos_weights():
+    import torch
+    from safetensors import safe_open
+    ck = ROOT / "deps" / "gmos" / "checkpoints"
+    with safe_open(str(ck / "pi3_model.safetensors"), "pt") as f:
+        assert len(list(f.keys())) > 0
+    torch.load(ck / "sam2.1_hiera_large.pt", map_location="cpu", weights_only=False)["model"]
+    torch.load(ck / "gmos_proposer.pth", map_location="cpu", weights_only=False)["model_state_dict"]
+    return "Pi3, SAM 2.1 and GMOS proposer checkpoints load"
+
+
 def tapnext_forward():
     import torch
     from tapnet.tapnext.tapnext_torch import TAPNext
@@ -79,6 +92,8 @@ def main():
         check("CUDA GPU", gpu)
     if env == "sam3":
         check("SAM 3 weights", sam3_weights)
+    if env == "gmos":
+        check("GMOS weights", gmos_weights)
     if env == "tapnet":
         check("TAPNext++", tapnext_forward)
     if failed:
