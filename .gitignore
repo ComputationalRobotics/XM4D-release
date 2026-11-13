@@ -1,6 +1,7 @@
-# --- Data: never commit (except the example scene, see the end) ---
+# --- Data: never commit (except the example scenes, see the end) ---
 datasets/*
 !datasets/sintel_alley_2/
+!datasets/hoi_ip1073/
 # gsplat example data (360_v2 datasets, images, COLMAP .bin) — ~13 GB, not code
 deps/
 
@@ -34,6 +35,8 @@ __pycache__/
 # keep the prebuilt XM solver (.so) — the Python imports it; source is in the XM-code repo
 !XM/build/*.so
 
-# the example scene ships with the repo (frames + masks), not its pipeline outputs
+# the example scenes ship with the repo (frames + masks), not their pipeline outputs
 !datasets/sintel_alley_2/**
 datasets/sintel_alley_2/outputs/
+!datasets/hoi_ip1073/**
+datasets/hoi_ip1073/outputs/

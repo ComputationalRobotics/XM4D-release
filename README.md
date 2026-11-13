@@ -99,7 +99,8 @@ SAM 3 masks differ in fewer than 0.1% of the mask pixels (PyTorch 2.9 instead of
 ## Usage
 
 The repo ships an example scene, `datasets/sintel_alley_2`: 10 frames of MPI Sintel `alley_2` with the mask of the
-running girl. `config.json` points to it, so every step below runs on it as it is.
+running girl. `config.json` points to it, so every step below runs on it as it is. A second one, `datasets/hoi_ip1073`
+(`"scene": "hoi_ip1073"`), has 10 frames of a person picking up a ring, with a human and a rigid object mask.
 
 For your own video, put its frames in a scene folder:
 
@@ -130,17 +131,24 @@ check the result and save it:
 track_points("dog", frame=0, points=[(420, 310)])   # points on the object (labels=[1, 0, ...] marks negatives)
 track_text("people", "person")                      # or a text prompt
 preview_video("dog")                                 # check it
-save("dog")
+save("dog", "other")                                 # with its category: "rigid", "human" or "other"
 merge_masks()                                        # at the end: all objects into the mask the pipeline reads
 ```
 
-Each object is saved in its own folder; `merge_masks()` (in `Python/check_masks.py`, callable outside the notebook
-too) writes their union, the mask that the pipeline reads:
+The category tells the later steps what the object is: `rigid` (moves as one rigid body), `human` (a person, hands
+included) or `other` (anything else that moves); `hand` is coming soon. Each object is saved in its own folder named
+after its category, and `merge_masks()` (in `Python/check_masks.py`, callable outside the notebook too) merges them:
 
 ```
-<scene>/masks/<object>/<frame>.png    one folder per object (white = object)
-<scene>/masks/<frame>.png             all objects merged
+<scene>/masks/<category>_<object>/<frame>.png   one folder per object (white = object)
+<scene>/masks/objects.json                      the object folders in the order they were added
+<scene>/masks/<frame>.png                       all objects merged: the mask the pipeline reads
+<scene>/mask_labels/<frame>.png                 which object each pixel belongs to (labels.json: label -> object)
 ```
+
+Where objects overlap, the pixel goes to the rigid object first, then hand, then human, then other; within a category
+to the object added first. `save_object()` and `remove_object()` in `Python/check_masks.py` save and delete objects
+outside the notebook.
 
 Step 1 merges the object folders itself when they are not merged yet, and stops with a warning while masks are missing.
 For a scene without any moving object, set `"no_masks": true` in `config.json`.

@@ -1,0 +1,12 @@
+[
+ {
+  "label": 1,
+  "folder": "rigid_ring",
+  "category": "rigid"
+ },
+ {
+  "label": 2,
+  "folder": "human_person",
+  "category": "human"
+ }
+]
