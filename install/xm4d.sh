@@ -9,6 +9,13 @@ clone https://github.com/facebookresearch/sam3.git "$ROOT/deps/sam3" 32f5f81
 clone https://github.com/ByteDance-Seed/Depth-Anything-3.git "$ROOT/deps/Depth-Anything-3" 2c21ea8
 clone https://github.com/google-deepmind/tapnet.git "$ROOT/deps/tapnet" ceedd60
 clone https://github.com/MIT-SPARK/TEASER-plusplus.git "$ROOT/deps/TEASER-plusplus" 52a9c52
+clone https://github.com/aharley/alltracker.git "$ROOT/deps/alltracker" e755313  # imported from deps/alltracker, not installed
+AT_CKPT="$ROOT/deps/alltracker/checkpoints/alltracker.pth"
+if [ ! -f "$AT_CKPT" ]; then
+    mkdir -p "$(dirname "$AT_CKPT")"
+    wget -O "$AT_CKPT.part" https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth
+    mv "$AT_CKPT.part" "$AT_CKPT"
+fi
 CKPT="$ROOT/deps/tapnet/checkpoints/tapnextpp_ckpt.pt"
 if [ ! -f "$CKPT" ]; then
     mkdir -p "$(dirname "$CKPT")"

@@ -30,6 +30,10 @@ def get_int(config_key, default, env=None):
     return int(_resolve(config_key, default, env))
 
 
+def get_str(config_key, default, env=None):
+    return str(_resolve(config_key, default, env)).strip()
+
+
 def get_bool(config_key, default, env=None):
     value = _resolve(config_key, default, env)
     if isinstance(value, str):

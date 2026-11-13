@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Conda env for step 2, 2D tracking (Python/static_tracking_online.py, dynamic_tracking.py): TAPNext++.
+# Conda env for step 2, 2D tracking (Python/static_tracking_online.py, dynamic_tracking.py): AllTracker (default)
+# and TAPNext++ (optional, config "TRACKER": "tapnext").
 # usage: bash install/tapnet.sh      (ENV=<name> bash install/tapnet.sh to use another env name)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 ENV="${ENV:-tapnet}"
@@ -10,6 +11,13 @@ if [ ! -f "$CKPT" ]; then
     mkdir -p "$(dirname "$CKPT")"
     wget -O "$CKPT.part" https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt
     mv "$CKPT.part" "$CKPT"
+fi
+clone https://github.com/aharley/alltracker.git "$ROOT/deps/alltracker" e755313  # imported from deps/alltracker, not installed
+AT_CKPT="$ROOT/deps/alltracker/checkpoints/alltracker.pth"
+if [ ! -f "$AT_CKPT" ]; then
+    mkdir -p "$(dirname "$AT_CKPT")"
+    wget -O "$AT_CKPT.part" https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth
+    mv "$AT_CKPT.part" "$AT_CKPT"
 fi
 new_env "$ENV" python=3.10
 pip install torch==2.9.1 torchvision==0.24.1 einops==0.8.1 numpy==2.0.2 opencv-python==4.12.0.88 pandas==2.3.3 \

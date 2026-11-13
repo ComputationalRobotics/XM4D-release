@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Dynamic-only online TAPNext tracking aligned with static_tracking_online.py."""
+"""Dynamic-only tracking aligned with static_tracking_online.py. Tracker (config TRACKER): "alltracker" (default;
+AllTracker from keyframes, utils/track_alltracker.py) or "tapnext" (the online TAPNext++ tracker)."""
 
 from pathlib import Path
 from collections import deque
@@ -61,7 +62,19 @@ DEPTH_MAX = dataset_config.get_float("DYN_DEPTH_MAX", 0.0, env="DYN_DEPTH_MAX")
 DEPTH_GRAD_THRESHOLD = dataset_config.get_float("DYN_DEPTH_GRAD_THRESHOLD", 0.0, env="DYN_DEPTH_GRAD_THRESHOLD")
 DEPTH_JUMP_THRESHOLD = None
 
-MOVE_DELETE_ENABLED = True
+# 2D tracker. AllTracker: points seeded on the object mask every ALLTRACKER_KEYFRAME frames where no tracked point
+# is visible nearby (grid spacing DYN_ALLTRACKER_GRID px at the tracking resolution ALLTRACKER_RES), visible where
+# AllTracker's visibility x confidence >= ALLTRACKER_VIS_THRESHOLD and the point is on the object mask. The
+# TAPNext-only filters below (large-2D-move truncation, lost-off-object) are not applied to AllTracker tracks.
+TRACKER = dataset_config.get_str("TRACKER", "alltracker", env="TRACKER").lower()
+if TRACKER not in {"alltracker", "tapnext"}:
+    raise ValueError(f"TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
+AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10, env="ALLTRACKER_KEYFRAME")
+AT_RES = dataset_config.get_int("ALLTRACKER_RES", 512, env="ALLTRACKER_RES")
+AT_VIS_THRESHOLD = dataset_config.get_float("ALLTRACKER_VIS_THRESHOLD", 0.6, env="ALLTRACKER_VIS_THRESHOLD")
+DYN_AT_GRID = dataset_config.get_float("DYN_ALLTRACKER_GRID", 2.0, env="DYN_ALLTRACKER_GRID")
+
+MOVE_DELETE_ENABLED = TRACKER == "tapnext"
 MOVE_WINDOW_SIZE = 10.0
 MOVE_DELETE_TOP_PERCENT = dataset_config.get_float("DYN_MOVE_DELETE_TOP_PERCENT", 100.0, env="DYN_MOVE_DELETE_TOP_PERCENT")
 # Only scan every Nth frame for the large-2D-move red flag (5 -> ~5x cheaper move-delete). The
@@ -70,6 +83,8 @@ MOVE_DELETE_STRIDE = dataset_config.get_int("DYN_MOVE_DELETE_STRIDE", 5, env="DY
 # Lost-off-object deletion: if a point is invisible (tracker-occluded) AND out of the dynamic mask for
 # MORE THAN this many consecutive frames, it has left the object -> truncate the track there. 0 disables.
 LOST_OFFMASK_MAX_FRAMES = dataset_config.get_int("DYN_LOST_OFFMASK_MAX_FRAMES", 2, env="DYN_LOST_OFFMASK_MAX_FRAMES")
+if TRACKER != "tapnext":
+    LOST_OFFMASK_MAX_FRAMES = 0
 # --- Smart max-points eviction (when the active set is full): evict only points that are clearly BAD,
 # instead of dropping every currently-invisible one. Per frame a present point is BAD if it is off the
 # dynamic mask by > DYN_MAXPT_OFFMASK_PX px OR has a large 2D move vs its neighbours. A point is evicted
@@ -871,44 +886,67 @@ if REVERSE:                                               # flip masks in time s
     dynamic_masks_query_256 = dynamic_masks_query_256[::-1].copy()
     dynamic_masks_vis = dynamic_masks_vis[::-1].copy()
 
-query_np = _make_mask_query_points(dynamic_masks_query_256[0], keep_frac=DENSITY_FRAC, query_t=0)
-print(f"Density: DYN_MASK_KEEP_FRAC={DENSITY_FRAC:.2f} (kept at frame 0 AND every online resample); "
-      f"coverage radius={ONLINE_RESAMPLE_RADIUS:.2f}px(@256)")
-if query_np is None or query_np.shape[1] == 0:
-    raise RuntimeError("No initial dynamic query points generated from the first mask.")
-print(f"Initial dynamic queries: {query_np.shape[1]}")
+if TRACKER == "tapnext":
+    query_np = _make_mask_query_points(dynamic_masks_query_256[0], keep_frac=DENSITY_FRAC, query_t=0)
+    print(f"Density: DYN_MASK_KEEP_FRAC={DENSITY_FRAC:.2f} (kept at frame 0 AND every online resample); "
+          f"coverage radius={ONLINE_RESAMPLE_RADIUS:.2f}px(@256)")
+    if query_np is None or query_np.shape[1] == 0:
+        raise RuntimeError("No initial dynamic query points generated from the first mask.")
+    print(f"Initial dynamic queries: {query_np.shape[1]}")
 
-video_256 = torch.from_numpy(video_np_256).to(device)
-tracks_xy_256, occluded, query_t = track_online_tapnext(
-    video_256,
-    query_np,
-    device=device,
-    checkpoint=str(CHECKPOINT),
-    add_points=ONLINE_ADD_POINTS,
-    add_every=ONLINE_ADD_EVERY,
-    add_start=ONLINE_ADD_START,
-    keep_frac=DENSITY_FRAC,
-    resample_margin=ONLINE_RESAMPLE_MARGIN,
-    resample_radius=ONLINE_RESAMPLE_RADIUS,
-    swap_xy_for_query=RESAMPLE_SWAP_XY,
-    use_certainty=ONLINE_USE_CERTAINTY,
-    certainty_radius=ONLINE_CERTAINTY_RADIUS,
-    certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
-    dynamic_masks_256=dynamic_masks_query_256,
-    max_points=ONLINE_MAX_POINTS,
-    downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
-    downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
-    maxpt_offmask_px256=MAXPT_OFFMASK_PX * 256.0 / float(max(H, W)),   # 10px native -> 256-grid
-    maxpt_past=MAXPT_PAST,
-    maxpt_bad_min=MAXPT_BAD_MIN,
-    maxpt_invis_consec=MAXPT_INVIS_CONSEC,
-    maxpt_move_window=MOVE_WINDOW_SIZE * 256.0 / float(max(H, W)),
-    maxpt_move_eps=float(MOVE_DELETE_TOP_PERCENT) / 100.0,
-)
+    video_256 = torch.from_numpy(video_np_256).to(device)
+    tracks_xy_256, occluded, query_t = track_online_tapnext(
+        video_256,
+        query_np,
+        device=device,
+        checkpoint=str(CHECKPOINT),
+        add_points=ONLINE_ADD_POINTS,
+        add_every=ONLINE_ADD_EVERY,
+        add_start=ONLINE_ADD_START,
+        keep_frac=DENSITY_FRAC,
+        resample_margin=ONLINE_RESAMPLE_MARGIN,
+        resample_radius=ONLINE_RESAMPLE_RADIUS,
+        swap_xy_for_query=RESAMPLE_SWAP_XY,
+        use_certainty=ONLINE_USE_CERTAINTY,
+        certainty_radius=ONLINE_CERTAINTY_RADIUS,
+        certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
+        dynamic_masks_256=dynamic_masks_query_256,
+        max_points=ONLINE_MAX_POINTS,
+        downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
+        downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
+        maxpt_offmask_px256=MAXPT_OFFMASK_PX * 256.0 / float(max(H, W)),   # 10px native -> 256-grid
+        maxpt_past=MAXPT_PAST,
+        maxpt_bad_min=MAXPT_BAD_MIN,
+        maxpt_invis_consec=MAXPT_INVIS_CONSEC,
+        maxpt_move_window=MOVE_WINDOW_SIZE * 256.0 / float(max(H, W)),
+        maxpt_move_eps=float(MOVE_DELETE_TOP_PERCENT) / 100.0,
+    )
 
-tracks_xy = tracks_xy_256.astype(np.float64, copy=True)
-tracks_xy[..., 0] = tracks_xy[..., 0] / 256.0 * W
-tracks_xy[..., 1] = tracks_xy[..., 1] / 256.0 * H
+    tracks_xy = tracks_xy_256.astype(np.float64, copy=True)
+    tracks_xy[..., 0] = tracks_xy[..., 0] / 256.0 * W
+    tracks_xy[..., 1] = tracks_xy[..., 1] / 256.0 * H
+else:
+    from utils.track_alltracker import grid_seeds, track_keyframes
+
+    dyn_masks_seed = dilate_dynamic_masks(dynamic_masks_base, DILATE_PX_QUERY) if DILATE_PX_QUERY != 0 else dynamic_masks_base
+    dyn_masks_seed = np.asarray(dyn_masks_seed)
+    if dyn_masks_seed.ndim == 4:
+        dyn_masks_seed = dyn_masks_seed[..., 0]
+    spacing = DYN_AT_GRID * max(H, W) / float(AT_RES)                  # grid spacing in native px
+    frames_track = video_np[0][::-1].copy() if REVERSE else video_np[0]
+    print(f"AllTracker: seeds every {spacing:.1f}px on the object mask, keyframe every {AT_KEYFRAME} frames, "
+          f"{AT_RES}px, visible at vis x conf >= {AT_VIS_THRESHOLD}")
+    trk, vis, query_t = track_keyframes(
+        frames_track,
+        lambda t, covered: grid_seeds(dyn_masks_seed[t] > 0, spacing, covered, spacing),
+        keyframe=AT_KEYFRAME, res=AT_RES, vis_threshold=AT_VIS_THRESHOLD, max_points=ONLINE_MAX_POINTS,
+        device=str(device), label="AllTracker (dynamic)",
+    )
+    if trk.shape[0] == 0:
+        raise RuntimeError("No dynamic points: the object mask is empty at every keyframe.")
+    tracks_xy = trk[None].astype(np.float64)
+    occluded = ~vis[None]
+    print(f"AllTracker dynamic tracks: {trk.shape[0]} from {len(np.unique(query_t))} keyframes")
 
 Q = tracks_xy.shape[1]
 dynamic_obs_mask = np.zeros((Q, T), dtype=bool)

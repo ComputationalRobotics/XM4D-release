@@ -23,6 +23,7 @@ PATHS = {
     "XM": [ROOT / "XM" / "build"],
 }
 TAPNEXT_CKPT = ROOT / "deps" / "tapnet" / "checkpoints" / "tapnextpp_ckpt.pt"
+ALLTRACKER_CKPT = ROOT / "deps" / "alltracker" / "checkpoints" / "alltracker.pth"
 failed = []
 
 
@@ -80,6 +81,18 @@ def tapnext_forward():
     return "TAPNext++ checkpoint loads and runs"
 
 
+def alltracker_forward():
+    import numpy as np
+    sys.path.insert(0, str(ROOT / "Python"))
+    from utils.track_alltracker import track_keyframes  # loaded as in the tracking steps
+    assert ALLTRACKER_CKPT.exists(), f"missing {ALLTRACKER_CKPT}"
+    frames = (np.random.rand(4, 96, 128, 3) * 255).astype(np.uint8)
+    tracks, vis, _ = track_keyframes(frames, lambda t, cov: np.array([[32.0, 48.0], [96.0, 40.0]]) if t == 0 else [],
+                                     keyframe=4, res=128, device="cuda", label="check")
+    assert tracks.shape == (2, 4, 2) and np.isfinite(tracks).all()
+    return "AllTracker checkpoint loads and runs"
+
+
 def main():
     env = sys.argv[1] if len(sys.argv) > 1 else ""
     if env not in MODULES:
@@ -95,7 +108,8 @@ def main():
     if env == "gmos":
         check("GMOS weights", gmos_weights)
     if env == "tapnet":
-        check("TAPNext++", tapnext_forward)
+        check("AllTracker", alltracker_forward)
+        check("TAPNext++ (optional tracker)", tapnext_forward)
     if failed:
         print(f"[check_env] {env}: NOT ready, {len(failed)} problem(s): {', '.join(failed)}")
         sys.exit(1)

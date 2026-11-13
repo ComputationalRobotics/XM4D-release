@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run online TAPNext tracking for XM datasets.
+"""Run 2D tracking of the static scene for XM datasets. Tracker (config TRACKER): "alltracker" (default; AllTracker
+from keyframes, utils/track_alltracker.py) or "tapnext" (the online TAPNext++ tracker).
 
 Paths and dataset settings come from utils.definitions / XM_* environment
 variables.
@@ -46,7 +47,18 @@ GRID = 50
 # If blank-region resampling appears mirrored (e.g., top-right becomes bottom-left),
 # enable this to emit resample queries as (t, y, x) instead of (t, x, y).
 RESAMPLE_SWAP_XY = True
-MOVE_DELETE_ENABLED = True
+# 2D tracker. AllTracker: points seeded off the (dilated) moving-object masks, a GRID x GRID grid at frame 0 and then
+# every ALLTRACKER_KEYFRAME frames an ONLINE_RESAMPLE_GRID grid wherever no tracked point is visible within
+# ONLINE_RESAMPLE_RADIUS (px @256); visible where AllTracker's visibility x confidence >= ALLTRACKER_VIS_THRESHOLD and
+# the point is off the moving objects. The flow-consistency trim (move-delete) below runs for TAPNext only.
+TRACKER = dataset_config.get_str("TRACKER", "alltracker", env="TRACKER").lower()
+if TRACKER not in {"alltracker", "tapnext"}:
+    raise ValueError(f"TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
+AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10, env="ALLTRACKER_KEYFRAME")
+AT_RES = dataset_config.get_int("ALLTRACKER_RES", 512, env="ALLTRACKER_RES")
+AT_VIS_THRESHOLD = dataset_config.get_float("ALLTRACKER_VIS_THRESHOLD", 0.6, env="ALLTRACKER_VIS_THRESHOLD")
+
+MOVE_DELETE_ENABLED = TRACKER == "tapnext"
 MOVE_WINDOW_SIZE = 10.0
 MOVE_DELETE_FLOW_ERROR_THRESHOLD = dataset_config.get_float(
     "MOVE_DELETE_FLOW_ERROR_THRESHOLD", 10.0, env="MOVE_DELETE_FLOW_ERROR_THRESHOLD"
@@ -597,71 +609,95 @@ def track_online_tapnext(
 video_np_256, video_np = load_frames_256(str(IMAGE_DIR), IMAGE_PATTERN)
 H, W = video_np.shape[2], video_np.shape[3]
 
-query_exclude_masks_256 = None
-if MASK_DIR is not None and Path(MASK_DIR).exists():
-    try:
-        _masks_256 = load_dynamic_masks(
-            str(MASK_DIR),
-            MASK_PATTERN,
-            t_expected=video_np.shape[1],
-            mask_mode="dynamic_positive",
-            target_size=(256, 256),
-        )
-        _masks_256 = np.asarray(_masks_256)
-        if _masks_256.ndim == 4 and _masks_256.shape[-1] == 1:
-            _masks_256 = _masks_256[..., 0]
-        if _masks_256.ndim == 4 and _masks_256.shape[0] == 1:
-            _masks_256 = _masks_256[0]
-        if _masks_256.ndim == 3:
-            query_exclude_masks_256 = _masks_256
-            # Dilate the query-exclusion masks (in 256-grid space) to match the
-            # margin used by the final track filter (MASK_DILATE_PX is defined at
-            # native resolution, so scale it to the 256 grid).
-            if MASK_DILATE_PX > 0:
-                dilate_px_256 = max(1, int(round(MASK_DILATE_PX * 256.0 / float(max(H, W)))))
-                query_exclude_masks_256 = dilate_dynamic_masks(query_exclude_masks_256, dilate_px_256)
-                print(
-                    f"Dilated query-exclusion masks by {dilate_px_256}px @256 "
-                    f"(= {MASK_DILATE_PX}px @native {W}x{H})"
-                )
-    except Exception as e:
-        print(f"Failed to load 256 dynamic masks for query exclusion: {e}")
+if TRACKER == "tapnext":
+    query_exclude_masks_256 = None
+    if MASK_DIR is not None and Path(MASK_DIR).exists():
+        try:
+            _masks_256 = load_dynamic_masks(
+                str(MASK_DIR),
+                MASK_PATTERN,
+                t_expected=video_np.shape[1],
+                mask_mode="dynamic_positive",
+                target_size=(256, 256),
+            )
+            _masks_256 = np.asarray(_masks_256)
+            if _masks_256.ndim == 4 and _masks_256.shape[-1] == 1:
+                _masks_256 = _masks_256[..., 0]
+            if _masks_256.ndim == 4 and _masks_256.shape[0] == 1:
+                _masks_256 = _masks_256[0]
+            if _masks_256.ndim == 3:
+                query_exclude_masks_256 = _masks_256
+                # Dilate the query-exclusion masks (in 256-grid space) to match the
+                # margin used by the final track filter (MASK_DILATE_PX is defined at
+                # native resolution, so scale it to the 256 grid).
+                if MASK_DILATE_PX > 0:
+                    dilate_px_256 = max(1, int(round(MASK_DILATE_PX * 256.0 / float(max(H, W)))))
+                    query_exclude_masks_256 = dilate_dynamic_masks(query_exclude_masks_256, dilate_px_256)
+                    print(
+                        f"Dilated query-exclusion masks by {dilate_px_256}px @256 "
+                        f"(= {MASK_DILATE_PX}px @native {W}x{H})"
+                    )
+        except Exception as e:
+            print(f"Failed to load 256 dynamic masks for query exclusion: {e}")
 
-query_np = make_grid_query_points(GRID, t_max=0, step=1)
-if query_exclude_masks_256 is not None:
-    query_np = _exclude_queries_in_dynamic_masks(
+    query_np = make_grid_query_points(GRID, t_max=0, step=1)
+    if query_exclude_masks_256 is not None:
+        query_np = _exclude_queries_in_dynamic_masks(
+            query_np,
+            query_exclude_masks_256,
+            swap_xy_for_query=False,
+        )
+
+    video_256 = torch.from_numpy(video_np_256).to(device)
+
+    tracks_xy_256, occluded = track_online_tapnext(
+        video_256,
         query_np,
-        query_exclude_masks_256,
-        swap_xy_for_query=False,
+        device=device,
+        checkpoint=str(CHECKPOINT),
+        add_points=ONLINE_ADD_POINTS,
+        add_every=ONLINE_ADD_EVERY,
+        resample_grid=ONLINE_RESAMPLE_GRID,
+        resample_margin=ONLINE_RESAMPLE_MARGIN,
+        resample_radius=ONLINE_RESAMPLE_RADIUS,
+        swap_xy_for_query=RESAMPLE_SWAP_XY,
+        use_certainty=ONLINE_USE_CERTAINTY,
+        certainty_radius=ONLINE_CERTAINTY_RADIUS,
+        certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
+        exclude_masks_256=query_exclude_masks_256,
+        max_points=ONLINE_MAX_POINTS,
+        downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
+        downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
     )
 
-video_256 = torch.from_numpy(video_np_256).to(device)
 
-tracks_xy_256, occluded = track_online_tapnext(
-    video_256,
-    query_np,
-    device=device,
-    checkpoint=str(CHECKPOINT),
-    add_points=ONLINE_ADD_POINTS,
-    add_every=ONLINE_ADD_EVERY,
-    resample_grid=ONLINE_RESAMPLE_GRID,
-    resample_margin=ONLINE_RESAMPLE_MARGIN,
-    resample_radius=ONLINE_RESAMPLE_RADIUS,
-    swap_xy_for_query=RESAMPLE_SWAP_XY,
-    use_certainty=ONLINE_USE_CERTAINTY,
-    certainty_radius=ONLINE_CERTAINTY_RADIUS,
-    certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
-    exclude_masks_256=query_exclude_masks_256,
-    max_points=ONLINE_MAX_POINTS,
-    downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
-    downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
-)
+    # Map tracks from 256-grid space back to original image space
+    tracks_xy = tracks_xy_256
+    tracks_xy[..., 0] = tracks_xy[..., 0] / 256 * W
+    tracks_xy[..., 1] = tracks_xy[..., 1] / 256 * H
+else:
+    from utils.track_alltracker import grid_seeds, track_keyframes
 
-
-# Map tracks from 256-grid space back to original image space
-tracks_xy = tracks_xy_256
-tracks_xy[..., 0] = tracks_xy[..., 0] / 256 * W
-tracks_xy[..., 1] = tracks_xy[..., 1] / 256 * H
+    exclude = np.zeros((video_np.shape[1], H, W), bool)                 # moving objects, dilated as below
+    if MASK_DIR is not None and Path(MASK_DIR).exists():
+        exclude = np.asarray(dilate_dynamic_masks(load_dynamic_masks(
+            str(MASK_DIR), MASK_PATTERN, t_expected=video_np.shape[1], mask_mode="dynamic_positive", target_size=(W, H),
+        ), MASK_DILATE_PX))
+        if exclude.ndim == 4:
+            exclude = exclude[..., 0]
+    side = float(max(H, W))
+    radius = ONLINE_RESAMPLE_RADIUS * side / 256.0
+    print(f"AllTracker: {GRID}x{GRID} seeds at frame 0, re-seeding every {AT_KEYFRAME} frames where no point is "
+          f"visible within {radius:.1f}px, {AT_RES}px, visible at vis x conf >= {AT_VIS_THRESHOLD}")
+    trk, vis, _ = track_keyframes(
+        video_np[0],
+        lambda t, covered: grid_seeds(~(exclude[t] > 0), side / (GRID if t == 0 else ONLINE_RESAMPLE_GRID), covered, radius),
+        keyframe=AT_KEYFRAME, res=AT_RES, vis_threshold=AT_VIS_THRESHOLD, max_points=ONLINE_MAX_POINTS,
+        device=str(device), label="AllTracker (static)",
+    )
+    tracks_xy = trk[None]
+    occluded = ~vis[None]
+    print(f"AllTracker static tracks: {trk.shape[0]}")
 
 # Optional dynamic masks
 dynamic_masks = None

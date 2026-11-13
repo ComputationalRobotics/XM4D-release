@@ -80,8 +80,9 @@ PyTorch 2.9. The model (DA3NESTED-GIANT-LARGE-1.1, 6.8 GB) is downloaded from Hu
 bash install/tapnet.sh
 ```
 
-Installs the [TAPNet](https://github.com/google-deepmind/tapnet) code (`deps/tapnet`) and the TAPNext++ checkpoint
-(2.5 GB) with PyTorch 2.9. The check runs TAPNext++ on the GPU.
+Installs the 2D tracker [AllTracker](https://github.com/aharley/alltracker) (`deps/alltracker`, checkpoint 66 MB)
+and, for the optional TAPNext tracking below, the [TAPNet](https://github.com/google-deepmind/tapnet) code
+(`deps/tapnet`) with the TAPNext++ checkpoint (2.5 GB), with PyTorch 2.9. The check runs both trackers on the GPU.
 
 ### 4. `XM`: solver, deformation graph and 4DGS data (steps 3–5)
 
@@ -187,7 +188,7 @@ conda activate da3
 python get_depths_clean.py           # 1. monocular depth (Depth Anything 3) -> outputs/depth_anything_3/
 
 conda activate tapnet
-python static_tracking_online.py     # 2. 2D tracks of the static scene
+python static_tracking_online.py     # 2. 2D tracks (AllTracker) of the static scene
 python dynamic_tracking.py           #    and of the moving objects -> outputs/tracks_dynamic_only.npz
 
 conda activate XM
@@ -200,6 +201,24 @@ Set `EDG_NO_VIZ=1` to skip the Open3D window at the end of step 4. Step 5 lifts 
 the masks (`--dynamic-init-source depth`; without it, step 5 expects a shape prior). It writes the training set and
 prints the matching training command for a modified gsplat `simple_trainer.py` (`--edg-results`). That trainer is not
 included in this repository yet.
+
+Step 2 tracks with AllTracker. Every `ALLTRACKER_KEYFRAME` frames (default 10), it adds points on a grid wherever no
+tracked point is visible nearby: off the moving objects for the static scene, on them for the moving objects. Each
+keyframe's points are tracked forward to the end of the video in one dense pass, at `ALLTRACKER_RES` px (512) on the long
+side. A point counts as visible while AllTracker's visibility × confidence is at least `ALLTRACKER_VIS_THRESHOLD`
+(0.6). A static point is hidden while it is on a moving object, a moving point while it is off its object.
+`DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at the tracking resolution.
+
+### Optional: track with TAPNext instead
+
+The earlier tracker, the online TAPNext++ tracker, is still included. To use it for step 2, set it in `config.json`:
+
+```json
+"TRACKER": "tapnext"
+```
+
+It is not used by default. The TAPNext path keeps its own filters, which AllTracker does not need: it cuts a track at
+a large 2D move against its neighbours and at a point lost off its object.
 
 ## License
 
