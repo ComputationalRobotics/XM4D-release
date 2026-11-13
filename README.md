@@ -28,8 +28,8 @@ cd XM4D-release
 ```
 
 Each stage of the pipeline runs in its own conda environment, with its own install script. A script clones its
-third-party code into `deps/` at the tested commit and creates the environment with pinned versions. The scripts never
-modify an existing environment. Each takes the environment name as an optional argument, e.g.
+third-party code into `deps/` at the tested commit and creates the environment with specific versions. Each takes the
+environment name as an optional argument, e.g.
 `bash install/tapnet.sh mytap`; without it, the name is the one in the heading (`sam3`, `gmos`, `da3`, `tapnet`, `XM`).
 When all environments are installed, check them with one command (see [Check the installation](#check-the-installation)).
 
