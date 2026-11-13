@@ -210,12 +210,27 @@ the masks (`--dynamic-init-source depth`; without it, step 5 expects a shape pri
 prints the matching training command for a modified gsplat `simple_trainer.py` (`--edg-results`). That trainer is not
 included in this repository yet.
 
+Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's per-frame focals, with the principal
+point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are squeezed to 2:1 for Depth Anything 3
+(`DA3_ASPECT_CAP`).
+
 Step 2 tracks with AllTracker. Every `ALLTRACKER_KEYFRAME` frames (default 10), it adds points on a grid wherever no
 tracked point is visible nearby: off the moving objects for the static scene, on them for the moving objects. Each
-keyframe's points are tracked forward to the end of the video in one dense pass, at `ALLTRACKER_RES` px (512) on the long
-side. A point counts as visible while AllTracker's visibility × confidence is at least `ALLTRACKER_VIS_THRESHOLD`
-(0.6). A static point is hidden while it is on a moving object, a moving point while it is off its object.
-`DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at the tracking resolution.
+keyframe's points are tracked forward in one dense pass. A static point is hidden while it is on a moving object, a
+moving point while it is off its object.
+
+- Static scene: tracked at `STATIC_ALLTRACKER_RES` px (1024) on the long side, for at most `STATIC_ALLTRACKER_MAX_LEN`
+  frames (100) from their keyframe. A point counts as visible while AllTracker's visibility × confidence is at least
+  `STATIC_ALLTRACKER_VIS_THRESHOLD` (0.99). Any frame where fewer than `STATIC_ALLTRACKER_MIN_VISIBLE` points (200) are
+  visible also becomes a keyframe. At 1024 px, AllTracker needs about 24 GB of GPU memory for a 1024 × 768 video; set
+  `STATIC_ALLTRACKER_RES` to 512 on a smaller GPU (the camera accuracy drops).
+- Moving objects: tracked at `ALLTRACKER_RES` px (512) to the end of the video, visible while visibility × confidence is
+  at least `ALLTRACKER_VIS_THRESHOLD` (0.6). `DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at
+  the tracking resolution.
+
+Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauchy loss of `CERES_LOSS_PX` px (2;
+`CERES_LOSS`: `cauchy`, `huber`, `softl1` or `trivial`), and the shared focal is refined too
+(`CERES_OPTIMIZE_INTRINSICS`).
 
 ### Optional: track with TAPNext instead
 

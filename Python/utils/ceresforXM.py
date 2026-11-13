@@ -90,6 +90,8 @@ def XM_Ceres_interface(
     optimize_intrinsics=False,
     intrinsic_scale_min=0.25,
     intrinsic_scale_max=4.0,
+    loss="trivial",
+    loss_scale=None,
 ):
     edges = np.asarray(edges, dtype=np.int64)
     landmarks2D = np.asarray(landmarks2D, dtype=np.float64)
@@ -184,9 +186,19 @@ def XM_Ceres_interface(
                     smooth_cost, None, [t_blocks[k - 1], t_blocks[k], t_blocks[k + 1]]
                 )
 
+    # Robust loss on the reprojection residuals; loss_scale is in the normalized landmark units.
+    if loss == "trivial" or loss_scale is None:
+        if loss != "trivial":
+            print(f"[Ceres] no intrinsics for the {loss} loss scale; using least squares")
+        make_loss = pyceres.TrivialLoss
+    else:
+        loss_cls = {"huber": pyceres.HuberLoss, "cauchy": pyceres.CauchyLoss, "softl1": pyceres.SoftLOneLoss}[loss]
+        make_loss = lambda: loss_cls(float(loss_scale))
+        print(f"[Ceres] {loss} loss, scale {float(loss_scale):.3g} (normalized)")
+
     def _solve(obs_keep_mask, quat_init, t_init, points_init, use_regularization=False):
         prob = pyceres.Problem()
-        loss = pyceres.TrivialLoss()
+        loss = make_loss()
 
         quat = [q.copy() for q in quat_init]
         t = [ti.copy() for ti in t_init]

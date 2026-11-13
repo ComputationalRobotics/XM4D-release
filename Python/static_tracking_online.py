@@ -48,15 +48,20 @@ GRID = 50
 # enable this to emit resample queries as (t, y, x) instead of (t, x, y).
 RESAMPLE_SWAP_XY = True
 # 2D tracker. AllTracker: points seeded off the (dilated) moving-object masks, a GRID x GRID grid at frame 0 and then
-# every ALLTRACKER_KEYFRAME frames an ONLINE_RESAMPLE_GRID grid wherever no tracked point is visible within
-# ONLINE_RESAMPLE_RADIUS (px @256); visible where AllTracker's visibility x confidence >= ALLTRACKER_VIS_THRESHOLD and
-# the point is off the moving objects. The flow-consistency trim (move-delete) below runs for TAPNext only.
+# every ALLTRACKER_KEYFRAME frames (and at any frame where fewer than STATIC_ALLTRACKER_MIN_VISIBLE points are visible)
+# an ONLINE_RESAMPLE_GRID grid wherever no tracked point is visible within ONLINE_RESAMPLE_RADIUS (px @256); each
+# keyframe's points are tracked at most STATIC_ALLTRACKER_MAX_LEN frames; visible where AllTracker's visibility x
+# confidence >= STATIC_ALLTRACKER_VIS_THRESHOLD and the point is off the moving objects. At STATIC_ALLTRACKER_RES = 1024
+# (AllTracker's own default) a 1024 x 768 video needs ~24 GB of GPU memory; 512 makes the static tracks less accurate.
+# The flow-consistency trim (move-delete) below runs for TAPNext only.
 TRACKER = dataset_config.get_str("TRACKER", "alltracker", env="TRACKER").lower()
 if TRACKER not in {"alltracker", "tapnext"}:
     raise ValueError(f"TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
 AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10, env="ALLTRACKER_KEYFRAME")
-AT_RES = dataset_config.get_int("ALLTRACKER_RES", 512, env="ALLTRACKER_RES")
-AT_VIS_THRESHOLD = dataset_config.get_float("ALLTRACKER_VIS_THRESHOLD", 0.6, env="ALLTRACKER_VIS_THRESHOLD")
+AT_RES = dataset_config.get_int("STATIC_ALLTRACKER_RES", 1024, env="STATIC_ALLTRACKER_RES")
+AT_VIS_THRESHOLD = dataset_config.get_float("STATIC_ALLTRACKER_VIS_THRESHOLD", 0.99, env="STATIC_ALLTRACKER_VIS_THRESHOLD")
+AT_MAX_LEN = dataset_config.get_int("STATIC_ALLTRACKER_MAX_LEN", 100, env="STATIC_ALLTRACKER_MAX_LEN")
+AT_MIN_VISIBLE = dataset_config.get_int("STATIC_ALLTRACKER_MIN_VISIBLE", 200, env="STATIC_ALLTRACKER_MIN_VISIBLE")
 
 MOVE_DELETE_ENABLED = TRACKER == "tapnext"
 MOVE_WINDOW_SIZE = 10.0
@@ -687,13 +692,14 @@ else:
             exclude = exclude[..., 0]
     side = float(max(H, W))
     radius = ONLINE_RESAMPLE_RADIUS * side / 256.0
-    print(f"AllTracker: {GRID}x{GRID} seeds at frame 0, re-seeding every {AT_KEYFRAME} frames where no point is "
-          f"visible within {radius:.1f}px, {AT_RES}px, visible at vis x conf >= {AT_VIS_THRESHOLD}")
+    print(f"AllTracker: {GRID}x{GRID} seeds at frame 0, re-seeding every {AT_KEYFRAME} frames (and below {AT_MIN_VISIBLE} "
+          f"visible points) where no point is visible within {radius:.1f}px, tracks <= {AT_MAX_LEN} frames, {AT_RES}px, "
+          f"visible at vis x conf >= {AT_VIS_THRESHOLD}")
     trk, vis, _ = track_keyframes(
         video_np[0],
         lambda t, covered: grid_seeds(~(exclude[t] > 0), side / (GRID if t == 0 else ONLINE_RESAMPLE_GRID), covered, radius),
         keyframe=AT_KEYFRAME, res=AT_RES, vis_threshold=AT_VIS_THRESHOLD, max_points=ONLINE_MAX_POINTS,
-        device=str(device), label="AllTracker (static)",
+        max_len=AT_MAX_LEN, min_visible=AT_MIN_VISIBLE, device=str(device), label="AllTracker (static)",
     )
     tracks_xy = trk[None]
     occluded = ~vis[None]

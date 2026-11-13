@@ -128,6 +128,10 @@ CERES_INTRINSIC_SCALE_MIN = dataset_config.get_float(
 CERES_INTRINSIC_SCALE_MAX = dataset_config.get_float(
     "CERES_INTRINSIC_SCALE_MAX", 4.0, env="CERES_INTRINSIC_SCALE_MAX"
 )
+# Robust loss on the Ceres reprojection residuals: "trivial" (plain least squares), "huber", "cauchy" or "softl1",
+# with its scale in pixels (converted to the normalized landmark units with the median focal of intrinsics.npy).
+CERES_LOSS = dataset_config.get_str("CERES_LOSS", "cauchy", env="CERES_LOSS").lower()
+CERES_LOSS_PX = dataset_config.get_float("CERES_LOSS_PX", 2.0, env="CERES_LOSS_PX")
 
 STATIC_TRACK_DEPTH_MAX = dataset_config.get_float(
     "STATIC_TRACK_DEPTH_MAX", 50.0, env="STATIC_TRACK_DEPTH_MAX"
@@ -476,7 +480,17 @@ def run_ceres_refine(
         optimize_intrinsics=CERES_OPTIMIZE_INTRINSICS,
         intrinsic_scale_min=CERES_INTRINSIC_SCALE_MIN,
         intrinsic_scale_max=CERES_INTRINSIC_SCALE_MAX,
+        loss=CERES_LOSS,
+        loss_scale=_ceres_loss_scale(),
     )
+
+
+def _ceres_loss_scale():
+    """CERES_LOSS_PX in normalized landmark units (px / median focal), or None without intrinsics.npy."""
+    K_all = _load_intrinsics_npy(1)
+    if K_all is None or CERES_LOSS == "trivial":
+        return None
+    return CERES_LOSS_PX / float(np.median(K_all[:, 0, 0]))
 
 
 def build_sR_real(R_real, s_real, N):
