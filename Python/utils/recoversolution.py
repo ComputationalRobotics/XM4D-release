@@ -50,7 +50,14 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
         R_real[:, 3*i:3*i+3] = sR_real[:, 3*i:3*i+3] / s_real[i]
 
     print("s_real: ", s_real)
-    
+
+    # rank > 3: the rank-3 rounding leaves blocks that are not orthogonal; replace each by its nearest orthogonal
+    # matrix (determinant sign kept, so a global reflection still cancels in the anchoring below)
+    if optimal_rank != 3:
+        for i in range(N):
+            U, S, Vt = svd(R_real[:, 3*i:3*i+3])
+            R_real[:, 3*i:3*i+3] = U @ Vt
+
     # because of anchoring
     R1 = R_real[:,:3]
     R_real = R1.T @ R_real
@@ -73,8 +80,9 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
 
     # normalize s and R
     s_real /= s_real[0]
+    R1 = R_real[:, :3].copy()          # the anchor before the loop overwrites block 0
     for i in range(N):
-        R_real[:, 3*i:3*i+3] = R_real[:, :3].T @ R_real[:, 3*i:3*i+3] 
+        R_real[:, 3*i:3*i+3] = R1.T @ R_real[:, 3*i:3*i+3]
 
     if negative_R > 0 and negative_R < N:
         for i in range(N):

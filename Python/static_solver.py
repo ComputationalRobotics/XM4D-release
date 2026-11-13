@@ -871,8 +871,10 @@ def _da3_scale_search(center, base_dirs, target_tree, static_ref_f, log_lo, log_
     return float(s), float(final_loss)
 
 
-def estimate_da3_frame_scales_static_chamfer(R_real, t_est, static_points):
+def estimate_da3_frame_scales_static_chamfer(R_real, t_est, static_points, frame_index=None):
+    """frame_index[i] = original frame of solver frame i (the solver may drop frames); None = the same order."""
     T_expected = t_est.shape[1]
+    frame_index = np.arange(T_expected) if frame_index is None else np.asarray(frame_index, dtype=np.int64)
     scales = np.ones((T_expected,), dtype=np.float64)
     losses = np.full((T_expected,), np.nan, dtype=np.float64)
     stats = {
@@ -892,7 +894,7 @@ def estimate_da3_frame_scales_static_chamfer(R_real, t_est, static_points):
         stats["reason"] = f"depth_source={utils.definitions.depth_source!r} is not DA3"
         return scales, losses, stats
 
-    depth_maps, K_all, depth_path = _load_selected_depth_maps_and_intrinsics(T_expected)
+    depth_maps, K_all, depth_path = _load_selected_depth_maps_and_intrinsics(int(frame_index.max()) + 1)
     if depth_maps is None or K_all is None:
         stats["reason"] = "depth maps or intrinsics unavailable"
         return scales, losses, stats
@@ -938,12 +940,16 @@ def estimate_da3_frame_scales_static_chamfer(R_real, t_est, static_points):
         f"anchor+local(radius={local_radius})"
     )
     found_logs = []  # log-scales of frames solved so far (for the running-median prior)
-    for i in range(T):
+    fitted = np.zeros((T_expected,), dtype=bool)
+    for i in range(T_expected):
+        f = int(frame_index[i])        # the depth map, intrinsics and mask of this camera's original frame
+        if f < 0 or f >= T:
+            continue
         pts_cam = _camera_depth_samples_for_da3_scale(
-            depth_maps[i],
-            K_all[i],
-            dynamic_masks[i],
-            i,
+            depth_maps[f],
+            K_all[f],
+            dynamic_masks[f],
+            f,
             DA3_SCALE_FIT_POINTS,
             DA3_SCALE_DEPTH_MIN,
         )
@@ -967,12 +973,18 @@ def estimate_da3_frame_scales_static_chamfer(R_real, t_est, static_points):
         scales[i], losses[i] = _da3_scale_search(
             center, base_dirs, target_tree, static_ref_f, lo, hi, lv, cand
         )
+        fitted[i] = True
         found_logs.append(float(np.log(max(scales[i], 1e-8))))
         print(
             f"[da3-scale] frame={i}: static_samples={pts_cam.shape[0]} "
             f"scale={scales[i]:.6g} loss={losses[i]:.6g}",
             flush=True,
         )
+
+    if found_logs and not fitted.all():
+        # frames without enough static depth take the median fitted scale, not 1.0 (the solver's global scale is arbitrary)
+        scales[~fitted] = float(np.exp(np.median(found_logs)))
+        print(f"[da3-scale] {int((~fitted).sum())} frame(s) without a fit take the median scale {scales[~fitted][0]:.6g}")
 
     return scales, losses, stats
 
@@ -2453,10 +2465,15 @@ else:
     p_est = p_est[:, finite_p]
 
 if args.fit_da3_scale:
+    solver_frame_orig = np.full(N, -1, dtype=np.int64)          # original frame of each solver frame
+    for orig_idx, new_idx in enumerate(np.asarray(indices_all, dtype=np.int64)):
+        if 0 <= new_idx < N:
+            solver_frame_orig[new_idx] = orig_idx
     da3_frame_scale, da3_frame_scale_loss, da3_frame_scale_stats = estimate_da3_frame_scales_static_chamfer(
         R_real,
         t_est,
         p_est,
+        frame_index=solver_frame_orig,
     )
     s_real = da3_frame_scale
 else:
