@@ -39,4 +39,4 @@ conda deactivate && conda activate "$ENV"
 
 pip install "$ROOT/deps/TEASER-plusplus"
 
-for stage in sam3 da3 tapnet XM; do python "$ROOT/install/check_env.py" "$stage"; done
+echo "[install] every stage is installed in env $ENV. Check it:  python install/check_env.py --env $ENV"

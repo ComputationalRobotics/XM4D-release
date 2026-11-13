@@ -17,3 +17,10 @@ clone() {  # clone <url> <dir> <commit>: the tested commit; an existing <dir> is
     git clone "$1" "$2"
     git -C "$2" checkout -q "$3"
 }
+
+installed() {  # installed <stage>: the end of an install script; the check runs once every environment is installed
+    local arg=""
+    [ "$ENV" != "$1" ] && arg=" $1=$ENV"
+    echo "[install] $1 is installed in env $ENV. Once every environment is installed, check them all:"
+    echo "  python install/check_env.py$arg"
+}

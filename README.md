@@ -20,8 +20,7 @@ GPU solver before any photometric training.
 
 ## Install
 
-Requirements: Linux x86-64, an NVIDIA GPU with a driver that supports CUDA 12.8, conda, git, wget, and a C++ compiler
-(to build TEASER++).
+Requirements: Linux x86-64, an NVIDIA GPU with a driver that supports CUDA 12.8, conda, git, wget, and a C++ compiler.
 
 ```bash
 git clone https://github.com/ComputationalRobotics/XM4D-release.git
@@ -29,27 +28,20 @@ cd XM4D-release
 ```
 
 Each stage of the pipeline runs in its own conda environment, with its own install script. A script clones its
-third-party code into `deps/` at the tested commit, creates the environment with pinned versions, and ends with a check
-that the environment can run its stage: the imports, the GPU and the model weights. A ready environment prints
-`[check_env] <env>: ready`. Run the check again at any time:
-
-```bash
-conda activate <env> && python install/check_env.py <env>
-```
-
-The scripts never modify an existing environment. Set `ENV=<name>` to install under another name.
+third-party code into `deps/` at the tested commit and creates the environment with pinned versions. The scripts never
+modify an existing environment. Set `ENV=<name>` to install under another name. When all environments are installed,
+check them with one command (see [Check the installation](#check-the-installation)).
 
 ### 1. `sam3`: masks (step 0)
 
 > [!WARNING]
 > **The SAM 3 checkpoint is gated: request access yourself.** Open [huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3),
 > request access to the weights and wait for the approval. Then log in with your Hugging Face token. Without access, the
-> check below fails at "SAM 3 weights".
+> installation check fails at "SAM 3 weights".
 
 ```bash
 bash install/sam3.sh
 conda activate sam3 && hf auth login          # once, with your Hugging Face token
-python install/check_env.py sam3
 ```
 
 Installs [SAM 3](https://github.com/facebookresearch/sam3) (`deps/sam3`) with PyTorch 2.10 and Jupyter. The
@@ -97,7 +89,7 @@ libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and C
 ### One environment instead (optional)
 
 The four environments above are the reference setup. Alternatively, everything installs into one environment `xm4d`
-(Python 3.10, PyTorch 2.9 for every stage). The script runs all four checks:
+(Python 3.10, PyTorch 2.9 for every stage):
 
 ```bash
 bash install/xm4d.sh
@@ -106,6 +98,21 @@ bash install/xm4d.sh
 Then use `conda activate xm4d` wherever the steps below activate `sam3`, `da3`, `tapnet` or `XM`. On our tests it gives
 the same results as the four environments within their run-to-run variation. The one consistent difference is that the
 SAM 3 masks differ in fewer than 0.1% of the mask pixels (PyTorch 2.9 instead of 2.10).
+
+### Check the installation
+
+When the environments are installed, check them all at once, with any Python 3 that has conda on the PATH (e.g. conda's
+`base`):
+
+```bash
+python install/check_env.py                  # the environments above
+python install/check_env.py --env xm4d       # or: the one-environment install
+```
+
+It runs the check of every stage in that stage's environment (the imports, the GPU and the model weights) and ends with
+a summary; it exits with an error if an environment is missing or fails. For step 0 it checks `sam3`, or `gmos` if
+`sam3` is not installed (both if both are), and warns if neither is installed. An environment installed under another
+name is given as `<stage>=<env>`, e.g. `python install/check_env.py tapnet=mytap`.
 
 ## Usage
 

@@ -24,4 +24,4 @@ if [ ! -f "$CK/gmos_proposer.pth" ]; then   # the GMOS proposer (0.1 GB), shared
     mv "$CK/gmos_proposer.pth.part" "$CK/gmos_proposer.pth"
 fi
 
-python "$ROOT/install/check_env.py" gmos
+installed gmos

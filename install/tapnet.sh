@@ -23,4 +23,4 @@ new_env "$ENV" python=3.10
 pip install torch==2.9.1 torchvision==0.24.1 einops==0.8.1 numpy==2.0.2 opencv-python==4.12.0.88 pandas==2.3.3 \
     pillow tqdm
 
-python "$ROOT/install/check_env.py" tapnet
+installed tapnet

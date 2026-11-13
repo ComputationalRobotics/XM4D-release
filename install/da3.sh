@@ -10,4 +10,4 @@ pip install torch==2.9.0 torchvision==0.24.0 xformers==0.0.33.post1
 pip install -e "$ROOT/deps/Depth-Anything-3"
 pip install open3d==0.19.0 scipy==1.15.3 pandas==2.3.3
 
-python "$ROOT/install/check_env.py" da3
+installed da3

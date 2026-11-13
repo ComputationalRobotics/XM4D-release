@@ -1,7 +1,14 @@
-"""Check that a conda env can run its XM4D stage: the imports of the stage's scripts, the GPU, and the model weights.
-usage (inside the env):  python install/check_env.py {sam3,gmos,da3,tapnet,XM}
-The install scripts run it at the end; run it again any time. Exits 1 if something is missing."""
+"""Check the conda environments of XM4D after installing them: for every stage, in its own env, the imports of the
+stage's scripts, the GPU and the model weights. Run it with any Python 3 that has conda on the PATH (e.g. conda's base):
+    python install/check_env.py                 # every stage in its env: sam3 (or gmos), da3, tapnet, XM
+    python install/check_env.py --env xm4d      # the one-environment install (install/xm4d.sh)
+    python install/check_env.py tapnet=mytap    # a stage installed under another env name (ENV=<name>)
+Step 0 is checked with sam3, with gmos when sam3 is not installed (both when both are), and gives a warning when neither
+is installed. Exits 1 if a stage fails or is missing."""
 import importlib
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -93,28 +100,67 @@ def alltracker_forward():
     return "AllTracker checkpoint loads and runs"
 
 
-def main():
-    env = sys.argv[1] if len(sys.argv) > 1 else ""
-    if env not in MODULES:
-        sys.exit(f"usage: python {sys.argv[0]} {{{','.join(MODULES)}}}")
-    sys.path[:0] = [str(p) for p in PATHS.get(env, [])]
-    print(f"[check_env] {env}  (python {sys.version.split()[0]}, {sys.executable})")
-    for mod in MODULES[env]:
+def check_stage(stage):   # runs inside the stage's env
+    sys.path[:0] = [str(p) for p in PATHS.get(stage, [])]
+    print(f"[check_env] {stage}  (python {sys.version.split()[0]}, {sys.executable})")
+    for mod in MODULES[stage]:
         check(f"import {mod}", lambda mod=mod: importlib.import_module(mod) and None)
-    if env != "XM":
+    if stage != "XM":
         check("CUDA GPU", gpu)
-    if env == "sam3":
+    if stage == "sam3":
         check("SAM 3 weights", sam3_weights)
-    if env == "gmos":
+    if stage == "gmos":
         check("GMOS weights", gmos_weights)
-    if env == "tapnet":
+    if stage == "tapnet":
         check("AllTracker", alltracker_forward)
         check("TAPNext++ (optional tracker)", tapnext_forward)
     if failed:
-        print(f"[check_env] {env}: NOT ready, {len(failed)} problem(s): {', '.join(failed)}")
+        print(f"[check_env] {stage}: NOT ready, {len(failed)} problem(s): {', '.join(failed)}")
         sys.exit(1)
-    print(f"[check_env] {env}: ready")
+    print(f"[check_env] {stage}: ready")
+
+
+def main():
+    envs = {stage: stage for stage in MODULES}   # stage -> conda env name
+    one_env = None
+    args = sys.argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--env" and args:
+            one_env = args.pop(0)
+            envs.update({stage: one_env for stage in ("sam3", "da3", "tapnet", "XM")})   # GMOS is not in the one env
+        elif a.split("=")[0] in MODULES and "=" in a:
+            envs[a.split("=")[0]] = a.split("=", 1)[1]
+        else:
+            sys.exit(__doc__)
+    conda = os.environ.get("CONDA_EXE", "conda")
+    listed = json.loads(subprocess.run([conda, "env", "list", "--json"], capture_output=True, text=True,
+                                       check=True).stdout)["envs"]
+    installed = {Path(p).name for p in listed}
+    masks = [stage for stage in ("sam3", "gmos") if envs[stage] in installed]
+    summary = []
+    for stage in masks + ["da3", "tapnet", "XM"]:
+        if envs[stage] not in installed:
+            script = "xm4d" if envs[stage] == one_env else stage
+            summary.append(("FAIL", stage, f"env {envs[stage]} is not installed: bash install/{script}.sh"))
+            continue
+        r = subprocess.run([conda, "run", "--no-capture-output", "-n", envs[stage], "python", str(Path(__file__).resolve()),
+                            "--stage", stage])
+        summary.append(("ok" if r.returncode == 0 else "FAIL", stage, f"env {envs[stage]}"))
+    print("\n[check_env] summary")
+    for status, stage, note in summary:
+        print(f"  {status:<5} {stage:<7} {note}")
+    if not masks:
+        print(f"  WARNING step 0: neither sam3 (env {envs['sam3']}) nor gmos (env {envs['gmos']}) is installed, so no "
+              "masks can be made.\n          Install one: bash install/sam3.sh, or bash install/gmos.sh where no "
+              "notebook runs.\n          Scenes that already have their masks, or set \"no_masks\", do not need it.")
+    if any(status == "FAIL" for status, _, _ in summary):
+        sys.exit(1)
+    print("[check_env] all stages ready" + ("" if masks else ", except step 0 (see the warning)"))
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--stage"]:
+        check_stage(sys.argv[2])
+    else:
+        main()

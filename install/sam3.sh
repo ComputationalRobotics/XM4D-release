@@ -10,4 +10,4 @@ pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytor
 pip install -e "$ROOT/deps/sam3[notebooks]"
 pip install setuptools==80.10.2   # SAM 3 imports pkg_resources, which newer setuptools no longer ships
 
-python "$ROOT/install/check_env.py" sam3
+installed sam3

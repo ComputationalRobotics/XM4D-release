@@ -22,4 +22,4 @@ conda deactivate && conda activate "$ENV"
 
 pip install "$ROOT/deps/TEASER-plusplus"
 
-python "$ROOT/install/check_env.py" XM
+installed XM
