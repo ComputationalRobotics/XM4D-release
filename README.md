@@ -72,9 +72,10 @@ PyTorch 2.9. The model (DA3NESTED-GIANT-LARGE-1.1, 6.8 GB) is downloaded from Hu
 bash install/tapnet.sh
 ```
 
-Installs the 2D tracker [AllTracker](https://github.com/aharley/alltracker) (`deps/alltracker`, checkpoint 66 MB)
-and, for the optional TAPNext tracking below, the [TAPNet](https://github.com/google-deepmind/tapnet) code
-(`deps/tapnet`) with the TAPNext++ checkpoint (2.5 GB), with PyTorch 2.9. The check runs both trackers on the GPU.
+Installs the two 2D trackers, with PyTorch 2.9: the [TAPNet](https://github.com/google-deepmind/tapnet) code
+(`deps/tapnet`) with the TAPNext++ checkpoint (2.5 GB), which tracks the static scene, and
+[AllTracker](https://github.com/aharley/alltracker) (`deps/alltracker`, checkpoint 66 MB), which tracks the moving
+objects. The check runs both trackers on the GPU.
 
 ### 4. `XM`: solver, deformation graph and 4DGS data (steps 3–5)
 
@@ -195,8 +196,8 @@ conda activate da3
 python get_depths_clean.py           # 1. monocular depth (Depth Anything 3) -> outputs/depth_anything_3/
 
 conda activate tapnet
-python static_tracking_online.py     # 2. 2D tracks (AllTracker) of the static scene
-python dynamic_tracking.py           #    and of the moving objects -> outputs/tracks_dynamic_only.npz
+python static_tracking_online.py     # 2. 2D tracks of the static scene (TAPNext++) -> outputs/output_tapnet_da3.npz
+python dynamic_tracking.py           #    and of the moving objects (AllTracker) -> outputs/tracks_dynamic_only.npz
 
 conda activate XM
 python static_solver.py              # 3. cameras + static points (XM solver) -> outputs/result_XM.npz
@@ -213,34 +214,41 @@ Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's p
 point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are squeezed to 2:1 for Depth Anything 3
 (`DA3_ASPECT_CAP`).
 
-Step 2 tracks with AllTracker. Every `ALLTRACKER_KEYFRAME` frames (default 10), it adds points on a grid wherever no
-tracked point is visible nearby: off the moving objects for the static scene, on them for the moving objects. Each
-keyframe's points are tracked forward in one dense pass. A static point is hidden while it is on a moving object, a
-moving point while it is off its object.
+Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving objects with AllTracker
+(`DYNAMIC_TRACKER`). A static point is hidden while it is on a moving object, a moving point while it is off its object.
 
-- Static scene: tracked at `STATIC_ALLTRACKER_RES` px (1024) on the long side, for at most `STATIC_ALLTRACKER_MAX_LEN`
-  frames (100) from their keyframe. A point counts as visible while AllTracker's visibility × confidence is at least
-  `STATIC_ALLTRACKER_VIS_THRESHOLD` (0.99). Any frame where fewer than `STATIC_ALLTRACKER_MIN_VISIBLE` points (200) are
-  visible also becomes a keyframe. At 1024 px, AllTracker needs about 24 GB of GPU memory for a 1024 × 768 video; set
-  `STATIC_ALLTRACKER_RES` to 512 on a smaller GPU (the camera accuracy drops).
-- Moving objects: tracked at `ALLTRACKER_RES` px (512) to the end of the video, visible while visibility × confidence is
-  at least `ALLTRACKER_VIS_THRESHOLD` (0.6). `DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at
-  the tracking resolution.
+- Static scene: TAPNext++ starts from a 50 × 50 grid of points off the moving objects and tracks them frame by frame.
+  At every frame it adds points wherever no visible point is within `ONLINE_RESAMPLE_RADIUS` px (4, on the frame
+  resized to 256 × 256), up to 20000 points. A point counts as visible while TAPNext's visibility × certainty is above
+  `ONLINE_CERTAINTY_THRESHOLD` (0.8). A track whose frame-to-frame motion differs from that of the points around it by
+  more than `MOVE_DELETE_FLOW_ERROR_THRESHOLD` px (10) keeps only its longest stable part. With 20000 points it used
+  up to about 45 GB of GPU memory on our videos (nvidia-smi), independent of the video length.
+- Moving objects: every `ALLTRACKER_KEYFRAME` frames (default 10), AllTracker adds points on a grid on the object
+  wherever no tracked point is visible nearby and tracks them forward in one dense pass at `ALLTRACKER_RES` px (512),
+  to the end of the video. A point counts as visible while visibility × confidence is at least
+  `ALLTRACKER_VIS_THRESHOLD` (0.6). `DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at the
+  tracking resolution.
 
 Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauchy loss of `CERES_LOSS_PX` px (2;
 `CERES_LOSS`: `cauchy`, `huber`, `softl1` or `trivial`), and the shared focal is refined too
 (`CERES_OPTIMIZE_INTRINSICS`).
 
-### Optional: track with TAPNext instead
+### Optional: swap the trackers
 
-The earlier tracker, the online TAPNext++ tracker, is still included. To use it for step 2, set it in `config.json`:
+Either part of step 2 can use either tracker, set in `config.json`:
 
 ```json
-"TRACKER": "tapnext"
+"STATIC_TRACKER": "alltracker",
+"DYNAMIC_TRACKER": "tapnext"
 ```
 
-It is not used by default. The TAPNext path keeps its own filters, which AllTracker does not need: it cuts a track at
-a large 2D move against its neighbours and at a point lost off its object.
+AllTracker tracks the static scene at `STATIC_ALLTRACKER_RES` px (1024), for at most `STATIC_ALLTRACKER_MAX_LEN`
+frames (100) from its keyframe, visible while visibility × confidence is at least `STATIC_ALLTRACKER_VIS_THRESHOLD`
+(0.99), with an extra keyframe at any frame where fewer than `STATIC_ALLTRACKER_MIN_VISIBLE` points (200) are visible.
+At 1024 px it needs about 24 GB of GPU memory for a 1024 × 768 video. Its points are more accurate on most of our test
+videos, but during a fast camera turn over repeating texture it can follow a wrong spot with full confidence, and the
+cameras then fail. TAPNext on the moving objects keeps its own filters: it cuts a track at a large 2D move against its
+neighbours and at a point lost off its object.
 
 ## License
 

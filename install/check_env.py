@@ -113,7 +113,7 @@ def check_stage(stage):   # runs inside the stage's env
         check("GMOS weights", gmos_weights)
     if stage == "tapnet":
         check("AllTracker", alltracker_forward)
-        check("TAPNext++ (optional tracker)", tapnext_forward)
+        check("TAPNext++", tapnext_forward)
     if failed:
         print(f"[check_env] {stage}: NOT ready, {len(failed)} problem(s): {', '.join(failed)}")
         sys.exit(1)

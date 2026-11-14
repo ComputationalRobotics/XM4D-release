@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dynamic-only tracking aligned with static_tracking_online.py. Tracker (config TRACKER): "alltracker" (default;
+"""Dynamic-only tracking aligned with static_tracking_online.py. Tracker (config DYNAMIC_TRACKER): "alltracker" (default;
 AllTracker from keyframes, utils/track_alltracker.py) or "tapnext" (the online TAPNext++ tracker)."""
 
 from pathlib import Path
@@ -66,9 +66,9 @@ DEPTH_JUMP_THRESHOLD = None
 # is visible nearby (grid spacing DYN_ALLTRACKER_GRID px at the tracking resolution ALLTRACKER_RES), visible where
 # AllTracker's visibility x confidence >= ALLTRACKER_VIS_THRESHOLD and the point is on the object mask. The
 # TAPNext-only filters below (large-2D-move truncation, lost-off-object) are not applied to AllTracker tracks.
-TRACKER = dataset_config.get_str("TRACKER", "alltracker", env="TRACKER").lower()
+TRACKER = dataset_config.get_str("DYNAMIC_TRACKER", "alltracker", env="DYNAMIC_TRACKER").lower()
 if TRACKER not in {"alltracker", "tapnext"}:
-    raise ValueError(f"TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
+    raise ValueError(f"DYNAMIC_TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
 AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10, env="ALLTRACKER_KEYFRAME")
 AT_RES = dataset_config.get_int("ALLTRACKER_RES", 512, env="ALLTRACKER_RES")
 AT_VIS_THRESHOLD = dataset_config.get_float("ALLTRACKER_VIS_THRESHOLD", 0.6, env="ALLTRACKER_VIS_THRESHOLD")
