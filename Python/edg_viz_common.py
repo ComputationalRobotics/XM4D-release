@@ -261,9 +261,9 @@ def _load_2d_context(merged: bool, n_tracks: int | None = None):
     merged_sm = out_dir / "tracks_dynamic_merged_smoothed.npz"
     merged_p = merged_sm if merged_sm.exists() else (out_dir / "tracks_dynamic_merged.npz")
     raw_p = Path(utils.definitions.tracks_dynamics_path)
-    tracks_path = merged_p if merged else raw_p
+    tracks_path = merged_p if merged and merged_p.exists() else raw_p      # no merged tracks: the moving objects' own
     data = np.load(str(tracks_path), allow_pickle=True)
-    if n_tracks is not None and int(data["tracks_xy"].shape[1]) != int(n_tracks):
+    if n_tracks is not None and int(data["tracks_xy"].shape[1]) != int(n_tracks) and merged_p.exists():
         other = raw_p if tracks_path == merged_p else merged_p
         alt = np.load(str(other), allow_pickle=True)
         if int(alt["tracks_xy"].shape[1]) == int(n_tracks):

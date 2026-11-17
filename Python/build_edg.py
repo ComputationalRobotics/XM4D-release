@@ -943,9 +943,22 @@ def _augment_edg_min_degree(edg_edges, nodes, Ps, Vs, min_degree, verbose=True,
     return edg_edges
 
 
+def _nanquantile_fast(a, q, axis=0):
+    """np.nanquantile(a, q, axis) with the default linear method, vectorised (sandbox 2026-11-17, speed only: numpy loops over
+    columns in Python when NaNs are present). Same interpolation (numpy's _lerp); NaN where a slice has no finite value."""
+    a = np.moveaxis(np.asarray(a, np.float64), axis, 0)
+    fin = ~np.isnan(a); n = fin.sum(0)
+    s = np.sort(np.where(fin, a, np.inf), axis=0)
+    v = q * (np.maximum(n, 1) - 1); lo = np.floor(v).astype(np.int64); hi = np.minimum(lo + 1, np.maximum(n - 1, 0)); g = v - lo
+    A = np.take_along_axis(s, lo[None], 0)[0]; B = np.take_along_axis(s, hi[None], 0)[0]; d = B - A
+    with np.errstate(invalid="ignore"):
+        out = np.where(g >= 0.5, B - d * (1 - g), A + d * g)
+    return np.where(n > 0, out, np.nan)
+
+
 def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, min_conn=2,
                            max_factor=3.0, cand_k=8, quantile=90, verbose=True, hop_limit=20,
-                           max_dist_factor=3.0, min_max_ratio=0.5):
+                           max_dist_factor=3.0, min_max_ratio=0.5, cand_near=0):
     """Attach each DYNAMIC point (track) to its `min_conn` EDG nodes (ORANGE edges), chosen so the
     connection stays SPATIALLY CLOSE ACROSS ALL co-visible frames. The skinning weight is set once and
     used for every frame (global), so a node that is near at one frame but far at others would corrupt
@@ -998,6 +1011,23 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
             keep = ~node_mask[qi]
             for nl, q in zip(ni[keep].tolist(), qi[keep].tolist()):
                 cand[q].add(int(nl))
+    elif cand_near and cand_near < K:                         # no track graph (sandbox 2026-11-17, speed): the cand_near
+        nodes_P = Ps[:, edg_nodes]                           # nodes nearest at up to 5 of the point's frames (min distance)
+        nodes_V = Vs[:, edg_nodes]
+        for c0 in range(0, dyn_ids.size, 2048):
+            qs = dyn_ids[c0:c0 + 2048]; dmin = np.full((qs.size, K), np.inf)
+            fr = [np.where(Vs[:, q])[0] for q in qs]
+            pick = np.array([f[np.linspace(0, f.size - 1, min(5, f.size)).astype(int)] if f.size else np.zeros(0, int) for f in fr], dtype=object)
+            for j in range(5):
+                ok = np.array([len(f) > j for f in pick]); 
+                if not ok.any():
+                    break
+                ii = np.where(ok)[0]; tj = np.array([pick[i][j] for i in ii])
+                d = np.linalg.norm(nodes_P[tj] - Ps[tj, qs[ii]][:, None, :], axis=2)          # (n, K)
+                d = np.where(nodes_V[tj], d, np.inf); dmin[ii] = np.minimum(dmin[ii], d)
+            near = np.argsort(dmin, axis=1)[:, :int(cand_near)]
+            for i, q in enumerate(qs.tolist()):
+                cand[q] = {int(n) for n in near[i] if np.isfinite(dmin[i, n])}
     else:                                                    # no track graph: every node is a candidate
         for q in dyn_ids.tolist():
             cand[q] = set(range(K))
@@ -1015,7 +1045,7 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
         d = np.linalg.norm(Ps[:, pts, :] - Ps[:, n_gid][:, None, :], axis=2)   # (T, n_pts)
         d = np.where(covis, d, np.nan)
         with np.errstate(all="ignore"):
-            rob = np.nanpercentile(d, quantile, axis=0)      # (n_pts,) robust over co-visible frames
+            rob = _nanquantile_fast(d, quantile / 100.0, axis=0)   # (n_pts,) robust over co-visible frames (= np.nanpercentile)
             dmn = np.nanmin(d, axis=0)
             dmx = np.nanmax(d, axis=0)
         for pi, q in enumerate(pts.tolist()):

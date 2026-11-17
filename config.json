@@ -32,6 +32,12 @@
 
   "LAMBDA": 10.0,
 
+  "SMOOTH_SIGMA_ACC": 3.0,
+  "SMOOTH_SIGMA_DEPTH": 0.1,
+  "EDG_MAX_NODES": 200,
+  "DYN_BIND": "motion",
+  "DYN_BIND_PX": 3.0,
+
   "USE_DA3_INTRINSICS": false,
   "DA3_SINGLE_INTRINSIC": true,
   "DA3_ASPECT_CAP": 2.0,

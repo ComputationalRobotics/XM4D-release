@@ -68,7 +68,7 @@ def load_inputs(merged, smoothed=True, edges_npz=None, table_path=None):
             print("[complete] WARNING: smoothed file missing -- raw merged is 2D-only (tracks_xyz all-NaN); "
                   "run optimize_dynamic_tracks.py first.")
     else:
-        tracks_path = Path(utils.definitions.tracks_dynamics_path)
+        tracks_path = Path(utils.definitions.dynamic_tracks_for_edg())
     data = np.load(str(tracks_path), allow_pickle=True)
     tracks_xyz = data["tracks_xyz"]                                   # (1,Q,T,3)
     occluded = data["occluded"]                                      # (1,Q,T)
@@ -166,13 +166,20 @@ def fit_frame_intrinsics(xyz_cam, xy, occ, T):
 
 # ------------------------------------------------------------------- pre-solve table cleaning (per cell)
 def _smooth_traj_nan(arr, win):
-    """NaN-aware centred moving average of a [T,3] trajectory (same as visualize_edg_filtered_open3d)."""
+    """NaN-aware centred moving average of a [T,3] trajectory. At the clip ends the window shrinks symmetrically
+    (half-width min(half, t, T-1-t); user 2026-11-16): a cut-off one-sided window lags a moving track, so every fast
+    node used to look like an outlier in the first / last frames and its table cells were deleted there."""
     half = max(1, int(win)) // 2
+    T = arr.shape[0]
     fin = np.isfinite(arr).all(axis=1)
     vals = np.where(fin[:, None], arr, 0.0)
-    kernel = np.ones(2 * half + 1)
-    num = np.stack([np.convolve(vals[:, d], kernel, mode="same") for d in range(3)], axis=1)
-    cnt = np.convolve(fin.astype(np.float64), kernel, mode="same")
+    cs = np.vstack([np.zeros((1, 3)), np.cumsum(vals, axis=0)])
+    cc = np.concatenate([[0.0], np.cumsum(fin.astype(np.float64))])
+    t = np.arange(T)
+    h = np.minimum(half, np.minimum(t, T - 1 - t))
+    lo, hi = t - h, t + h + 1
+    num = cs[hi] - cs[lo]
+    cnt = cc[hi] - cc[lo]
     out = np.full_like(arr, np.nan)
     ok = fin & (cnt > 0)
     out[ok] = num[ok] / cnt[ok, None]
@@ -332,9 +339,41 @@ def _slerp(Ra, Rb, u):
     return Ra @ _so3_exp_np(u * _so3_log_np(Ra.T @ Rb))
 
 
-def init_dense(table, rotation, filled, rot_filled):
+def _follow_neighbours(c, R, filled, edges):
+    """Before a node's first / after its last observed cell, move it rigidly with its EDG neighbours frame by frame
+    (from the known frame p = t -+ 1: c_m(t) = mean_n [c_n(t) + Q_n (c_m(p) - c_n(p))], Q_n = R_n(t) R_n(p)^T,
+    R_m(t) = mean Q_n projected to SO(3) times R_m(p)); a held-constant end leaves a node behind on a moving object
+    and the temporal terms make it too stiff to catch up (car-roundabout, user 2026-11-16). Sweeps repeat until no node
+    gains a frame; a node with no known neighbour keeps its held-constant end."""
+    M, T, _ = c.shape
+    nbr = [[] for _ in range(M)]
+    for a, b in edges.tolist():
+        nbr[a].append(b); nbr[b].append(a)
+    f = [np.where(filled[m])[0] for m in range(M)]
+    known = filled.copy()
+    for step, ts in ((-1, range(T - 2, -1, -1)), (1, range(1, T))):     # leading holes, then trailing holes
+        changed = True
+        while changed:
+            changed = False
+            for t in ts:
+                p = t - step
+                for m in range(M):
+                    if known[m, t] or not known[m, p] or f[m].size == 0 or f[m][0] < t < f[m][-1]:
+                        continue
+                    ns = [n for n in nbr[m] if known[n, t] and known[n, p]]
+                    if not ns:
+                        continue
+                    Q = [R[n, t] @ R[n, p].T for n in ns]
+                    c[m, t] = np.mean([c[n, t] + q @ (c[m, p] - c[n, p]) for n, q in zip(ns, Q)], axis=0)
+                    U, _, Vt = np.linalg.svd(np.sum(Q, axis=0))
+                    U[:, -1] *= np.sign(np.linalg.det(U @ Vt))
+                    R[m, t] = U @ Vt @ R[m, p]; known[m, t] = changed = True
+
+
+def init_dense(table, rotation, filled, rot_filled, edges=None):
     """Dense starting point: linear interp for c, geodesic interp for R, between nearest observed cells;
-    endpoints held constant. Interpolated cells are NOT anchored (their init prior is off elsewhere)."""
+    endpoints held constant, or with `edges` moved with the node's EDG neighbours (_follow_neighbours).
+    Interpolated cells are NOT anchored (their init prior is off elsewhere)."""
     M, T, _ = table.shape
     c = np.zeros((M, T, 3), dtype=np.float64)
     for m in range(M):
@@ -358,6 +397,8 @@ def init_dense(table, rotation, filled, rot_filled):
             else:
                 a = f[f < t][-1]; b = f[f > t][0]
                 R[m, t] = _slerp(rotation[m, a], rotation[m, b], (t - a) / (b - a))
+    if edges is not None:
+        _follow_neighbours(c, R, filled, edges)
     return c, R
 
 
@@ -533,7 +574,11 @@ def complete(D, args, device):
     table, rotation = D["table"], D["rotation"]
     filled, rot_filled, weight = D["filled"], D["rot_filled"], D["weight"]
 
-    c_init, R_init = init_dense(table, rotation, filled, rot_filled)
+    # ---- ARAP edge index arrays (local node indices)
+    nl = D["node_loc"]
+    e = np.array([[nl[a], nl[b]] for a, b in D["edg_edges"].tolist() if a in nl and b in nl], dtype=np.int64)
+
+    c_init, R_init = init_dense(table, rotation, filled, rot_filled, None if args.hold_ends else e)
     scene = robustscale(np.linalg.norm(c_init[filled] - np.median(c_init[filled], 0), axis=1), 1e-6)
 
     # ---- fixed skinning + observation pairs
@@ -551,9 +596,6 @@ def complete(D, args, device):
                xy=torch.as_tensor(D["xy"][en_glob][n2d_ok], dtype=torch.float32, device=device))
     print(f"[2d] reprojection targets: {n2d_m.size} node cells + {OB['O']} dyn observations")
 
-    # ---- ARAP edge index arrays (local node indices)
-    nl = D["node_loc"]
-    e = np.array([[nl[a], nl[b]] for a, b in D["edg_edges"].tolist() if a in nl and b in nl], dtype=np.int64)
     em = torch.as_tensor(e[:, 0], device=device); en = torch.as_tensor(e[:, 1], device=device)
     E = e.shape[0]
 
@@ -572,7 +614,7 @@ def complete(D, args, device):
     a = torch.as_tensor(np.clip(a, 0.0, 4.0), dtype=torch.float32, device=device)
 
     # ---- robust residual scales from the RELIABLE (originally observed) init cells (PDF section 6)
-    gaps = args.gaps
+    gaps = args.gaps if args.gaps else [g for g in (1, 4, 16, 64, 128, 256) if g < T]
     with torch.no_grad():
         phi_init = warp_phi(torch.as_tensor(c_init, dtype=torch.float32, device=device), R0t,
                             OB["p_o"], OB["p_m"], OB["p_w"], OB["p_t"], OB["p_s"], OB["p_xsrc"],
@@ -750,14 +792,20 @@ def main():
     ap.add_argument("--edges-npz", default=None,
                     help="optionally override the EDG edges with a rebuilt set "
                          "(outputs/edg_edges_rebuilt.npz from rebuild_edg_edges.py); default = edg_topology.npz")
-    ap.add_argument("--iters", type=int, default=1000)
+    ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--lr", type=float, default=1e-2)
-    ap.add_argument("--gaps", type=int, nargs="+", default=[1], help="ARAP temporal gaps D (e.g. 1 2 4)")
+    ap.add_argument("--gaps", type=int, nargs="+", default=None,
+                    help="ARAP temporal gaps D (default 1 4 16 64 128 256, those shorter than the video): the long gaps keep a node's "
+                         "motion consistent over the whole video, not only between neighbouring frames")
     ap.add_argument("--lambda-obs", type=float, default=1.0)
     ap.add_argument("--lambda-arap", type=float, default=1.0)
-    ap.add_argument("--lambda-vel", type=float, default=0.1)
-    ap.add_argument("--lambda-acc", type=float, default=0.0)
-    ap.add_argument("--lambda-init", type=float, default=10.0)
+    ap.add_argument("--lambda-vel", type=float, default=0.0)
+    ap.add_argument("--lambda-acc", type=float, default=1.0,
+                    help="second-difference smoothness of every node trajectory (the table from the segment solves zig-zags)")
+    ap.add_argument("--lambda-init", type=float, default=3.0)
+    ap.add_argument("--hold-ends", action="store_true",
+                    help="hold a node constant before its first / after its last observed cell (old init) instead of "
+                         "moving it with its EDG neighbours")
     ap.add_argument("--lambda-2d", type=float, default=1.0,
                     help="2D reprojection loss (dyn warped points + EDG nodes vs their pixel tracks); 0 = off")
     ap.add_argument("--eta-coord", type=float, default=1.0)
@@ -765,24 +813,24 @@ def main():
     ap.add_argument("--sig-rot", type=float, default=0.1, help="rotation residual scale floor (radians)")
     ap.add_argument("--huber-delta", type=float, default=2.0,
                     help="Huber transition for L_obs/L_arap, in whitened residual std-devs (PDF: 1.5-2.5)")
-    ap.add_argument("--smooth-win", type=int, default=9,
+    ap.add_argument("--smooth-win", type=int, default=0,
                     help="pre-solve clean, filter 1: smoothing window for the per-cell smooth-error deletion "
                          "(0 disables)")
     ap.add_argument("--smooth-sigma", type=float, default=5.0,
                     help="pre-solve clean, filter 1: delete a cell when its residual to the smoothed track "
                          "exceeds median + sigma * 1.4826*MAD (pooled over all cells)")
-    ap.add_argument("--reproj-del-px", type=float, default=10.0,
+    ap.add_argument("--reproj-del-px", type=float, default=0.0,
                     help="pre-solve clean, filter 2: delete a cell whose projected 2D position is farther "
                          "than this many px from the node's initial 2D observation (0 disables)")
-    ap.add_argument("--no-mask-del", action="store_true",
-                    help="pre-solve clean, filter 2: do NOT delete cells projecting outside the dynamic mask")
+    ap.add_argument("--mask-del", action=argparse.BooleanOptionalAction, default=False,
+                    help="pre-solve clean, filter 2: delete cells projecting outside the dynamic mask (default off)")
     ap.add_argument("--mask-dilate-px", type=int, default=5,
                     help="pre-solve clean, filter 2: dilate the dynamic masks before the outside-mask test")
-    ap.add_argument("--post-del-frac", type=float, default=0.8,
+    ap.add_argument("--post-del-frac", type=float, default=0.0,
                     help="AFTER solving, delete a WHOLE track whose solved trajectory fails the same 2D "
                          "criterion (far from observation / outside mask) in more than this fraction of its "
                          "evaluable frames (0 disables)")
-    ap.add_argument("--bad-node-frac", type=float, default=0.3,
+    ap.add_argument("--bad-node-frac", type=float, default=0.0,
                     help="AFTER solving, DELETE the BAD ('red') EDG nodes -- nodes whose skinning-weighted "
                          "fraction of render-colour-OUTLIER dynamic points is >= this (the same "
                          "classification as visualize_edg_filtered_open3d --edg-quality) -- and REASSIGN "
@@ -803,7 +851,7 @@ def main():
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     print(f"[device] {device}")
     D = load_inputs(args.merged, args.smoothed, args.edges_npz, args.table)
-    masks = None if args.no_mask_del else _load_dyn_mask_images(D["T"], args.mask_dilate_px)
+    masks = _load_dyn_mask_images(D["T"], args.mask_dilate_px) if args.mask_del else None
     clean_table(D, args, masks)                                       # delete bad cells, THEN solve
     c_fin, R_fin, tracks = complete(D, args, torch.device(device))
     dyn_ids, dyn_reconstruct = warp_dyn_output(tracks, c_fin, R_fin, D, torch.device(device))
@@ -848,6 +896,10 @@ def main():
         import shutil
         from completed_to_results import convert
         ra = Path(args.results_all) if args.results_all else Path(utils.definitions.output_dir) / "results_all.npz"
+        if not ra.exists():                                          # no EDG_old.py run: the base is the camera solve's
+            rt = np.load(Path(utils.definitions.output_dir) / "result_XM.npz")   # static points (as EDG_old.py writes them)
+            np.savez_compressed(ra, static_landmarks=rt["p"].T.astype(np.float64) if "p" in rt else None)
+            print(f"[results_all] created {ra.name} with the {rt['p'].shape[1] if 'p' in rt else 0} static points of result_XM.npz")
         if ra.exists():
             bak = ra.with_name("results_all_preEDGupdate.npz")
             if not bak.exists():

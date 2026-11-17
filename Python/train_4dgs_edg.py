@@ -45,6 +45,10 @@ DYNA_MAX_POINTS_PER_FRAME = 1000
 DYNA_SAMPLE_FRAME_STRIDE = 5
 DYNA_MAX_POINTS = 100000  # <=0 keeps all dynamic prior points
 DYNA_MASK_DILATE_PX = 0
+# --dyn-lift-per-frame: which EDG nodes carry a lifted pixel (config.json DYN_BIND): "motion" = those that best carry the track
+# seen within DYN_BIND_PX px of it at its frame (fitted over the track's frames); "nearest" = the K nearest nodes in 3D.
+DYN_BIND = dataset_config.get_str("DYN_BIND", "motion").lower()
+DYN_BIND_PX = dataset_config.get_float("DYN_BIND_PX", 3.0)
 DYNAMIC_INIT_SOURCE = "prior"  # "prior" or "depth"
 DEPTH_SOURCE = "da3"  # "da3" or "gt"
 # Intrinsics come from one source: outputs/depth_anything_3/intrinsics.npy (written by
@@ -382,9 +386,47 @@ def _save_dyn_density_2d(output_dir, knn, w, rel, er, ero, R_raw, t_raw, K_all, 
         print(f"[dyn-density] viz failed (continuing): {exc}")
 
 
+def _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_cand=12, min_frames=3):
+    """For DYN_BIND = "motion": per moving-point track (the tracks the EDG was built from), the K EDG nodes whose rigid
+    motion carries it best: among the n_cand nodes nearest to the track at its first seen frame, the K with the smallest
+    spread of the local coordinate R_m(f)^T (x(f) - X_m(f)) over the track's frames; weights 1 / spread.
+    Returns (xy (Q,T,2) image px, seen (Q,T), nodes (Q,K) node index or -1, weights (Q,K))."""
+    z = np.load(utils.definitions.dynamic_tracks_for_edg(), allow_pickle=True)
+    xy = z["tracks_xy"][0].astype(np.float64); xyz = z["tracks_xyz"][0].astype(np.float64); Q = xy.shape[0]
+    T = min(xy.shape[1], er.shape[1], R_raw.shape[0])
+    sc = np.ones(T) if frame_scales is None else np.where(np.isfinite(frame_scales[:T]), frame_scales[:T], 1.0)
+    Xw = np.einsum("tij,qtj->qti", np.asarray(R_raw[:T], np.float64) * sc[:, None, None], xyz[:, :T]) + np.asarray(t_raw[:T], np.float64)[None]
+    vis = ~z["occluded"][0][:, :T].astype(bool) & np.isfinite(xy[:, :T]).all(-1) & np.isfinite(Xw).all(-1)
+    if "dynamic_obs_mask" in z.files:
+        vis &= z["dynamic_obs_mask"][:, :T].astype(bool)
+    nodes = np.full((Q, K), -1, np.int64); wts = np.zeros((Q, K))
+    ok = np.where(vis.sum(1) >= min_frames)[0]
+    erT = er[:, :T]
+    for c0 in range(0, len(ok), 256):
+        q = ok[c0:c0 + 256]; f0 = vis[q].argmax(1)
+        d = np.linalg.norm(erT[:, f0].transpose(1, 0, 2) - Xw[q, f0][:, None], axis=-1)       # (B, M) at the first frame
+        d = np.where(np.isfinite(d), d, np.inf); cand = np.argsort(d, axis=1)[:, :n_cand]       # (B, C)
+        Xc, Rc = er[cand][:, :, :T], ero[cand][:, :, :T]                                        # (B,C,T,3), (B,C,T,3,3)
+        L = np.einsum("bctji,bctj->bcti", Rc, Xw[q][:, None] - Xc)                              # local coordinates
+        m = vis[q][:, None, :, None]; n = vis[q].sum(1)[:, None, None]
+        r = np.where(m, L, 0).sum(2) / n
+        res = np.where(m[..., 0], ((L - r[:, :, None]) ** 2).sum(-1), 0).sum(2) / n[..., 0]     # (B, C)
+        res = np.where(np.isfinite(res), res, np.inf); o = np.argsort(res, axis=1)[:, :K]
+        nodes[q] = np.take_along_axis(cand, o, 1)
+        w = 1.0 / (np.take_along_axis(res, o, 1) + 1e-12); wts[q] = w / w.sum(1, keepdims=True)
+    return xy[:, :T], vis, nodes, wts
+
+
+def _img_wh(path, _c={}):
+    if path not in _c:
+        im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED); _c[path] = None if im is None else (im.shape[1], im.shape[0])
+    return _c[path]
+
+
 def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_raw, K_all,
                                        image_paths, er, ero, node_ids, w2t, target_frame,
-                                       k_neighbors, target_points, stride=2, sigma_frac=1.5):
+                                       k_neighbors, target_points, stride=2, sigma_frac=1.5,
+                                       frame_scales=None):
     """Densely lift dynamic-region depth pixels from EVERY frame to 3D, EDG-bind each at ITS OWN frame
     (rest frame = the frame it was lifted from: rel = R_m(t)^T (X - X_m(t))), colour from the image, then
     ADAPTIVE-DENSITY voxel-downsample (uniform 3D density) to ~target_points. Returns per-point arrays in
@@ -396,6 +438,10 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
     K = int(k_neighbors)
     Tn = min(int(depth_maps.shape[0]), int(R_raw.shape[0]), int(K_all.shape[0]), len(image_paths), T)
     Xw_all, rgb_all, knn_all, w_all, rel_all, sk_all = [], [], [], [], [], []
+    # DYN_BIND "motion": a lifted pixel takes the nodes that best carry the track seen within DYN_BIND_PX px of it at its
+    # frame (the nearest nodes in 3D often belong to another part and average its motion away); "nearest": K nearest nodes.
+    mot = _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K) if DYN_BIND == "motion" else None
+    n_mot = 0
     for t in range(Tn):
         present = np.where(np.isfinite(er[:, t]).all(1))[0]      # EDG nodes solved at frame t
         if present.size < K:
@@ -411,6 +457,9 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
         if not ok.any():
             continue
         yy, xx, z = yy[ok], xx[ok], z[ok]
+        if frame_scales is not None and t < len(frame_scales) and np.isfinite(frame_scales[t]):
+            z = z * float(frame_scales[t])         # per-frame depth scale: world = R@(s*Xc)+t == (s*R)@Xc+t, as the
+                                                   # EDG / track lift (s*R); without it the points are off by s_t
         K_t = np.asarray(K_all[t], np.float64)
         fx, fy, cx, cy = K_t[0, 0], K_t[1, 1], K_t[0, 2], K_t[1, 2]
         Xc = np.stack([(xx - cx) / fx * z, (yy - cy) / fy * z, z], 1)      # camera
@@ -424,6 +473,15 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
         sigma = max(float(np.median(dist[:, 0])) * float(sigma_frac), 1e-6)
         w = np.exp(-(dist / sigma) ** 2); w /= np.clip(w.sum(1, keepdims=True), 1e-12, None)
         nl = present[nn]                                                  # node-ids-order local index (M-space)
+        if mot is not None and t < mot[0].shape[1] and nl.shape[1] == K:   # the motion-fitted nodes of the nearest track
+            tq = np.where(mot[1][:, t] & (mot[2][:, 0] >= 0))[0]
+            wh = _img_wh(image_paths[t])
+            if tq.size and wh is not None:
+                sxd, syd = wh[0] / float(Wd), wh[1] / float(Hd)                # image px per depth px
+                dd, ii = cKDTree(mot[0][tq, t] / np.array([sxd, syd])).query(np.stack([xx, yy], 1).astype(np.float64))
+                hit = np.where(dd <= DYN_BIND_PX / sxd)[0]
+                hit = hit[np.isfinite(er[mot[2][tq[ii[hit]]], t]).all(-1).all(-1)]
+                nl[hit] = mot[2][tq[ii[hit]]]; w[hit] = mot[3][tq[ii[hit]]]; n_mot += hit.size
         Xm = er[nl, t]; Rm = ero[nl, t]                                   # (N,K,3),(N,K,3,3)
         rel = np.einsum("nkji,nkj->nki", Rm, (Xw[:, None, :] - Xm))       # R_m(t)^T (X - X_m(t))
         img = cv2.imread(str(image_paths[t]), cv2.IMREAD_COLOR)
@@ -460,6 +518,9 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
     finite = np.isfinite(pos_target_solver).all(1)
     keep = _density_adaptive_downsample(pos_target_solver[finite], int(target_points))
     gi = np.where(finite)[0][keep]
+    if mot is not None:
+        print(f"[dyn-bind] motion binding: {n_mot} of {Xw_all.shape[0]} lifted pixels took the fitted nodes of a track within "
+              f"{DYN_BIND_PX:g} px ({int((mot[2][:, 0] >= 0).sum())} tracks fitted, K={K})")
     print(f"[dyn-lift] per-frame depth lift: {Xw_all.shape[0]} raw -> {gi.size} after density-adaptive "
           f"downsample (target {target_points}, keeps sparse regions); each bound at its own frame.")
     xyz_target = _apply_transform(pos_target_solver[gi], w2t)
@@ -498,7 +559,7 @@ def _flyaway_reject(skin_fn, struct, T, k=8, std_ratio=3.0, frac=0.3, n_sample=2
 
 
 def _depth_consistency_reject(sp, skin_fn, depth_maps, R_raw, t_raw, K_all,
-                              good_mask, tol=0.1, frac=0.3, min_check=5):
+                              good_mask, tol=0.1, frac=0.3, min_check=5, frame_scales=None):
     """Reject dynamic points that float off the observed surface: warp each point to every frame,
     project into that frame's solver camera, sample the depth map at the projected pixel, and compare
     the point's camera-space depth to the observed depth (relative error > `tol`). A point whose depth
@@ -528,6 +589,8 @@ def _depth_consistency_reject(sp, skin_fn, depth_maps, R_raw, t_raw, K_all,
             continue
         dv = np.full(P, np.nan)
         dv[inb] = dm[vi[inb], ui[inb]]
+        if frame_scales is not None and t < len(frame_scales) and np.isfinite(frame_scales[t]):
+            dv = dv * float(frame_scales[t])       # scale the observed depth into the (s*R) world gauge
         valid = inb & np.isfinite(dv) & (dv > 1e-6)
         if not valid.any():
             continue
@@ -694,6 +757,7 @@ def _build_edg_good_dynamic_points(
     lift_per_frame: bool = False,
     flyaway_std: float = 3.0,
     flyaway_frac: float = 0.3,
+    frame_scales=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Dynamic cloud from the EDG-skinned photometrically-GOOD tracks (edg_completed.npz).
 
@@ -744,7 +808,8 @@ def _build_edg_good_dynamic_points(
             depth_maps=depth_maps, dynamic_masks=dynamic_masks, R_raw=R_raw, t_raw=t_raw, K_all=K_all,
             image_paths=image_paths, er=er, ero=ero, node_ids=node_ids, w2t=w2t,
             target_frame=int(target_frame), k_neighbors=K,
-            target_points=int(dyn_min_points) if int(dyn_min_points) > 0 else 50000)
+            target_points=int(dyn_min_points) if int(dyn_min_points) > 0 else 50000,
+            frame_scales=frame_scales)
         if xyzL.shape[0] == 0:
             return (np.zeros((0, 3)), np.zeros((0, 3), np.uint8),
                     np.zeros((0, K), np.int64), np.zeros((0, K)), np.zeros((0, K, 3)))
@@ -763,7 +828,8 @@ def _build_edg_good_dynamic_points(
                 return np.einsum("nk,nkd->nd", ls["w"], Xm + np.einsum("nkij,nkj->nki", Rm, ls["rel"]))
             reject, _vf, _nc = _depth_consistency_reject(
                 lifted, _lifted_skin, depth_maps, R_raw, t_raw, K_all,
-                np.ones(xyzL.shape[0], bool), tol=float(depth_reject_tol), frac=float(depth_reject_frac))
+                np.ones(xyzL.shape[0], bool), tol=float(depth_reject_tol), frac=float(depth_reject_frac),
+                frame_scales=frame_scales)
             n_rej = int(reject.sum())
             print(f"[dyn-lift] depth-reject: {n_rej}/{xyzL.shape[0]} lifted points floated off surface "
                   f"(>{100*float(depth_reject_frac):.0f}% frames) -> dropped; kept {xyzL.shape[0]-n_rej}.")
@@ -823,7 +889,7 @@ def _build_edg_good_dynamic_points(
             and R_raw is not None and t_raw is not None and K_all is not None):
         reject, viol_frac, n_check = _depth_consistency_reject(
             sp, _skin_dyn_frame, depth_maps, R_raw, t_raw, K_all, good,
-            tol=float(depth_reject_tol), frac=float(depth_reject_frac))
+            tol=float(depth_reject_tol), frac=float(depth_reject_frac), frame_scales=frame_scales)
         n_rej = int((good & reject).sum())
         print(f"[edg-good] depth-reject: {n_rej}/{int(good.sum())} good points violate depth in "
               f">{100*float(depth_reject_frac):.0f}% of checkable frames (rel-tol {depth_reject_tol:g}) -> dropped.")
@@ -2007,6 +2073,7 @@ def prepare_4dgs_dataset(
             lift_per_frame=bool(dyn_lift_per_frame),
             flyaway_std=float(dyn_flyaway_std),
             flyaway_frac=float(dyn_flyaway_frac),
+            frame_scales=da3_frame_scales if depth_source_norm == "da3" else None,
         )
         if isinstance(dyn_xyz_target, np.ndarray) and dyn_xyz_target.shape[0] > 0:
             canonical_pts.append(dyn_xyz_target)
@@ -2305,12 +2372,12 @@ def main() -> None:
     parser.add_argument(
         "--dyn-source",
         type=str,
-        default="prior",
+        default="edg-good",
         choices=["prior", "edg-good"],
-        help="Dynamic cloud source. 'prior' (default) = existing --dynamic-init-source path (unchanged); "
-             "'edg-good' = ONLY the EDG-skinned photometrically-GOOD tracks from edg_completed.npz "
-             "(visualize_best_color_2d --use-color set), coloured with their fused BGR and re-bound to the "
-             "results_all EDG for the trainer warp.",
+        help="Dynamic cloud source. 'edg-good' (default) = from the completed EDG (edg_completed.npz): with "
+             "--dyn-lift-per-frame (default) the moving-object depth pixels of every frame, each bound to the EDG at its "
+             "own frame (config DYN_BIND); without it the EDG-skinned photometrically good tracks. 'prior' = the "
+             "--dynamic-init-source path.",
     )
     parser.add_argument(
         "--dyn-best",
@@ -2407,8 +2474,8 @@ def main() -> None:
 
     print(f"Prepared 4DGS dataset at: {gs_dir}")
 
-    gsplat_result_dir = Path(args.gsplat_result_dir) if args.gsplat_result_dir else gs_dir.parent / f"gsplat_edg_target_{args.target_frame:04d}"
-    simple_trainer = Path(__file__).resolve().parents[1] / "deps" / "gsplat" / "examples" / "simple_trainer.py"
+    gsplat_result_dir = Path(args.gsplat_result_dir) if args.gsplat_result_dir else gs_dir.parent / "gsplat"
+    simple_trainer = Path(__file__).resolve().parents[1] / "build" / "gsplat_examples" / "simple_trainer.py"   # install/gs.sh
     results_npz = Path(utils.definitions.output_dir) / "results_all.npz"
     train_cmd = [
         "CUDA_VISIBLE_DEVICES=" + str(args.cuda_visible_devices),

@@ -4,6 +4,8 @@ datasets/*
 !datasets/hoi_ip1073/
 # gsplat example data (360_v2 datasets, images, COLMAP .bin) — ~13 GB, not code
 deps/
+# the 4D Gaussian trainer, assembled by install/gs.sh from deps/gsplat + gsplat_patch/
+build/
 
 # --- Run logs & Python caches ---
 *.log

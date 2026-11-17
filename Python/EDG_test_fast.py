@@ -220,7 +220,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seg-len", type=int, default=11, help="frames per segment (EDG_test: 11, 1-frame overlap)")
     ap.add_argument("--n-seg", type=int, default=5, help="chained segments per run (5 x 10 = ~50 frames)")
-    ap.add_argument("--n-runs", type=int, default=30, help="number of random-strided runs to average")
+    ap.add_argument("--n-runs", type=int, default=10, help="number of random-strided runs to average")
     ap.add_argument("--gaps", type=int, nargs="+", default=[1, 2], help="candidate strides per run")
     ap.add_argument("--seed-obs", action="store_true",
                     help="also seed each node's direct observations into the table at weight 1 (fills ALL "

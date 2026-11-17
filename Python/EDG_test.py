@@ -45,7 +45,7 @@ def load_all(tracks_path=None):
     scale 's' (EDG_old convention), and load the fixed EDG topology + dynamic->EDG skinning assignment
     produced by build_edg.py. tracks_path MUST match what build_edg used (same track id space)."""
     root = Path(utils.definitions.rootpath)
-    data = np.load(tracks_path or utils.definitions.tracks_dynamics_path, allow_pickle=True)
+    data = np.load(tracks_path or utils.definitions.dynamic_tracks_for_edg(), allow_pickle=True)
     tracks_xyz = data["tracks_xyz"]                  # (1,Q,T,3)
     occluded = data["occluded"]                      # (1,Q,T)
     dyn_mask = data["dynamic_obs_mask"]              # (Q,T)

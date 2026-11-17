@@ -29,7 +29,8 @@ cd XM4D-release
 
 Each stage of the pipeline runs in its own conda environment, with its own install script. A script clones its
 third-party code into `deps/` at a specific commit. Each takes the environment name as an optional argument, e.g.
-`bash install/tapnet.sh mytap`; without it, the name is the one in the heading (`sam3`, `gmos`, `da3`, `tapnet`, `XM`).
+`bash install/tapnet.sh mytap`; without it, the name is the one in the heading (`sam3`, `gmos`, `da3`, `tapnet`, `XM`,
+`gs`).
 When all environments are installed, check them with one command (see [Check the installation](#check-the-installation)).
 
 ### 1. `sam3`: masks (step 0)
@@ -66,7 +67,7 @@ bash install/da3.sh
 Installs [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) (`deps/Depth-Anything-3`) with
 PyTorch 2.9. The model (DA3NESTED-GIANT-LARGE-1.1, 6.8 GB) is downloaded from Hugging Face on the first run.
 
-### 3. `tapnet`: tracking (step 2)
+### 3. `tapnet`: tracking (step 2) and the deformation-graph completion (step 4)
 
 ```bash
 bash install/tapnet.sh
@@ -87,6 +88,17 @@ Installs the environment for the XM solver, which ships compiled in `XM/build` (
 libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and COLMAP bindings, and
 [TEASER++](https://github.com/MIT-SPARK/TEASER-plusplus) (`deps/TEASER-plusplus`, built from source).
 
+### 5. `gs`: 4D Gaussian training (step 6)
+
+```bash
+bash install/gs.sh
+```
+
+Installs [gsplat](https://github.com/nerfstudio-project/gsplat) (`deps/gsplat`) with PyTorch 2.10 and compiles its CUDA
+kernels, which needs the CUDA toolkit (nvcc 12.x; set `CUDA_HOME` if it is not in `/usr/local/cuda`). The trainer is
+gsplat's `examples/` with our two changed files from `gsplat_patch/examples/` copied over them, in
+`build/gsplat_examples/`; `deps/gsplat` itself stays unmodified.
+
 ### One environment instead (optional)
 
 The four environments above are the reference setup. Alternatively, everything installs into one environment `xm4d`
@@ -96,7 +108,7 @@ The four environments above are the reference setup. Alternatively, everything i
 bash install/xm4d.sh
 ```
 
-Then use `conda activate xm4d` wherever the steps below activate `sam3`, `da3`, `tapnet` or `XM`. On our tests it gives
+Then use `conda activate xm4d` wherever the steps below activate `sam3`, `da3`, `tapnet` or `XM` (step 6 keeps `gs`). On our tests it gives
 the same results as the four environments within their run-to-run variation. The one consistent difference is that the
 SAM 3 masks differ in fewer than 0.1% of the mask pixels (PyTorch 2.9 instead of 2.10).
 
@@ -187,7 +199,7 @@ frame rate of your frames (default 24). On our test videos of up to 150 frames i
 Step 1 merges the object folders itself when they are not merged yet, and stops with a warning while masks are missing.
 For a scene without any moving object, set `"no_masks": true` in `config.json`.
 
-### Steps 1–5
+### Steps 1–6
 
 ```bash
 cd Python
@@ -201,14 +213,22 @@ python dynamic_tracking.py           #    and of the moving objects (AllTracker)
 
 conda activate XM
 python static_solver.py              # 3. cameras + static points (XM solver) -> outputs/result_XM.npz
-python EDG_old.py                    # 4. embedded deformation graph + dynamic 3D tracks -> outputs/results_all.npz
-python train_4dgs_edg.py --dynamic-init-source depth   # 5. 4D Gaussian training data -> outputs/gs_edg_target_0000/
+python smooth_dynamic_tracks.py      # 4. the moving points' 3D tracks, smoothed -> outputs/tracks_dynamic_only_smoothed.npz
+python edg_topology.py               #    embedded deformation graph: nodes, edges, point links -> outputs/edg_topology.npz
+python EDG_test_fast.py              #    its motion, by XM segment solves -> outputs/edg_test/edg_table.npz
+conda activate tapnet
+python complete_edg_table.py         #    completed over every frame -> outputs/edg_test/edg_completed.npz, results_all.npz
+conda activate XM
+python train_4dgs_edg.py             # 5. 4D Gaussian training data -> outputs/gs_edg_target_0000/
+
+conda activate gs                    # 6. 4D Gaussians: the command step 5 prints, e.g.
+python ../build/gsplat_examples/simple_trainer.py default --data-dir ../datasets/<scene>/outputs/gs_edg_target_0000 \
+    --result-dir ../datasets/<scene>/outputs/gsplat --data-factor 1 \
+    --edg-results ../datasets/<scene>/outputs/results_all.npz --edg-target-frame 0
 ```
 
-Set `EDG_NO_VIZ=1` to skip the Open3D window at the end of step 4. Step 5 lifts the moving points from the depth and
-the masks (`--dynamic-init-source depth`; without it, step 5 expects a shape prior). It writes the training set and
-prints the matching training command for a modified gsplat `simple_trainer.py` (`--edg-results`). That trainer is not
-included in this repository yet.
+Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 6 reads its training settings (learning rates, loss weights,
+`max_steps`, `steps_scaler`) from `config.json` too; a command-line flag overrides them.
 
 Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's per-frame focals, with the principal
 point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are squeezed to 2:1 for Depth Anything 3
@@ -232,6 +252,24 @@ Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving 
 Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauchy loss of `CERES_LOSS_PX` px (2;
 `CERES_LOSS`: `cauchy`, `huber`, `softl1` or `trivial`), and the shared focal is refined too
 (`CERES_OPTIMIZE_INTRINSICS`).
+
+Step 4 builds and solves the embedded deformation graph (EDG) of the moving objects:
+
+- `smooth_dynamic_tracks.py`: with the cameras fixed, each moving point's 3D track keeps its 2D track (Cauchy, 2 px)
+  and its depth (10%, weaker) and is smooth in time (acceleration, `SMOOTH_SIGMA_ACC` = 3 px per frame²). Without it
+  the per-frame depth noise makes the graph zig-zag.
+- `edg_topology.py`: graph nodes are tracks that already describe their neighbourhood: a fast-moving node removes the
+  tracks within 0.4 of its motion radius, a slow one the tracks that keep a nearly constant distance to it; up to
+  `EDG_MAX_NODES` (200). Two nodes are joined when they move together (score of their typical distance and their
+  relative motion) at a nearly constant distance. Each moving point joins its two nearest nodes that stay close in
+  every frame they share.
+- `EDG_test_fast.py`: the graph's motion over many short windows, each solved by XM; `complete_edg_table.py` turns
+  them into one motion over every frame (as-rigid-as-possible over gaps of 1 to 256 frames, smooth in time).
+
+Step 5 lifts the moving-object depth pixels of every frame and binds each one to the graph at its own frame. With
+`DYN_BIND` `"motion"` (default) a pixel takes the nodes that best carry the track seen within `DYN_BIND_PX` px (3)
+of it, fitted over that track's frames; `"nearest"` takes the 6 nearest nodes, which often belong to another part
+and average its motion away.
 
 ### Optional: swap the trackers
 

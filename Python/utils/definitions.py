@@ -22,6 +22,12 @@ print(f"[config] {CONFIG_PATH} -> scene {rootpath}")
 
 output_dir = (rootpath / "outputs").absolute()
 tracks_dynamics_path = rootpath / "outputs" / "tracks_dynamic_only.npz"
+tracks_dynamics_smoothed_path = rootpath / "outputs" / "tracks_dynamic_only_smoothed.npz"   # smooth_dynamic_tracks.py
+
+
+def dynamic_tracks_for_edg():
+    """The moving points' tracks the deformation-graph steps read: the smoothed ones when smooth_dynamic_tracks.py ran."""
+    return tracks_dynamics_smoothed_path if tracks_dynamics_smoothed_path.exists() else tracks_dynamics_path
 video_dir = rootpath / "images"
 mask_dir = rootpath / os.environ.get("XM_MASK_SUBDIR", "masks")
 
