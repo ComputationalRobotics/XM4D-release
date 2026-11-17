@@ -401,16 +401,15 @@ def _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_cand=12, min_f
         vis &= z["dynamic_obs_mask"][:, :T].astype(bool)
     nodes = np.full((Q, K), -1, np.int64); wts = np.zeros((Q, K))
     ok = np.where(vis.sum(1) >= min_frames)[0]
-    erT = er[:, :T]
-    for c0 in range(0, len(ok), 256):
-        q = ok[c0:c0 + 256]; f0 = vis[q].argmax(1)
-        d = np.linalg.norm(erT[:, f0].transpose(1, 0, 2) - Xw[q, f0][:, None], axis=-1)       # (B, M) at the first frame
+    for c0 in range(0, len(ok), 512):
+        q = ok[c0:c0 + 512]; vq = vis[q]; f0 = vq.argmax(1)
+        d = np.linalg.norm(er[:, f0].transpose(1, 0, 2) - Xw[q, f0][:, None], axis=-1)        # (B, M) at the first frame
         d = np.where(np.isfinite(d), d, np.inf); cand = np.argsort(d, axis=1)[:, :n_cand]       # (B, C)
-        Xc, Rc = er[cand][:, :, :T], ero[cand][:, :, :T]                                        # (B,C,T,3), (B,C,T,3,3)
-        L = np.einsum("bctji,bctj->bcti", Rc, Xw[q][:, None] - Xc)                              # local coordinates
-        m = vis[q][:, None, :, None]; n = vis[q].sum(1)[:, None, None]
-        r = np.where(m, L, 0).sum(2) / n
-        res = np.where(m[..., 0], ((L - r[:, :, None]) ** 2).sum(-1), 0).sum(2) / n[..., 0]     # (B, C)
+        bi, fi = np.nonzero(vq)                                    # the seen frames only, grouped by track (row-major)
+        n = vq.sum(1); s0 = np.r_[0, np.cumsum(n)[:-1]]
+        L = np.einsum("ncji,ncj->nci", ero[cand[bi], fi[:, None]], Xw[q[bi], fi][:, None] - er[cand[bi], fi[:, None]])
+        r = np.add.reduceat(L, s0, axis=0) / n[:, None, None]                                   # local coordinates' mean
+        res = np.add.reduceat(((L - r[bi]) ** 2).sum(-1), s0, axis=0) / n[:, None]              # (B, C) their spread
         res = np.where(np.isfinite(res), res, np.inf); o = np.argsort(res, axis=1)[:, :K]
         nodes[q] = np.take_along_axis(cand, o, 1)
         w = 1.0 / (np.take_along_axis(res, o, 1) + 1e-12); wts[q] = w / w.sum(1, keepdims=True)
