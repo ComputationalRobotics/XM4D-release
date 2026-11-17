@@ -101,14 +101,14 @@ gsplat's `examples/` with our two changed files from `gsplat_patch/examples/` co
 
 ### One environment instead (optional)
 
-The four environments above are the reference setup. Alternatively, everything installs into one environment `xm4d`
-(Python 3.10, PyTorch 2.9 for every stage):
+The environments above are the reference setup. Alternatively, `sam3`, `da3`, `tapnet` and `XM` install into one
+environment `xm4d` (Python 3.10, PyTorch 2.9 for every stage); step 6 keeps its own `gs`:
 
 ```bash
 bash install/xm4d.sh
 ```
 
-Then use `conda activate xm4d` wherever the steps below activate `sam3`, `da3`, `tapnet` or `XM` (step 6 keeps `gs`). On our tests it gives
+Then use `conda activate xm4d` wherever the steps below activate `sam3`, `da3`, `tapnet` or `XM`. On our tests it gives
 the same results as the four environments within their run-to-run variation. The one consistent difference is that the
 SAM 3 masks differ in fewer than 0.1% of the mask pixels (PyTorch 2.9 instead of 2.10).
 

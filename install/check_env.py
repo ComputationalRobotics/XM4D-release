@@ -1,6 +1,6 @@
 """Check the conda environments of XM4D after installing them: for every stage, in its own env, the imports of the
 stage's scripts, the GPU and the model weights. Run it with any Python 3 that has conda on the PATH (e.g. conda's base):
-    python install/check_env.py                 # every stage in its env: sam3 (or gmos), da3, tapnet, XM
+    python install/check_env.py                 # every stage in its env: sam3 (or gmos), da3, tapnet, XM, gs
     python install/check_env.py --env xm4d      # the one-environment install (install/xm4d.sh)
     python install/check_env.py tapnet=mytap    # a stage installed under another env name (bash install/tapnet.sh mytap)
 Step 0 is checked with sam3, with gmos when sam3 is not installed (both when both are), and gives a warning when neither
@@ -22,6 +22,8 @@ MODULES = {
     "tapnet": ["numpy", "PIL", "cv2", "pandas", "tqdm", "torch", "einops", "tapnet.tapnext.tapnext_torch"],
     "XM": ["numpy", "scipy", "cv2", "pandas", "matplotlib", "networkx", "open3d", "pyceres", "pycolmap",
            "teaserpp_python", "XM"],
+    "gs": ["numpy", "scipy", "cv2", "PIL", "imageio", "yaml", "tqdm", "matplotlib", "sklearn", "piexif", "tyro", "viser",
+           "nerfview", "torchmetrics", "torch", "fused_ssim", "gsplat"],
 }
 PATHS = {
     "gmos": [ROOT / "deps" / "gmos"],
@@ -31,6 +33,7 @@ PATHS = {
 }
 TAPNEXT_CKPT = ROOT / "deps" / "tapnet" / "checkpoints" / "tapnextpp_ckpt.pt"
 ALLTRACKER_CKPT = ROOT / "deps" / "alltracker" / "checkpoints" / "alltracker.pth"
+GS_TRAINER = ROOT / "build" / "gsplat_examples" / "simple_trainer.py"
 failed = []
 
 
@@ -100,6 +103,20 @@ def alltracker_forward():
     return "AllTracker checkpoint loads and runs"
 
 
+def gsplat_render():
+    import torch
+    from gsplat import rasterization
+    assert GS_TRAINER.exists(), f"missing {GS_TRAINER} (made by install/gs.sh)"
+    n, dev = 64, "cuda"
+    means = torch.rand(n, 3, device=dev) - 0.5 + torch.tensor([0.0, 0.0, 3.0], device=dev)
+    quats = torch.nn.functional.normalize(torch.rand(n, 4, device=dev), dim=-1)
+    img, alpha, _ = rasterization(means, quats, torch.full((n, 3), 0.05, device=dev), torch.full((n,), 0.8, device=dev),
+                                  torch.rand(n, 3, device=dev), torch.eye(4, device=dev)[None],
+                                  torch.tensor([[[64.0, 0, 32], [0, 64.0, 32], [0, 0, 1]]], device=dev), 64, 64)
+    assert torch.isfinite(img).all() and alpha.max() > 0
+    return "trainer in build/gsplat_examples, gsplat CUDA rasterizer runs"
+
+
 def check_stage(stage):   # runs inside the stage's env
     sys.path[:0] = [str(p) for p in PATHS.get(stage, [])]
     print(f"[check_env] {stage}  (python {sys.version.split()[0]}, {sys.executable})")
@@ -114,6 +131,8 @@ def check_stage(stage):   # runs inside the stage's env
     if stage == "tapnet":
         check("AllTracker", alltracker_forward)
         check("TAPNext++", tapnext_forward)
+    if stage == "gs":
+        check("gsplat", gsplat_render)
     if failed:
         print(f"[check_env] {stage}: NOT ready, {len(failed)} problem(s): {', '.join(failed)}")
         sys.exit(1)
@@ -128,7 +147,7 @@ def main():
         a = args.pop(0)
         if a == "--env" and args:
             one_env = args.pop(0)
-            envs.update({stage: one_env for stage in ("sam3", "da3", "tapnet", "XM")})   # GMOS is not in the one env
+            envs.update({stage: one_env for stage in ("sam3", "da3", "tapnet", "XM")})   # GMOS and gs are not in the one env
         elif a.split("=")[0] in MODULES and "=" in a:
             envs[a.split("=")[0]] = a.split("=", 1)[1]
         else:
@@ -139,7 +158,7 @@ def main():
     installed = {Path(p).name for p in listed}
     masks = [stage for stage in ("sam3", "gmos") if envs[stage] in installed]
     summary = []
-    for stage in masks + ["da3", "tapnet", "XM"]:
+    for stage in masks + ["da3", "tapnet", "XM", "gs"]:
         if envs[stage] not in installed:
             script = "xm4d" if envs[stage] == one_env else stage
             summary.append(("FAIL", stage, f"env {envs[stage]} is not installed: bash install/{script}.sh"))

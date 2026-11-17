@@ -74,7 +74,7 @@ def _dilate_dyn_mask(D, dilate_px):
         return D["dyn_mask"]
     try:
         import cv2
-        from utils.track_tapnet import load_dynamic_masks, dilate_dynamic_masks
+        from utils.masks import load_dynamic_masks, dilate_dynamic_masks
     except Exception as e:
         print(f"[dyn-mask] cannot dilate ({e}); using original dynamic_obs_mask.")
         return D["dyn_mask"]
@@ -108,7 +108,7 @@ def _dyn_region_near_px(D, frac, fallback=15.0):
         return float(fallback)
     try:
         import cv2
-        from utils.track_tapnet import load_dynamic_masks
+        from utils.masks import load_dynamic_masks
     except Exception as e:
         print(f"[edg-near] cannot load masks ({e}); using fixed {fallback}px")
         return float(fallback)
