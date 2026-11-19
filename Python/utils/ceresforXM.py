@@ -123,13 +123,15 @@ def XM_Ceres_interface(
         points0.append(p_XM[:, i])
 
     options = pyceres.SolverOptions()
-    # Direct SPARSE_SCHUR + monotonic steps: deterministic and (for these
-    # problem sizes) faster than the iterative/non-monotonic combo, which was
-    # non-reproducible and occasionally wandered into bad local minima.
-    options.linear_solver_type = getattr(
-        pyceres.LinearSolverType,
-        os.environ.get("XM_CERES_LINEAR_SOLVER", "ITERATIVE_SCHUR"),
+    # Linear solver: DENSE_SCHUR for short videos with many landmarks per frame (<= 100 frames, >= 60 landmarks per
+    # frame: 1.2-15x faster on the 16-scene test set, same cameras), ITERATIVE_SCHUR otherwise (long videos, where the
+    # dense reduced camera system grows with frames^2, and few landmarks per frame, as TUM: dense was 1.1-2.8x slower).
+    # XM_CERES_LINEAR_SOLVER forces one.
+    linear_solver = os.environ.get("XM_CERES_LINEAR_SOLVER") or (
+        "DENSE_SCHUR" if N <= 100 and M >= 60 * N else "ITERATIVE_SCHUR"
     )
+    print(f"[Ceres] linear solver {linear_solver} ({N} frames, {M} landmarks)")
+    options.linear_solver_type = getattr(pyceres.LinearSolverType, linear_solver)
     options.preconditioner_type = pyceres.PreconditionerType.SCHUR_JACOBI
     options.use_nonmonotonic_steps = True
     options.minimizer_progress_to_stdout = True
@@ -204,17 +206,20 @@ def XM_Ceres_interface(
         t = [ti.copy() for ti in t_init]
         points = [pi.copy() for pi in points_init]
 
+        # Observations grouped by camera, in their original order (stable sort = the per-camera np.where order).
+        kept = np.flatnonzero(obs_keep_mask)
+        kept = kept[np.argsort(edges[kept, 0], kind="stable")]
+        bounds = np.searchsorted(edges[kept, 0], np.arange(1, N + 2))
+        make_cost = pycolmap.cost_functions.ReprojErrorCost
+        add_block = prob.add_residual_block
+        cam_model, cam_params = cam.model, cam.params
         for i in range(N):
-            index = np.where((edges[:, 0] == i + 1) & obs_keep_mask)[0]
+            index = kept[bounds[i]:bounds[i + 1]]
             if len(index) == 0:
                 continue
-            p2d = landmarks2D[index, :]
-            p2d_index = edges[index, 1]
-            for j in range(len(index)):
-                p = pycolmap.Point2D(p2d[j], p2d_index[j] - 1)
-                cost = pycolmap.cost_functions.ReprojErrorCost(cam.model, p.xy)
-                params = [quat[i], t[i], points[p.point3D_id], cam.params]
-                prob.add_residual_block(cost, loss, params)
+            qi, ti = quat[i], t[i]
+            for xy, pid in zip(landmarks2D[index, :], (edges[index, 1] - 1).tolist()):
+                add_block(make_cost(cam_model, xy), loss, [qi, ti, points[pid], cam_params])
             prob.set_manifold(quat[i], pyceres.EigenQuaternionManifold())
 
         if optimize_intrinsics:
@@ -282,28 +287,6 @@ def XM_Ceres_interface(
         obs_keep, quat0, t0, points0, use_regularization=False
     )
 
-    # Second pass:
-    # 1. Measure per-point reprojection error from the first-pass solution.
-    # 2. Remove the top 10% worst 3D points.
-    # 3. Solve again without any regularization.
-    point_err_sum, point_err_cnt = compute_point_reprojection_stats(
-        quat, t, points, obs_keep
-    )
-    valid_pid = point_err_cnt > 0
-    num_valid = int(np.sum(valid_pid))
-    num_drop = max(1, int(np.ceil(0.10 * num_valid))) if num_valid > 0 else 0
-
-    if num_drop > 0:
-        point_err_mean = np.full(M, -np.inf, dtype=np.float64)
-        point_err_mean[valid_pid] = point_err_sum[valid_pid] / point_err_cnt[valid_pid]
-        worst_pid = np.argsort(point_err_mean)[-num_drop:]
-        obs_keep = ~np.isin(edges[:, 1] - 1, worst_pid)
-        print(
-            f"[Ceres] Removing top {num_drop}/{num_valid} points by reprojection error (~10%) before pass 2."
-        )
-    else:
-        print("[Ceres] No valid points available for reprojection-based filtering before pass 2.")
-
     regularization_loss = 0.0
     for i in range(N):
         smooth_cost = SecondDifferenceTranslationCost(float(penalty_t_acc))
@@ -320,7 +303,30 @@ def XM_Ceres_interface(
     regularization_loss /= max(1e-12, t_scale * t_scale)
     print(f"[Ceres] Regularization loss after pass 1: {regularization_loss:.6f}")
     
+    # The second pass only runs with regularization, so its per-point error statistics are computed only then.
     if regularization_loss > regularization_threshold and use_regularization:
+        # Second pass:
+        # 1. Measure per-point reprojection error from the first-pass solution.
+        # 2. Remove the top 10% worst 3D points.
+        # 3. Solve again without any regularization.
+        point_err_sum, point_err_cnt = compute_point_reprojection_stats(
+            quat, t, points, obs_keep
+        )
+        valid_pid = point_err_cnt > 0
+        num_valid = int(np.sum(valid_pid))
+        num_drop = max(1, int(np.ceil(0.10 * num_valid))) if num_valid > 0 else 0
+
+        if num_drop > 0:
+            point_err_mean = np.full(M, -np.inf, dtype=np.float64)
+            point_err_mean[valid_pid] = point_err_sum[valid_pid] / point_err_cnt[valid_pid]
+            worst_pid = np.argsort(point_err_mean)[-num_drop:]
+            obs_keep = ~np.isin(edges[:, 1] - 1, worst_pid)
+            print(
+                f"[Ceres] Removing top {num_drop}/{num_valid} points by reprojection error (~10%) before pass 2."
+            )
+        else:
+            print("[Ceres] No valid points available for reprojection-based filtering before pass 2.")
+
         quat, t, points, summary = _solve(
             obs_keep, quat0, t0, points0, use_regularization=True
         )

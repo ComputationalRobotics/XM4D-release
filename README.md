@@ -228,9 +228,9 @@ python ../build/gsplat_examples/simple_trainer.py default --data-dir ../datasets
 ```
 
 Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 2 writes its visualisation videos (`outputs/viz_*.mp4`) and the
-unfiltered static tracks (`outputs/tracks_debug.npz`) only with `"DEBUG": true` in `config.json`. Step 6 reads its
-training settings (learning rates, loss weights, `max_steps`, `steps_scaler`) from `config.json` too; a command-line
-flag overrides them.
+unfiltered static tracks (`outputs/tracks_debug.npz`), and step 3 its lifted tracks (`tracks_debug_3d_solver.npz`) and
+XM matrices (`Abar.bin`, `Q.mat`), only with `"DEBUG": true` in `config.json`. Step 6 reads its training settings
+(learning rates, loss weights, `max_steps`, `steps_scaler`) from `config.json` too; a command-line flag overrides them.
 
 Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's per-frame focals, with the principal
 point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are squeezed to 2:1 for Depth Anything 3
@@ -262,7 +262,10 @@ and 5.3 → 2.7 min).
 
 Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauchy loss of `CERES_LOSS_PX` px (2;
 `CERES_LOSS`: `cauchy`, `huber`, `softl1` or `trivial`), and the shared focal is refined too
-(`CERES_OPTIMIZE_INTRINSICS`).
+(`CERES_OPTIMIZE_INTRINSICS`). Videos of at most 100 frames with at least 60 landmarks per frame use Ceres' dense
+Schur solver, all others the iterative one (`XM_CERES_LINEAR_SOLVER` forces either). On our 13 test videos of at most
+100 frames this made step 3 2.4 times faster (239 → 99 s) with the same cameras, except Sintel market_6 (position
+error 0.0095 → 0.0087, rotation error 0.025 → 0.035).
 
 Step 4 builds and solves the embedded deformation graph (EDG) of the moving objects:
 

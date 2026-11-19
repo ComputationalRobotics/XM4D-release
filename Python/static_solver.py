@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
 
@@ -132,6 +133,7 @@ CERES_INTRINSIC_SCALE_MAX = dataset_config.get_float(
 # with its scale in pixels (converted to the normalized landmark units with the median focal of intrinsics.npy).
 CERES_LOSS = dataset_config.get_str("CERES_LOSS", "cauchy", env="CERES_LOSS").lower()
 CERES_LOSS_PX = dataset_config.get_float("CERES_LOSS_PX", 2.0, env="CERES_LOSS_PX")
+DEBUG = dataset_config.get_bool("DEBUG", False, env="DEBUG")  # also write tracks_debug_3d_solver.npz, Abar.bin and Q.mat
 
 STATIC_TRACK_DEPTH_MAX = dataset_config.get_float(
     "STATIC_TRACK_DEPTH_MAX", 50.0, env="STATIC_TRACK_DEPTH_MAX"
@@ -174,9 +176,9 @@ DA3_SCALE_LOCAL_CANDIDATES = env_int("DA3_SCALE_LOCAL_CANDIDATES", 9)
 # a closed-form ICP-style refinement then gives a continuous, sub-grid per-frame
 # scale: s = sum(dir . (nn - center)) / sum(dir . dir) over trimmed correspondences.
 DA3_SCALE_REFINE_ITERS = env_int("DA3_SCALE_REFINE_ITERS", 4)
-# KD-tree query threads. workers=-1 spawns a thread per core (huge overhead for the
-# many tiny per-frame queries on a big machine); 1 is fastest for these sizes.
-DA3_SCALE_QUERY_WORKERS = env_int("DA3_SCALE_QUERY_WORKERS", 1)
+# KD-tree query threads (the result does not depend on them). workers=-1 spawns a thread per core (huge overhead
+# for the many tiny per-frame queries on a big machine); 4 is fastest for these sizes (1.4x vs 1, 16 is slower).
+DA3_SCALE_QUERY_WORKERS = env_int("DA3_SCALE_QUERY_WORKERS", 4)
 RESULT_POINT_MAX_NORM = env_float("XM_RESULT_POINT_MAX_NORM", 2.0)
 
 
@@ -631,14 +633,16 @@ def _load_dynamic_masks(mask_dir, pattern, t_expected, target_hw):
     if not paths:
         print(f"[track-lift] no masks found at {mask_dir / pattern}; treating all pixels as static.")
         return np.zeros((t_expected, target_hw[0], target_hw[1]), dtype=bool)
-    masks = []
-    for path in paths[:t_expected]:
+    def read(path):
         mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise RuntimeError(f"Failed to read mask: {path}")
         if mask.shape[:2] != target_hw:
             mask = cv2.resize(mask, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_NEAREST)
-        masks.append(mask > 0)
+        return mask > 0
+
+    with ThreadPoolExecutor(8) as executor:     # cv2 releases the GIL
+        masks = list(executor.map(read, paths[:t_expected]))
     if len(masks) < t_expected:
         pad = [np.zeros(target_hw, dtype=bool) for _ in range(t_expected - len(masks))]
         masks.extend(pad)
@@ -1662,6 +1666,13 @@ def lift_2d_tracks_to_solver_input(
     depth_max_deleted_obs_mask = np.zeros((1, Q, T), dtype=bool)
     prev_depths = np.full(Q, np.nan, dtype=np.float64)
 
+    def image_hw(path):         # only the frame size is needed; read in threads (cv2 releases the GIL)
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        return None if img is None else img.shape[:2]
+
+    with ThreadPoolExecutor(8) as executor:
+        image_hws = list(executor.map(image_hw, image_paths[:T]))
+
     edges_list = []
     weights_list = []
     landmarks_list = []
@@ -1672,11 +1683,10 @@ def lift_2d_tracks_to_solver_input(
             print(f"[track-lift] frame {t}: missing GT intrinsics for {image_name}; skipped.")
             continue
 
-        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if img is None:
+        if image_hws[t] is None:
             print(f"[track-lift] frame {t}: could not read {image_path}; skipped.")
             continue
-        H_img, W_img = img.shape[:2]
+        H_img, W_img = image_hws[t]
 
         if depth_source == "gt":
             if dataset_cat == "Replica":
@@ -1760,30 +1770,32 @@ def lift_2d_tracks_to_solver_input(
             conf_vals = np.asarray(conf_vals_map[yi[idx], xi[idx]], dtype=np.float64)
             conf_xyz[idx, t] = conf_vals
 
-        for local, q_idx in enumerate(idx):
-            edges_list.append([int(q_idx), int(t)])  # [landmark_index, frame_index], converted below
-            landmarks_list.append(Pc[local].tolist())
-            if conf_vals is not None and np.isfinite(conf_vals[local]):
-                weights_list.append([float(conf_vals[local])])
-            else:
-                weights_list.append([1.0])
+        # [landmark_index, frame_index] (converted below); weight = the finite confidences, else 1
+        edges_list.append(np.stack([idx, np.full(idx.shape[0], t)], axis=1).astype(np.int64))
+        landmarks_list.append(Pc)
+        w = np.ones(idx.shape[0], dtype=np.float64)
+        if conf_vals is not None:
+            finite = np.isfinite(conf_vals)
+            w[finite] = conf_vals[finite]
+        weights_list.append(w[:, None])
 
-    edges = np.asarray(edges_list, dtype=np.int64)
-    weights = np.asarray(weights_list, dtype=np.float64)
-    landmarks = np.asarray(landmarks_list, dtype=np.float64)
-    if edges.size == 0:
+    if not edges_list:
         raise RuntimeError("[track-lift] no valid 3D observations were created from 2D tracks.")
+    edges = np.concatenate(edges_list, axis=0)
+    weights = np.concatenate(weights_list, axis=0)
+    landmarks = np.concatenate(landmarks_list, axis=0).astype(np.float64)
 
-    np.savez_compressed(
-        Path(output_path) / "tracks_debug_3d_solver.npz",
-        tracks_xyz=tracks_xyz,
-        conf_xyz=conf_xyz,
-        depth_grad_deleted_obs_mask=depth_grad_deleted_obs_mask,
-        depth_max_deleted_obs_mask=depth_max_deleted_obs_mask,
-        video_dir=str(image_dir),
-        depth_dir=str(depth_path),
-        depth_source=np.array(depth_source),
-    )
+    if DEBUG:
+        np.savez_compressed(
+            Path(output_path) / "tracks_debug_3d_solver.npz",
+            tracks_xyz=tracks_xyz,
+            conf_xyz=conf_xyz,
+            depth_grad_deleted_obs_mask=depth_grad_deleted_obs_mask,
+            depth_max_deleted_obs_mask=depth_max_deleted_obs_mask,
+            video_dir=str(image_dir),
+            depth_dir=str(depth_path),
+            depth_source=np.array(depth_source),
+        )
     print(
         "[track-lift] lifted 2D tracks in static_solver: "
         f"obs={edges.shape[0]}, depth_grad_deleted={int(np.sum(depth_grad_deleted_obs_mask))}, "
@@ -2247,7 +2259,7 @@ N = int(np.max(edges[:, 0]))
 M = int(np.max(edges[:, 1]))
 
 # interface to create the matrix given the edges, weights and landmarks
-create_matrix(weights, edges, landmarks, output_path, penalty_t=PENALTY_T)
+Abar = create_matrix(weights, edges, landmarks, output_path, penalty_t=PENALTY_T, debug=DEBUG)
 LAMBDA = dataset_config.get_float("LAMBDA", 10.0, env="LAMBDA")
 # Solver-acceleration knobs (config-driven; defaults reproduce the original behaviour):
 #   RANK     : max rank searched by the mixed solver (lower = faster; IMC static rank is 3).
@@ -2264,7 +2276,6 @@ elif MODE == 2:
 solver_time += time.perf_counter() - solver_start
 
 # visualize the camera poses
-Abar,_ = load_matrix_from_bin(output_path + '/Abar.bin')
 R,_ = load_matrix_from_bin(output_path + '/R.bin')
 s,_ = load_matrix_from_bin(output_path + '/s.bin')
 Q,_ = load_matrix_from_bin(output_path + '/Q.bin')    
@@ -2352,7 +2363,7 @@ if USE_XM2:
   N = int(np.max(edges[:, 0]))  
   M = int(np.max(edges[:, 1]))  
 
-  create_matrix(weights, edges, landmarks, output_path, penalty_t=PENALTY_T)
+  Abar = create_matrix(weights, edges, landmarks, output_path, penalty_t=PENALTY_T, debug=DEBUG)
 
   solver_start = time.perf_counter()
   if MODE == 1:
@@ -2361,7 +2372,6 @@ if USE_XM2:
       XM.solve(output_path, RANK, 1e-4, 0.0, 30)
   solver_time += time.perf_counter() - solver_start
 
-  Abar,_ = load_matrix_from_bin(output_path + '/Abar.bin')
   R,_ = load_matrix_from_bin(output_path + '/R.bin')
   s,_ = load_matrix_from_bin(output_path + '/s.bin')
   Q,_ = load_matrix_from_bin(output_path + '/Q.bin')        
