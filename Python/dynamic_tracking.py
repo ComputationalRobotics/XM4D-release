@@ -73,6 +73,9 @@ AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10, env="ALLTRACKER_
 AT_RES = dataset_config.get_int("ALLTRACKER_RES", 512, env="ALLTRACKER_RES")
 AT_VIS_THRESHOLD = dataset_config.get_float("ALLTRACKER_VIS_THRESHOLD", 0.6, env="ALLTRACKER_VIS_THRESHOLD")
 DYN_AT_GRID = dataset_config.get_float("DYN_ALLTRACKER_GRID", 2.0, env="DYN_ALLTRACKER_GRID")
+AT_MIN_NEW = dataset_config.get_float("ALLTRACKER_MIN_NEW", 0.0, env="ALLTRACKER_MIN_NEW")
+AT_FP16 = dataset_config.get_bool("ALLTRACKER_FP16", True, env="ALLTRACKER_FP16")
+DEBUG = dataset_config.get_bool("DEBUG", False, env="DEBUG")  # also write the per-reason visualisation video
 
 MOVE_DELETE_ENABLED = TRACKER == "tapnext"
 MOVE_WINDOW_SIZE = 10.0
@@ -940,7 +943,7 @@ else:
         frames_track,
         lambda t, covered: grid_seeds(dyn_masks_seed[t] > 0, spacing, covered, spacing),
         keyframe=AT_KEYFRAME, res=AT_RES, vis_threshold=AT_VIS_THRESHOLD, max_points=ONLINE_MAX_POINTS,
-        device=str(device), label="AllTracker (dynamic)",
+        min_new=AT_MIN_NEW, fp16=AT_FP16, device=str(device), label="AllTracker (dynamic)",
     )
     if trk.shape[0] == 0:
         raise RuntimeError("No dynamic points: the object mask is empty at every keyframe.")
@@ -1252,20 +1255,21 @@ np.savez_compressed(
     mask_dir=str(MASK_DIR),
 )
 print(f"Wrote: {OUT_DIR / OUT_NAME}")
-_viz_name = "viz_" + (OUT_NAME[:-4] if OUT_NAME.endswith('.npz') else OUT_NAME) + ".mp4"
+if DEBUG:
+    _viz_name = "viz_" + (OUT_NAME[:-4] if OUT_NAME.endswith('.npz') else OUT_NAME) + ".mp4"
 
-_write_dynamic_reason_viz_mp4(
-    video_np_full,
-    tracks_xy,
-    occluded_dynamic,
-    str(OUT_DIR / _viz_name),
-    raw_occluded=occluded,
-    dynamic_obs_mask=dynamic_obs_mask,
-    depth_grad_deleted_obs_mask=depth_grad_deleted_obs_mask,
-    depth_max_deleted_obs_mask=depth_max_deleted_obs_mask,
-    move_delete_query_mask=move_delete_query_mask,
-    move_delete_first_frame=move_delete_first_frame,
-    query_t=query_t,
-    fps=10,
-)
-print(f"Wrote: {OUT_DIR / _viz_name}")
+    _write_dynamic_reason_viz_mp4(
+        video_np_full,
+        tracks_xy,
+        occluded_dynamic,
+        str(OUT_DIR / _viz_name),
+        raw_occluded=occluded,
+        dynamic_obs_mask=dynamic_obs_mask,
+        depth_grad_deleted_obs_mask=depth_grad_deleted_obs_mask,
+        depth_max_deleted_obs_mask=depth_max_deleted_obs_mask,
+        move_delete_query_mask=move_delete_query_mask,
+        move_delete_first_frame=move_delete_first_frame,
+        query_t=query_t,
+        fps=10,
+    )
+    print(f"Wrote: {OUT_DIR / _viz_name}")

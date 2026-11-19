@@ -11,6 +11,7 @@ from collections import deque
 import sys
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 
 from tqdm import tqdm
 
@@ -103,6 +104,8 @@ ONLINE_CERTAINTY_THRESHOLD = dataset_config.get_float(
 ONLINE_QUERY_DOWNSAMPLE_THRESHOLD = None
 ONLINE_MAX_POINTS = 20000
 ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO = 0.5
+ONLINE_FP16 = dataset_config.get_bool("ONLINE_FP16", True, env="ONLINE_FP16")  # TAPNext under fp16 autocast
+DEBUG = dataset_config.get_bool("DEBUG", False, env="DEBUG")  # also write tracks_debug.npz and the viz videos
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 install_script_logger("static_tracking", OUT_DIR)
@@ -184,9 +187,8 @@ def _make_uncovered_query_points_at_frame(
 
     if ref_sets:
         refs = np.concatenate(ref_sets, axis=0)
-        d2 = np.sum((cand[:, None, :] - refs[None, :, :]) ** 2, axis=2)
-        min_d2 = np.min(d2, axis=1)
-        mask_uncovered = min_d2 > radius2
+        min_d, _ = cKDTree(refs).query(cand, k=1)
+        mask_uncovered = min_d * min_d > radius2
     else:
         mask_uncovered = np.ones(cand.shape[0], dtype=bool)
 
@@ -212,6 +214,9 @@ def _compute_flow_error_by_transition(
     query's flow and the median flow of nearby points from t-1 to t. Values
     are NaN when that transition cannot be evaluated.
     """
+    # Neighbours = every other valid point within half a window in x AND y (Chebyshev distance <= half, KD-tree
+    # pairs); neighbour flow = per-component median (np.median semantics: mean of the two middle values for an even
+    # count). Same result as a per-point loop with np.median, ~20x faster.
     Q = tracks_xy.shape[1]
     T = tracks_xy.shape[2]
     flow_error = np.full((Q, T), np.nan, dtype=np.float64)
@@ -234,36 +239,23 @@ def _compute_flow_error_by_transition(
 
         P = pts[idx_valid].astype(np.float64)
         flow = P - prev[idx_valid].astype(np.float64)
+        n = len(P)
 
-        bins = {}
-        for i, p in enumerate(P):
-            bx = int(np.floor(float(p[0]) / window))
-            by = int(np.floor(float(p[1]) / window))
-            bins.setdefault((bx, by), []).append(i)
-
-        for i, p in enumerate(P):
-            bx = int(np.floor(float(p[0]) / window))
-            by = int(np.floor(float(p[1]) / window))
-
-            cand = []
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    cand.extend(bins.get((bx + dx, by + dy), []))
-            if not cand:
-                continue
-
-            cand = np.asarray(cand, dtype=np.int64)
-            dx_local = np.abs(P[cand, 0] - p[0])
-            dy_local = np.abs(P[cand, 1] - p[1])
-            in_win = (dx_local <= half) & (dy_local <= half)
-            cand = cand[in_win]
-            cand = cand[cand != i]
-            if cand.size == 0:
-                continue
-
-            neighbor_flow = np.median(flow[cand], axis=0)
-            err = float(np.linalg.norm(flow[i] - neighbor_flow))
-            flow_error[idx_valid[i], t] = err
+        pairs = cKDTree(P).query_pairs(half, p=np.inf, output_type="ndarray")
+        if pairs.size == 0:
+            continue
+        a = np.r_[pairs[:, 0], pairs[:, 1]]
+        b = np.r_[pairs[:, 1], pairs[:, 0]]
+        cnt = np.bincount(a, minlength=n)
+        has = cnt > 0
+        start = np.r_[0, np.cumsum(cnt)[:-1]]
+        lo = (start + (cnt - 1) // 2)[has]
+        hi = (start + cnt // 2)[has]
+        neighbor_flow = np.empty((int(has.sum()), 2))
+        for d in range(2):
+            v = flow[b, d][np.lexsort((flow[b, d], a))]      # grouped by point, sorted within each group
+            neighbor_flow[:, d] = (v[lo] + v[hi]) / 2.0
+        flow_error[idx_valid[has], t] = np.linalg.norm(flow[has] - neighbor_flow, axis=1)
 
     return flow_error
 
@@ -424,6 +416,7 @@ def track_online_tapnext(
     max_points: int = 6000,
     downsample_threshold: int | None = None,
     downsample_target_ratio: float = 0.5,
+    fp16: bool = False,
 ):
     """Online tracking with per-frame query augmentation."""
     if checkpoint.endswith(".npz"):
@@ -568,15 +561,17 @@ def track_online_tapnext(
             state = _expand_state_for_new_queries(state, n_add_effective)
 
 
-        if state is None:
-            pred_tracks, track_logits, visible_logits, state = model(
-                video=video_256[:, t : t + 1], query_points=query_points_t
-            )
-        else:
-            state.query_points = query_points_t
-            pred_tracks, track_logits, visible_logits, state = model(
-                video=video_256[:, t : t + 1], state=state
-            )
+        with torch.autocast("cuda", dtype=torch.float16, enabled=fp16):
+            if state is None:
+                pred_tracks, track_logits, visible_logits, state = model(
+                    video=video_256[:, t : t + 1], query_points=query_points_t
+                )
+            else:
+                state.query_points = query_points_t
+                pred_tracks, track_logits, visible_logits, state = model(
+                    video=video_256[:, t : t + 1], state=state
+                )
+        pred_tracks, track_logits, visible_logits = pred_tracks.float(), track_logits.float(), visible_logits.float()
 
         tracks_yx = pred_tracks.detach().cpu()
         tracks_xy = torch.flip(tracks_yx, dims=[-1]).numpy()[0, 0]  # [Q,2]
@@ -676,6 +671,7 @@ if TRACKER == "tapnext":
         max_points=ONLINE_MAX_POINTS,
         downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
         downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
+        fp16=ONLINE_FP16,
     )
 
 
@@ -733,14 +729,15 @@ if MASK_DIR is not None and Path(MASK_DIR).exists():
         print(f"Failed to load/apply masks from {MASK_DIR}: {e}")
 
 # Save 2D outputs
-np.savez_compressed(
-    OUT_DIR / "tracks_debug.npz",
-    tracks_xy=tracks_xy,
-    occluded=occluded,
-    video_dir=str(IMAGE_DIR),
-    grid=int(GRID),
-    mask_dir=str(MASK_DIR) if MASK_DIR is not None else "",
-)
+if DEBUG:
+    np.savez_compressed(
+        OUT_DIR / "tracks_debug.npz",
+        tracks_xy=tracks_xy,
+        occluded=occluded,
+        video_dir=str(IMAGE_DIR),
+        grid=int(GRID),
+        mask_dir=str(MASK_DIR) if MASK_DIR is not None else "",
+    )
 
 move_delete_deleted_obs_mask = None
 
@@ -810,17 +807,18 @@ np.savez_compressed(
 )
 print(f"Wrote 2D tracking output for solver: {output_tapnet_src_path}")
 
-write_viz_mp4(
-    video_np,
-    tracks_xy,
-    occluded_viz,
-    str(OUT_DIR / "viz_debug.mp4"),
-    fps=10,
-    tail_length=12,
-    tail_thickness=1,
-    dynamic_masks=dynamic_masks,
-    highlight_radius=5,
-    highlight_obs_mask_3=move_delete_deleted_obs_mask,
-    highlight_obs_color_3=(255, 0, 255),
-)
-write_viz_mp4(video_np, None, None, str(OUT_DIR / "viz_origin.mp4"))
+if DEBUG:
+    write_viz_mp4(
+        video_np,
+        tracks_xy,
+        occluded_viz,
+        str(OUT_DIR / "viz_debug.mp4"),
+        fps=10,
+        tail_length=12,
+        tail_thickness=1,
+        dynamic_masks=dynamic_masks,
+        highlight_radius=5,
+        highlight_obs_mask_3=move_delete_deleted_obs_mask,
+        highlight_obs_color_3=(255, 0, 255),
+    )
+    write_viz_mp4(video_np, None, None, str(OUT_DIR / "viz_origin.mp4"))

@@ -227,8 +227,10 @@ python ../build/gsplat_examples/simple_trainer.py default --data-dir ../datasets
     --edg-results ../datasets/<scene>/outputs/results_all.npz --edg-target-frame 0
 ```
 
-Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 6 reads its training settings (learning rates, loss weights,
-`max_steps`, `steps_scaler`) from `config.json` too; a command-line flag overrides them.
+Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 2 writes its visualisation videos (`outputs/viz_*.mp4`) and the
+unfiltered static tracks (`outputs/tracks_debug.npz`) only with `"DEBUG": true` in `config.json`. Step 6 reads its
+training settings (learning rates, loss weights, `max_steps`, `steps_scaler`) from `config.json` too; a command-line
+flag overrides them.
 
 Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's per-frame focals, with the principal
 point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are squeezed to 2:1 for Depth Anything 3
@@ -238,16 +240,25 @@ Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving 
 (`DYNAMIC_TRACKER`). A static point is hidden while it is on a moving object, a moving point while it is off its object.
 
 - Static scene: TAPNext++ starts from a 50 × 50 grid of points off the moving objects and tracks them frame by frame.
-  At every frame it adds points wherever no visible point is within `ONLINE_RESAMPLE_RADIUS` px (4, on the frame
-  resized to 256 × 256), up to 20000 points. A point counts as visible while TAPNext's visibility × certainty is above
-  `ONLINE_CERTAINTY_THRESHOLD` (0.8). A track whose frame-to-frame motion differs from that of the points around it by
-  more than `MOVE_DELETE_FLOW_ERROR_THRESHOLD` px (10) keeps only its longest stable part. With 20000 points it used
-  up to about 45 GB of GPU memory on our videos (nvidia-smi), independent of the video length.
+  At every frame it draws `ONLINE_RESAMPLE_GRID`² random points (30², on the frame resized to 256 × 256) and adds
+  those with no visible point within `ONLINE_RESAMPLE_RADIUS` px (4), up to 20000 points. A point counts as visible
+  while TAPNext's visibility × certainty is above `ONLINE_CERTAINTY_THRESHOLD` (0.8). A track whose frame-to-frame
+  motion differs from that of the points around it by more than `MOVE_DELETE_FLOW_ERROR_THRESHOLD` px (10) keeps only
+  its longest stable part. With 20000 points it used up to about 45 GB of GPU memory on our videos (nvidia-smi),
+  independent of the video length.
 - Moving objects: every `ALLTRACKER_KEYFRAME` frames (default 10), AllTracker adds points on a grid on the object
   wherever no tracked point is visible nearby and tracks them forward in one dense pass at `ALLTRACKER_RES` px (512),
   to the end of the video. A point counts as visible while visibility × confidence is at least
   `ALLTRACKER_VIS_THRESHOLD` (0.6). `DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at the
-  tracking resolution.
+  tracking resolution. Each pass costs the same however few points it adds; `ALLTRACKER_MIN_NEW` (0, off) skips a
+  keyframe that would add fewer new points than this share of the points visible there. On DyCheck, 0.05 made this
+  tracking 1.4 times faster again but left up to 2% more of the object untracked.
+
+Both trackers run in half precision (`ONLINE_FP16`, `ALLTRACKER_FP16`; `false` for full precision). On our test
+videos, half precision with 30² points per frame gave the same cameras (16 videos of all six datasets) and the same
+moving-point accuracy (DyCheck human keypoints, 72.9 vs 73.2% within 16 px) as full precision with 60², in 5.3 times
+less time for the static scene and 1.9 times less for the moving objects (DyCheck teddy, 472 frames: 11.3 → 1.8 min
+and 5.3 → 2.7 min).
 
 Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauchy loss of `CERES_LOSS_PX` px (2;
 `CERES_LOSS`: `cauchy`, `huber`, `softl1` or `trivial`), and the shared focal is refined too

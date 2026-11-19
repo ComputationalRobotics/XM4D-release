@@ -4,7 +4,9 @@ Dense tracking from keyframes: at every `keyframe`-th frame, `seed_fn` places ne
 visible nearby, and that keyframe's points are tracked forward to the end of the video (or `max_len` frames) with ONE
 dense AllTracker pass from the keyframe (the flow of every pixel, sampled at the points). A point is visible where
 AllTracker's visibility x confidence >= `vis_threshold`. With `min_visible` > 0, any frame where fewer points are
-visible also becomes a keyframe. Frames are resized so that the long side is `res` px.
+visible also becomes a keyframe. With `min_new` > 0, a keyframe is skipped while it would add fewer new points than
+`min_new` x the points visible there (each pass costs the same however few points it adds). Frames are resized so that
+the long side is `res` px. `fp16` runs AllTracker under fp16 autocast.
 """
 
 import sys
@@ -52,7 +54,7 @@ def _sample(maps, pts):
 
 @torch.no_grad()
 def track_keyframes(frames, seed_fn, *, keyframe=10, res=512, vis_threshold=0.6, max_points=None, max_len=None,
-                    min_visible=0, device="cuda", label="AllTracker"):
+                    min_visible=0, min_new=0.0, fp16=False, device="cuda", label="AllTracker"):
     """frames (T, H, W, 3) uint8 RGB. seed_fn(t, visible_xy (n, 2)) -> new points (m, 2) at frame t, native px.
     Returns tracks (N, T, 2) float32 native px (NaN before each point's keyframe), visible (N, T) bool, query_t (N,)."""
     T, H, W = frames.shape[:3]
@@ -72,14 +74,16 @@ def track_keyframes(frames, seed_fn, *, keyframe=10, res=512, vis_threshold=0.6,
         new = np.asarray(seed_fn(t0, cur), np.float64).reshape(-1, 2)
         if max_points is not None:
             new = new[:max(0, int(max_points) - n_total)]
-        if not len(new):
+        if not len(new) or len(new) < min_new * len(cur):
             continue
         tr = np.full((len(new), T, 2), np.nan, np.float32)
         v = np.zeros((len(new), T), bool)
         tr[:, t0], v[:, t0] = new, True
         t1 = T if not max_len else min(T, t0 + int(max_len) + 1)
         if t0 < t1 - 1:
-            flows, visconfs, _, _ = model.forward_sliding(video[:, t0:t1].to(device), iters=4, sw=None, is_training=False)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=fp16):
+                flows, visconfs, _, _ = model.forward_sliding(video[:, t0:t1].to(device), iters=4, sw=None, is_training=False)
+            flows, visconfs = flows.float(), visconfs.float()
             if flows.dim() == 4:                                            # a single next frame comes back unstacked
                 flows, visconfs = flows[:, None], visconfs[:, None]
             else:                                                           # drop the keyframe itself

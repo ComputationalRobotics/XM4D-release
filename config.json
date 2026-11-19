@@ -1,6 +1,7 @@
 {
   "scene": "sintel_alley_2",
   "no_masks": false,
+  "DEBUG": false,
 
   "STATIC_TRACKER": "tapnext",
   "DYNAMIC_TRACKER": "alltracker",
@@ -10,7 +11,7 @@
   "DYN_ALLTRACKER_GRID": 2,
 
   "MOVE_DELETE_FLOW_ERROR_THRESHOLD": 10.0,
-  "ONLINE_RESAMPLE_GRID": 60,
+  "ONLINE_RESAMPLE_GRID": 30,
   "ONLINE_RESAMPLE_RADIUS": 4.0,
   "ONLINE_CERTAINTY_THRESHOLD": 0.8,
 
