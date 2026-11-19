@@ -49,11 +49,12 @@ import utils.definitions
 import EDG_test as ET          # reuse load_all / build_segment_inputs / solve_segment (imports XM once)
 
 
-def _dist_to_obs(obs):
-    """obs: [n,T] bool of DIRECTLY-observed cells per id. Return [n,T] float = #frames from each frame to
-    the nearest observed frame in that row (0 at an observed frame); inf for a row with no observation."""
-    n, T = obs.shape
-    idx = np.arange(T)[None, :]
+def _dist_to_obs(obs, frames):
+    """obs: [n,F] bool of DIRECTLY-observed cells per id at the sorted `frames` [F]. Return [n,F] float = #frames
+    from each frame to the nearest observed frame in that row (0 at an observed frame); inf for a row with no
+    observation."""
+    idx = np.asarray(frames)[None, :]
+    T = int(idx.max(initial=-1)) + 1
     prev = np.maximum.accumulate(np.where(obs, idx, -1), axis=1)     # last obs index <= f  (-1 if none yet)
     df = np.where(prev >= 0, idx - prev, np.inf)                     # distance looking backward
     nxt = np.minimum.accumulate(np.where(obs, idx, T)[:, ::-1], axis=1)[:, ::-1]  # first obs index >= f
@@ -85,9 +86,10 @@ def save_table_heatmap(node_pos, node_w, node_ids, path):
 def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn, rng, run_id, n_runs, gap):
     """One run = EDG_test chaining over the ordered strided `run_frames`: up to n_seg segments of seg_len
     frames (1-frame overlap), carrying each EDG node forward + composing global rotation. Returns
-    (node_pos, dyn_pos) dicts gid -> [T,3], finite only at the run's frames; and #segments solved."""
+    node_pos dict gid -> [T,3], finite only at the run's frames; the dynamic points as (gids [n], positions
+    [n, run_frames.size, 3], NaN where not solved); and #segments solved."""
     T = D["T"]
-    edg_rot, edg_pos, dyn_pos = {}, {}, {}
+    edg_rot, edg_pos, dyn_seg = {}, {}, []
 
     def ens_rot(g):
         if g not in edg_rot:
@@ -125,17 +127,18 @@ def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn,
                 rest_global = rot_arr[rest] if np.isfinite(rot_arr[rest]).all() else np.eye(3)
                 Rg = rest_global[None, :, :] @ R_edg[j]
                 pos_arr = ens_pos(edg_pos, gid)
-                for ti, f in enumerate(frames.tolist()):
-                    rot_arr[f] = Rg[ti]; pos_arr[f] = ed[j, ti]
-            for i, gid in enumerate(ukps.tolist()):
-                arr = ens_pos(dyn_pos, gid)
-                for ti, f in enumerate(frames.tolist()):
-                    arr[f] = dyn[i, ti]
+                rot_arr[frames] = Rg; pos_arr[frames] = ed[j]
+            dyn_seg.append((ukps, np.searchsorted(run_frames, frames), dyn))
             nseg += 1
         if ci + seg_len >= run_frames.size:
             break
         ci += seg_len - 1                                              # 1-frame overlap
-    return edg_pos, dyn_pos, nseg
+    # dynamic points over the run's frames; a later segment overwrites the shared overlap frame (like the nodes)
+    dyn_ids = np.unique(np.concatenate([u for u, _, _ in dyn_seg])) if dyn_seg else np.zeros(0, dtype=np.int64)
+    dyn_pos = np.full((dyn_ids.size, run_frames.size, 3), np.nan, dtype=np.float64)
+    for u, fi, dyn in dyn_seg:
+        dyn_pos[np.searchsorted(dyn_ids, u)[:, None], fi[None, :]] = dyn
+    return edg_pos, (dyn_ids, dyn_pos), nseg
 
 
 def _sample_start(rng, hole, g, span_frames, T, bias):
@@ -159,19 +162,19 @@ def _sample_start(rng, hole, g, span_frames, T, bias):
     return int(rng.choice(hi, p=p / tot))
 
 
-def _accumulate(pos_sum, pos_w, run_pos, valid):
-    """Add a run's per-id trajectories into the global weighted sums. Cell (id, frame f) gets weight
-    1/(1+d), d = #frames from f to that id's NEAREST direct observation this run (valid[id]=True & solved);
-    f observed -> d=0 -> w=1; extrapolated k frames past the last obs -> w=1/(1+k). No obs this run -> w=0."""
-    if not run_pos:
+def _accumulate(pos_sum, pos_w, gids, P, valid, frames):
+    """Add a run's per-id trajectories P [n,F,3] (rows = gids, columns = the run's sorted `frames`; a run
+    solves nothing elsewhere, so only these cells change) into the global weighted sums. Cell (id, frame f)
+    gets weight 1/(1+d), d = #frames from f to that id's NEAREST direct observation this run (valid[id]=True
+    & solved); f observed -> d=0 -> w=1; extrapolated k frames past the last obs -> w=1/(1+k). No obs this
+    run -> w=0."""
+    if not gids.size:
         return
-    gids = np.fromiter(run_pos.keys(), dtype=np.int64)
-    P = np.stack([run_pos[int(g)] for g in gids.tolist()])            # [n,T,3]
-    solved = np.isfinite(P).all(-1)                                   # [n,T] cells this run produced
-    d = _dist_to_obs(valid[gids].astype(bool) & solved)              # [n,T] dist to nearest direct obs
-    w = np.where(solved & np.isfinite(d), 1.0 / (1.0 + d), 0.0)       # [n,T]
-    pos_sum[gids] += w[..., None] * np.where(solved[..., None], P, 0.0)
-    pos_w[gids] += w
+    solved = np.isfinite(P).all(-1)                                   # [n,F] cells this run produced
+    d = _dist_to_obs(valid[np.ix_(gids, frames)].astype(bool) & solved, frames)  # [n,F] dist to nearest direct obs
+    w = np.where(solved & np.isfinite(d), 1.0 / (1.0 + d), 0.0)       # [n,F]
+    pos_sum[np.ix_(gids, frames)] += w[..., None] * np.where(solved[..., None], P, 0.0)
+    pos_w[np.ix_(gids, frames)] += w
 
 
 def _kabsch_R(P, Q):
@@ -271,14 +274,16 @@ def main():
         print(f"\n===== SAMPLE {run+1}/{args.n_runs}: gap={g}, {run_frames.size} strided frames "
               f"{run_frames[0]}..{run_frames[-1]}, up to {args.n_seg} iterations of {args.seg_len}-frame "
               f"segments (targeting {int(hole[run_frames].sum())} unfilled observable cells) =====", flush=True)
-        node_pos, dyn_pos, nseg = solve_run(D, run_frames, args.seg_len, args.n_seg, args.w_arap,
-                                            args.w_smooth, out_dir, (args.max_dyn or None), rng,
-                                            run + 1, args.n_runs, g)
-        _accumulate(pos_sum, pos_w, node_pos, valid)
-        _accumulate(pos_sum, pos_w, dyn_pos, valid)
+        node_pos, (dyn_gids, dyn_pos), nseg = solve_run(D, run_frames, args.seg_len, args.n_seg, args.w_arap,
+                                                        args.w_smooth, out_dir, (args.max_dyn or None), rng,
+                                                        run + 1, args.n_runs, g)
+        node_gids = np.fromiter(node_pos.keys(), dtype=np.int64)
+        P = np.stack([node_pos[gid][run_frames] for gid in node_gids.tolist()]) if node_gids.size else None
+        _accumulate(pos_sum, pos_w, node_gids, P, valid, run_frames)
+        _accumulate(pos_sum, pos_w, dyn_gids, dyn_pos, valid, run_frames)
         n_ok += 1
         print(f"[sample {run+1}/{args.n_runs} done] {nseg} segments solved; "
-              f"{len(node_pos)} nodes + {len(dyn_pos)} dyn points touched")
+              f"{len(node_pos)} nodes + {dyn_gids.size} dyn points touched")
 
     glob = D["glob"]                                                  # [Q,T,3] world-lifted observations
     en = edg_nodes
@@ -295,10 +300,15 @@ def main():
         print("[obs] observation seeding OFF: table = average of independently solved sampled segments, "
               "NaN everywhere else (pass --seed-obs to also fill all directly-observed cells)")
 
-    pos = np.full((Q, T, 3), np.nan, dtype=np.float64)
     m = pos_w > 0
-    pos[m] = pos_sum[m] / pos_w[m][:, None]
-    node_pos = pos[edg_nodes].copy()                                  # the node x frame table (NaN = hole)
+
+    def _mean(ids):                                                   # weighted average of the rows `ids` (NaN = no weight)
+        out = np.full((ids.size, T, 3), np.nan, dtype=np.float64)
+        r, f = np.nonzero(m[ids])
+        out[r, f] = pos_sum[ids[r], f] / pos_w[ids[r], f][:, None]
+        return out
+
+    node_pos = _mean(edg_nodes)                                       # the node x frame table (NaN = hole)
     node_w = pos_w[edg_nodes].copy()                                  # accumulated reliability per cell
     filled = np.isfinite(node_pos).all(-1)
     print(f"[table] {n_ok}/{args.n_runs} runs; node-frame table {100 * filled.mean():.1f}% filled "
@@ -306,7 +316,7 @@ def main():
 
     node_mask = np.zeros(Q, dtype=bool); node_mask[edg_nodes] = True
     dyn_ids = np.where(m.any(1) & ~node_mask)[0]
-    dyn_reconstruct = pos[dyn_ids]
+    dyn_reconstruct = _mean(dyn_ids)
 
     node_ids = edg_nodes
     node_set = set(node_ids.tolist())

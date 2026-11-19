@@ -4,20 +4,20 @@ AllTracker from keyframes, utils/track_alltracker.py) or "tapnext" (the online T
 
 from pathlib import Path
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import glob
 import os
 import sys
+import time
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deps" / "tapnet"))
-
-from tapnet.tapnext.tapnext_torch import TAPNext
-from tapnet.tapnext.tapnext_torch_utils import restore_model_from_jax_checkpoint, tracker_certainty
 
 from utils.readgt_DAVIS import load_davis_gt
 from utils.readgt_TUM import load_tum_gt
@@ -26,16 +26,12 @@ from utils.readgt_custom import load_custom_gt
 from utils.readgt_replica import load_replica_gt, read_replica_depth
 from utils.readgt_sintel import load_sintel_gt, depth_read
 from utils.readgt_dycheck import load_dycheck_gt
-from utils.track_tapnet import (
-    dilate_dynamic_masks,
-    load_dynamic_masks,
-    load_frames_256,
-    write_viz_mp4,
-)
+from utils.masks import _numeric_key, dilate_dynamic_masks, load_dynamic_masks  # utils.track_tapnet imports tapnet (~3 s)
 
 import utils.definitions
 import utils.dataset_config as dataset_config
-from utils.script_logger import install_script_logger
+from utils.io import savez_compressed_fast
+from utils.script_logger import install_script_logger, pause_script_logger, resume_script_logger
 
 
 ### S0: CONFIG
@@ -155,21 +151,19 @@ if REVERSE:
     print("[reverse] BACKWARD tracking: flipping time-indexed inputs; queries seed at the original last frame")
 
 
-if dataset_cat in {"Sintel", "Sintel_debug"}:
-    gt = load_sintel_gt(str(rootpath))
-elif dataset_cat == "TUM":
-    gt = load_tum_gt(str(rootpath))
-elif dataset_cat == "DAVIS":
-    gt = load_davis_gt(str(rootpath))
-elif dataset_cat == "Replica":
-    gt = load_replica_gt(str(rootpath))
-elif dataset_cat == "Syn4D":
-    gt = load_colmap_gt(str(rootpath / "colmap"))
-elif dataset_cat == "Dycheck":
-    gt = load_dycheck_gt(str(rootpath))
-elif dataset_cat == "Custom":
-    gt = load_custom_gt(rootpath)
-else:
+# per-frame K of the dataset, loaded right before the 3D lift (a Custom scene's K comes from step 1, which
+# run_pipeline.sh may still be running while this step tracks)
+GT_LOADERS = {
+    "Sintel": lambda: load_sintel_gt(str(rootpath)),
+    "Sintel_debug": lambda: load_sintel_gt(str(rootpath)),
+    "TUM": lambda: load_tum_gt(str(rootpath)),
+    "DAVIS": lambda: load_davis_gt(str(rootpath)),
+    "Replica": lambda: load_replica_gt(str(rootpath)),
+    "Syn4D": lambda: load_colmap_gt(str(rootpath / "colmap")),
+    "Dycheck": lambda: load_dycheck_gt(str(rootpath)),
+    "Custom": lambda: load_custom_gt(rootpath),
+}
+if dataset_cat not in GT_LOADERS:
     raise ValueError(f"Unsupported dataset_cat '{dataset_cat}'")
 
 
@@ -645,6 +639,9 @@ def track_online_tapnext(
     maxpt_move_window: float = 6.0,
     maxpt_move_eps: float = 1.0,
 ):
+    from tapnet.tapnext.tapnext_torch import TAPNext   # here: tapnet's package import pulls in tensorflow (~3 s)
+    from tapnet.tapnext.tapnext_torch_utils import restore_model_from_jax_checkpoint, tracker_certainty
+
     if checkpoint.endswith(".npz"):
         model = TAPNext(image_size=(256, 256)).to(device).eval()
         model = restore_model_from_jax_checkpoint(model, checkpoint)
@@ -850,11 +847,19 @@ def track_online_tapnext(
     return tracks_xy_full, occluded_full, query_t
 
 
-video_np_256, video_np = load_frames_256(str(IMAGE_DIR), IMAGE_PATTERN)
+if TRACKER == "tapnext":
+    from utils.track_tapnet import load_frames_256
+    video_np_256, video_np = load_frames_256(str(IMAGE_DIR), IMAGE_PATTERN)
+else:                                                     # AllTracker resizes the full-size frames itself
+    _paths = sorted(glob.glob(os.path.join(str(IMAGE_DIR), IMAGE_PATTERN)), key=_numeric_key)
+    if not _paths:
+        raise FileNotFoundError(f"No frames found in {IMAGE_DIR} matching {IMAGE_PATTERN}")
+    with ThreadPoolExecutor(8) as _ex:                    # as load_frames_256 decodes them, in threads
+        video_np = np.stack(list(_ex.map(lambda p: np.asarray(Image.open(p).convert("RGB"), dtype=np.uint8), _paths)))[None]
 video_np_full = video_np                                  # kept in ORIGINAL order (viz + output flip-back)
 H, W = video_np.shape[2], video_np.shape[3]
 T = video_np.shape[1]
-if REVERSE:
+if REVERSE and TRACKER == "tapnext":
     video_np_256 = video_np_256[:, ::-1].copy()          # track on the time-flipped video (masks flipped below)
 
 if MASK_DIR is None or not Path(MASK_DIR).exists():
@@ -1001,6 +1006,17 @@ occluded_dynamic[0] |= ~dynamic_obs_mask
 #     occluded_dynamic[0] |= edge_obs_mask
 #     print(f"Filtered edge observations: {int(np.sum(edge_obs_mask))}")
 
+
+# run_pipeline.sh starts this step next to step 1: wait for the depth (its marker) before the 3D lift
+_depth_done = os.environ.get("XM_WAIT_FOR_DEPTH")
+if _depth_done and not os.path.exists(_depth_done):
+    pause_script_logger("waiting for step 1's depth")              # (not this step's runtime)
+    while not os.path.exists(_depth_done):
+        if os.path.exists(_depth_done + ".failed"):
+            raise RuntimeError("step 1 (depth) failed, so there is no depth to lift the tracks with")
+        time.sleep(1)
+    resume_script_logger()
+gt = GT_LOADERS[dataset_cat]()
 
 depth_paths = sorted(glob.glob(os.path.join(str(GT_DEPTH_DIR), "*.dpt")))
 if REVERSE:
@@ -1239,7 +1255,7 @@ if REVERSE:
                                         (T - 1) - lost_offmask_first_frame, T).astype(np.int64)
     print(f"[reverse] flipped outputs back to original frame order")
 
-np.savez_compressed(
+savez_compressed_fast(                                   # zlib level 1: same arrays, ~3x faster than numpy's level 6
     OUT_DIR / OUT_NAME,
     tracks_xy=tracks_xy,
     tracks_xyz=tracks_xyz,

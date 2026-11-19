@@ -16,6 +16,7 @@ Point links: each moving point joins its 2 nearest nodes (p90 distance, among it
 usage: python edg_topology.py
 """
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -31,12 +32,45 @@ except AttributeError:
 
 
 # ------------------------------------------------------------------ node selection (motion-radius rule)
-def motion_radius(P, Vs):
-    """RMS distance of each track's positions over its seen frames from their mean. P (Q, T, 3), Vs (T, Q)."""
-    with np.errstate(all="ignore"):
-        mu = np.nanmean(np.where(Vs.T[..., None], P, np.nan), axis=1)
-        R = np.sqrt(np.nanmean(np.where(Vs.T, ((P - mu[:, None]) ** 2).sum(-1), np.nan), axis=1))
+def motion_radius(P, Vs, off=None):
+    """RMS distance of each track's positions (minus a per-frame offset off (T, 3)) over its seen frames from their mean.
+    P (Q, T, 3), Vs (T, Q)."""
+    R = np.empty(P.shape[0])
+
+    def one(r):                                                        # np.nanmean over the seen frames (P is finite there)
+        V = Vs.T[r]; n = V.sum(1); Pr = P[r] if off is None else P[r] - off[None]   # as sum / count, without its NaN
+        with np.errstate(all="ignore"):                                # copies, on blocks of tracks in threads (speed)
+            mu = np.where(V[..., None], Pr, 0.0).sum(1) / n[:, None]
+            d = Pr - mu[:, None]
+            R[r] = np.sqrt(np.where(V, (d[..., 0] * d[..., 0] + d[..., 1] * d[..., 1]) + d[..., 2] * d[..., 2], 0.0).sum(1) / n)
+    step = max(1, -(-P.shape[0] // 32))
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(one, [slice(i, i + step) for i in range(0, P.shape[0], step)]))
     return np.nan_to_num(R)
+
+
+def nanmedian_rows(a, off=None):
+    """np.nanmedian(a - off[None], axis=1) for a 2D a: one sort per row, large arrays in row blocks in threads (speed only:
+    numpy takes a masked-array path for rows shorter than 600 and a Python loop otherwise). The two middle finite values
+    averaged in the array's dtype, as np.median does; NaN for an all-NaN row."""
+    out = np.empty(a.shape[0], a.dtype if off is None else np.result_type(a, off))
+    if a.shape[1] == 0:                                                # no values: NaN, as np.nanmedian
+        out[:] = np.nan
+        return out
+
+    def one(r):
+        s = np.sort(a[r] if off is None else a[r] - off[None], axis=1)  # NaN last
+        n = (~np.isnan(s)).sum(1)
+        lo = np.take_along_axis(s, ((np.maximum(n, 1) - 1) // 2)[:, None], 1)[:, 0]
+        hi = np.take_along_axis(s, (n // 2)[:, None], 1)[:, 0]
+        out[r] = (lo + hi) / 2
+    if a.size < 1 << 16:
+        one(slice(None))
+        return out
+    step = max(1, -(-a.shape[0] // 32))
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(one, [slice(i, i + step) for i in range(0, a.shape[0], step)]))
+    return out
 
 
 def shared_offset(P, Vs, iters=8):
@@ -44,11 +78,12 @@ def shared_offset(P, Vs, iters=8):
     T = Vs.shape[0]; c = np.zeros((T, 3)); n = Vs.sum(1)
     for ax in range(3):
         X = np.where(Vs.T, P[..., ax], np.nan).astype(np.float32)
+        XQ, XT = np.ascontiguousarray(X), np.ascontiguousarray(X.T)    # rows per track, rows per frame (speed)
         ca = np.zeros(T, np.float32)
         with np.errstate(all="ignore"):
             for _ in range(iters):
-                mu = np.nanmedian(X - ca[None], axis=1)
-                ca = np.nan_to_num(np.nanmedian(X - mu[:, None], axis=0))
+                mu = nanmedian_rows(XQ, ca)                            # = np.nanmedian(X - ca[None], axis=1)
+                ca = np.nan_to_num(nanmedian_rows(XT, mu))             # = np.nanmedian(X - mu[:, None], axis=0)
         ca[n < 10] = 0
         c[:, ax] = ca - np.median(ca[n >= 10]) if (n >= 10).any() else ca
     return c
@@ -60,61 +95,74 @@ def compensated_radius(P, Vs, thr, gate=2.0):
     R0 = motion_radius(P, Vs); c = shared_offset(P, Vs); seen = Vs.sum(1) >= 10
     rc = float(np.sqrt(np.mean(np.sum((c[seen] - c[seen].mean(0)) ** 2, axis=1)))) if seen.any() else 0.0
     on = rc >= gate * thr
-    return (motion_radius(P - c[None], Vs) if on else R0), R0, c, rc, bool(on)
+    return (motion_radius(P, Vs, c) if on else R0), R0, c, rc, bool(on)
 
 
 def select_nodes(P, Vs, Ocount, R, thr, prm, trees, close2d, overlap_frac=0.5, min_node_frames=20, quantile=0.80, nsamp=30):
     """Picked nodes in pick order (see the module docstring). trees = build_edg._frame_trees_2d(P, Vs, T)."""
     idx_per, tree_per = trees
+    VQ = np.ascontiguousarray(Vs.T)                                    # (Q, T): one row per track (speed)
+
+    def close(kn, g, gseen):                                           # is g close in 2D to one of the nodes kn?
+        co = VQ[kn][:, gseen]                                          # (co-visible frames are among g's seen frames gseen;
+        ok = co.sum(1) > overlap_frac * np.minimum(Ocount[kn], Ocount[g])   # the distances skip only NaN entries: speed)
+        if not ok.any():
+            return False
+        kn, co = kn[ok], co[ok]
+        v = close2d[0][kn[:, None], gseen] - close2d[0][g, gseen][None]
+        d = np.where(co, np.sqrt(v[..., 0] * v[..., 0] + v[..., 1] * v[..., 1]), np.nan)   # = np.linalg.norm
+        near = np.nanmin(d, axis=1) <= close2d[1]                      # a quantile is >= the minimum: only these can be close
+        return near.any() and (_nq(d[near], close2d[2], axis=1) <= close2d[1]).any()
+
     has = np.where(Ocount > int(min_node_frames))[0]
     order = has[np.argsort(-Ocount[has], kind="stable")]
     alive = np.zeros(P.shape[0], bool); alive[has] = True
     nodes = []
+    ex = ThreadPoolExecutor(8)
     for g in order:
         if not alive[g]:
             continue
-        if nodes:                                                      # 2D closeness to a kept node
-            kn = np.asarray(nodes, np.int64)
-            co = Vs[:, kn] & Vs[:, [g]]
-            ok = co.sum(0) > overlap_frac * np.minimum(Ocount[kn], Ocount[g])
-            if ok.any():
-                kn, co = kn[ok], co[:, ok]
-                d = np.where(co.T, np.linalg.norm(close2d[0][kn] - close2d[0][g][None], axis=2), np.nan)
-                if (_nq(d, close2d[2], axis=1) <= close2d[1]).any():
-                    alive[g] = False; continue
+        gseen = np.flatnonzero(VQ[g])
+        if nodes:                                                      # 2D closeness to a kept node; the kept node nearest
+            kn = np.asarray(nodes, np.int64)                           # at g's middle seen frame is tested first (speed)
+            f = gseen[gseen.size // 2]; w = close2d[0][kn, f] - close2d[0][g, f]
+            c = np.argmin(np.where(VQ[kn, f], w[:, 0] * w[:, 0] + w[:, 1] * w[:, 1], np.inf))
+            if close(kn[c:c + 1], g, gseen) or close(np.delete(kn, c), g, gseen):
+                alive[g] = False; continue
         is_fast = R[g] > prm["r0"] * thr
         r = prm["a"] * R[g] if is_fast else prm["cap"] * thr
-        gframes = np.where(Vs[:, g])[0]
+        gframes = gseen
         if gframes.size > nsamp:
             gframes = gframes[np.linspace(0, gframes.size - 1, nsamp).astype(int)]
-        cand = set()
+        cand = []
         for t in gframes:
             if tree_per[t] is None:
                 continue
-            for h in tree_per[t].query_ball_point(P[g, t], r):
-                b = int(idx_per[t][h])
-                if b != g and alive[b]:
-                    cand.add(b)
+            cand.append(idx_per[t][tree_per[t].query_ball_point(P[g, t], r)])
+        cand = np.unique(np.concatenate(cand)) if cand else np.zeros(0, np.int64)   # the set of tracks in the balls (order-free)
+        cand = cand[(cand != g) & alive[cand]]
         kill = np.zeros(0, np.int64); n_o = 0
-        if cand:
-            cand = np.fromiter(cand, np.int64)
-            co = Vs[:, g][:, None] & Vs[:, cand]
-            ok = co.sum(0) > overlap_frac * np.minimum(Ocount[g], Ocount[cand])
-            cand, co = cand[ok], co[:, ok]; n_o = int(cand.size)
-            if cand.size:
-                d = np.where(co.T, np.linalg.norm(P[cand] - P[g][None], axis=2), np.nan)
+        if cand.size:
+            co = VQ[cand][:, gseen]
+            ok = co.sum(1) > overlap_frac * np.minimum(Ocount[g], Ocount[cand])
+            cand, co = cand[ok], co[ok]; n_o = int(cand.size)
+
+            def hit(r):                                                # the test of the candidates cand[r], row by row:
+                v = P[cand[r, None], gseen] - P[g, gseen][None]        # row blocks in threads (speed)
+                d = np.where(co[r], np.sqrt((v[..., 0] * v[..., 0] + v[..., 1] * v[..., 1]) + v[..., 2] * v[..., 2]), np.nan)
                 if is_fast:
-                    hit = _nq(d, quantile, axis=1) <= prm["a"] * R[g]
-                else:
-                    med = np.nanmedian(d, axis=1)
-                    dev = _nq(np.abs(d - med[:, None]), 0.90, axis=1)
-                    hit = (med <= prm["cap"] * thr) & (dev <= np.maximum(prm["b"] * med, prm["e"] * thr))
-                kill = cand[hit]
+                    return _nq(d, quantile, axis=1) <= prm["a"] * R[g]
+                med = np.nanmedian(d, axis=1)
+                dev = _nq(np.abs(d - med[:, None]), 0.90, axis=1)
+                return (med <= prm["cap"] * thr) & (dev <= np.maximum(prm["b"] * med, prm["e"] * thr))
+            if cand.size:
+                kill = cand[np.concatenate(list(ex.map(hit, [slice(i, i + 256) for i in range(0, cand.size, 256)])))]
         alive[g] = False
         if kill.size < prm["k"] or kill.size < prm["rho"] * n_o:       # support: it must describe tracks
             continue
         alive[kill] = False
         nodes.append(int(g))
+    ex.shutdown()
     return np.array(nodes, np.int64)
 
 
@@ -146,20 +194,23 @@ def fps_budget(P, Vs, Ocount, nodes, max_nodes, quantile=0.80):
 
 
 # ------------------------------------------------------------------ edges
-def robust_mode(v):
-    """Most frequent value of a sample: the median of its shortest half."""
-    v = np.sort(v[np.isfinite(v)]); n = v.size
-    if n < 3:
-        return float(np.median(v)) if n else np.nan
-    h = (n + 1) // 2
-    i = int(np.argmin(v[h - 1:] - v[:n - h + 1]))
-    return float(np.median(v[i:i + h]))
+def robust_mode_rows(a):
+    """Most frequent value of each row's sample (NaN = missing): the median of its shortest half (the plain median below 3)."""
+    if a.shape[1] == 0:
+        return np.full(a.shape[0], np.nan)
+    s = np.sort(a, axis=1); n = (~np.isnan(s)).sum(1); h = (n + 1) // 2      # NaN last
+    k = np.arange(s.shape[1])[None]
+    w = np.take_along_axis(s, np.minimum(k + h[:, None] - 1, s.shape[1] - 1), 1) - s   # spread of the half starting at k
+    i = np.argmin(np.where(k <= (n - h)[:, None], w, np.inf), axis=1)
+    lo = np.take_along_axis(s, (i + (h - 1) // 2)[:, None], 1)[:, 0]; hi = np.take_along_axis(s, (i + h // 2)[:, None], 1)[:, 0]
+    return np.where(n >= 3, (lo + hi) / 2, nanmedian_rows(a))
 
 
 def object_extent(P, Vs):
     """Size of the moving object: per frame the p95 distance of the seen tracks from their centroid, median over frames."""
-    return float(np.median([np.percentile(np.linalg.norm(P[Vs[t], t] - P[Vs[t], t].mean(0), axis=1), 95)
-                            for t in range(Vs.shape[0]) if Vs[t].sum() > 10]))
+    with ThreadPoolExecutor(8) as ex:                                  # frames in threads (speed)
+        return float(np.median(list(ex.map(lambda t: np.percentile(np.linalg.norm(P[Vs[t], t] - P[Vs[t], t].mean(0), axis=1), 95),
+                                           [t for t in range(Vs.shape[0]) if Vs[t].sum() > 10]))))
 
 
 def select_edges(nodes, P, Vs, Ocount, R, thr, ext, c_sh, on_sh, prm):
@@ -173,18 +224,21 @@ def select_edges(nodes, P, Vs, Ocount, R, thr, ext, c_sh, on_sh, prm):
     reach = np.where(R[nodes] > prm["r0"] * thr, 0.4 * R[nodes], 2.0 * thr)  # how far node selection removes tracks
     score = np.full((M, M), np.inf); vel = np.full((M, M), np.nan); q90 = np.full((M, M), np.nan)
     med = np.full((M, M), np.nan); dev = np.full((M, M), np.nan)
-    for i in range(M):
-        for j in range(i + 1, M):
-            co = V[i] & V[j]
-            if co.sum() <= prm["overlap"] * min(Ocount[nodes[i]], Ocount[nodes[j]]) or co.sum() < 3:
-                continue
-            c = robust_mode(np.linalg.norm(X[i, co] - X[j, co], axis=1))
-            with np.errstate(all="ignore"):
-                v = np.nanmedian(np.linalg.norm(d[i] - d[j], axis=-1) / (nd[i] + nd[j] + eps))
-            if np.isfinite(v):
-                score[i, j] = score[j, i] = c * (0.5 + v); vel[i, j] = vel[j, i] = v
-                d3 = np.linalg.norm(X[i, co] - X[j, co], axis=1); q90[i, j] = q90[j, i] = np.quantile(d3, 0.90)
-                med[i, j] = med[j, i] = np.median(d3); dev[i, j] = dev[j, i] = np.quantile(np.abs(d3 - med[i, j]), 0.90)
+    cnt = V.astype(np.int64) @ V.T.astype(np.int64)                    # co-visible frames of each pair
+    norm3 = lambda u: np.sqrt((u[..., 0] * u[..., 0] + u[..., 1] * u[..., 1]) + u[..., 2] * u[..., 2])   # = np.linalg.norm
+    for i in range(M):                                                 # all partners j > i of node i at once (speed)
+        j = np.arange(i + 1, M)
+        j = j[(cnt[i, j] > prm["overlap"] * np.minimum(Ocount[nodes[i]], Ocount[nodes[j]])) & (cnt[i, j] >= 3)]
+        if not j.size:
+            continue
+        d3 = np.where(V[i] & V[j], norm3(X[i][None] - X[j]), np.nan)  # pair distance in each co-visible frame
+        with np.errstate(all="ignore"):
+            v = nanmedian_rows(norm3(d[i][None] - d[j]) / (nd[i] + nd[j] + eps))
+        ok = np.isfinite(v); j, d3, v = j[ok], d3[ok], v[ok]
+        m3 = nanmedian_rows(d3)
+        score[i, j] = score[j, i] = robust_mode_rows(d3) * (0.5 + v); vel[i, j] = vel[j, i] = v
+        q90[i, j] = q90[j, i] = _nq(d3, 0.90, axis=1)                  # = np.quantile over the co-visible frames
+        med[i, j] = med[j, i] = m3; dev[i, j] = dev[j, i] = _nq(np.abs(d3 - m3[:, None]), 0.90, axis=1)
     lim = np.where(R[nodes] > prm["r0"] * thr, prm["ball"] * R[nodes], np.inf)
     with np.errstate(invalid="ignore"):
         in_ball = q90 < np.minimum(lim[:, None], lim[None])

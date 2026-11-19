@@ -58,7 +58,8 @@ def load_all(tracks_path=None):
     R_for_edg = R_raw.astype(np.float64).copy()
     if s_raw is not None:
         R_for_edg *= s_raw[:, None, None]
-    glob = np.einsum("tij,qtj->qti", R_for_edg, tracks_xyz[0].astype(np.float64)) + t_raw[None, :, :]  # (Q,T,3)
+    glob = np.einsum("tij,qtj->qti", R_for_edg, tracks_xyz[0].astype(np.float64))  # (Q,T,3)
+    glob += t_raw[None, :, :]                                                      # in place (speed only)
     valid = (np.isfinite(glob).all(axis=-1) & (occluded[0] == 0) & dyn_mask.astype(bool))              # (Q,T)
 
     topo = np.load(Path(utils.definitions.output_dir) / "edg_topology.npz")
@@ -78,11 +79,14 @@ def load_all(tracks_path=None):
     for d, n in dyn_edg.tolist():
         dyn_to_nodes[int(d)].append(int(n))
     dyn_to_nodes = {d: np.asarray(v, dtype=int) for d, v in dyn_to_nodes.items()}
+    dyn_assign = np.full((Q, max([v.size for v in dyn_to_nodes.values()], default=0)), -1, dtype=int)
+    for d, v in dyn_to_nodes.items():                                      # the same lists, -1 padded (speed only)
+        dyn_assign[d, :v.size] = v
 
     print(f"[load] Q={Q} T={T} | EDG: {edg_nodes.size} nodes, {edg_edges.shape[0]} edges | "
           f"skinning: {len(dyn_to_nodes)} dynamic points assigned")
     return dict(glob=glob, valid=valid, T=T, Q=Q,
-                edg_nodes=edg_nodes, edg_edges=edg_edges, dyn_to_nodes=dyn_to_nodes)
+                edg_nodes=edg_nodes, edg_edges=edg_edges, dyn_to_nodes=dyn_to_nodes, dyn_assign=dyn_assign)
 
 
 # ------------------------------------------------------------------------------- per-segment solver glue
@@ -99,7 +103,7 @@ def build_segment_inputs(D, seg_frames, edg_pos, max_dyn=None, rng=None):
     Skinning neighbours = each dynamic point's assigned nodes (dyn_edg_edges) that are present, inverse-
     distance weighted at the rest frame using the node REST POSES g (works for carried nodes too)."""
     glob, valid = D["glob"], D["valid"]
-    edg_nodes, edg_edges, dyn_to_nodes = D["edg_nodes"], D["edg_edges"], D["dyn_to_nodes"]
+    edg_nodes, edg_edges = D["edg_nodes"], D["edg_edges"]
     rest = int(seg_frames[0])
 
     valid_at_rest = edg_nodes[valid[edg_nodes, rest]]                          # observed at rest
@@ -143,36 +147,40 @@ def build_segment_inputs(D, seg_frames, edg_pos, max_dyn=None, rng=None):
 
     # dynamic keypoints = tracks valid at rest that have an assignment, skinned to their PRESENT nodes
     kp_neighbors, kp_weights, kp_rest = {}, {}, {}
-    dyn_kp_idx, dyn_frame, dyn_global = [], [], []
     cand_q = np.where(valid[:, rest])[0]
     if max_dyn is not None and cand_q.size > int(max_dyn):     # subsample dyn keypoints (data) for speed
         cand_q = (rng if rng is not None else np.random.default_rng()).choice(
             cand_q, size=int(max_dyn), replace=False)
-    for q in cand_q.tolist():
-        assigned = dyn_to_nodes.get(q)
-        if assigned is None:
-            continue
-        nb = np.array([n for n in assigned.tolist() if n in present_set], dtype=int)
-        if nb.size < 2:                                           # solver needs >= 2 neighbours
-            continue
-        pr = glob[q, rest].astype(np.float64)
-        nb_pos = g[[edg_idx_map[int(n)] for n in nb.tolist()]]   # node REST POSES (carried or observed)
-        d = np.linalg.norm(nb_pos - pr[None, :], axis=1)
-        if np.any(d <= 1e-8):
-            w = np.zeros_like(d); w[int(np.argmin(d))] = 1.0
-        else:
-            w = 1.0 / (d + 1e-8); w = w / w.sum()
-        kp_neighbors[q] = nb
-        kp_weights[q] = w.astype(np.float64)
-        kp_rest[q] = pr
-        for f in frames.tolist():
-            if valid[q, f]:
-                dyn_kp_idx.append(q); dyn_frame.append(int(f)); dyn_global.append(glob[q, f])
-    if not dyn_kp_idx:
+    # batched over the candidates with the same number of present assigned nodes K (speed only; the same arrays and
+    # the same per-row norm / sum as one keypoint at a time, in candidate order)
+    loc = np.full(D["Q"], -1, dtype=int); loc[present] = np.arange(M)    # global id -> row of g (-1 = not present)
+    A = D["dyn_assign"][cand_q]                                            # assigned nodes, -1 padded
+    keep = (A >= 0) & (loc[np.maximum(A, 0)] >= 0)                         # ... that are present (assignment order)
+    cnt = keep.sum(1)
+    ok = cnt >= 2                                                          # solver needs >= 2 neighbours
+    nb_rows, w_rows, pr_rows = [None] * cand_q.size, [None] * cand_q.size, [None] * cand_q.size
+    for K in np.unique(cnt[ok]).tolist():
+        r = np.nonzero(ok & (cnt == K))[0]
+        nb = A[r][keep[r]].reshape(-1, K)
+        pr = glob[cand_q[r], rest].astype(np.float64)
+        nb_pos = g[loc[nb]]                                               # node REST POSES (carried or observed)
+        d = np.linalg.norm(nb_pos - pr[:, None, :], axis=2)
+        near = (d <= 1e-8).any(1)
+        w = np.zeros_like(d); w[near, np.argmin(d[near], axis=1)] = 1.0
+        wf = 1.0 / (d[~near] + 1e-8); w[~near] = wf / wf.sum(1, keepdims=True)
+        for i, ri in enumerate(r.tolist()):
+            nb_rows[ri], w_rows[ri], pr_rows[ri] = nb[i], w[i], pr[i]
+    qs = cand_q[ok]
+    for i, q in zip(np.nonzero(ok)[0].tolist(), qs.tolist()):
+        kp_neighbors[q] = nb_rows[i]
+        kp_weights[q] = w_rows[i]
+        kp_rest[q] = pr_rows[i]
+    oi, ti = np.nonzero(valid[qs][:, frames])                              # (keypoint, frame) in candidate order
+    if not oi.size:
         return None
-    dyn_kp_idx = np.array(dyn_kp_idx, dtype=int)
-    dyn_frame = np.array(dyn_frame, dtype=int)
-    dyn_global = np.array(dyn_global, dtype=np.float64)
+    dyn_kp_idx = qs[oi].astype(int)
+    dyn_frame = frames[ti].astype(int)
+    dyn_global = glob[qs[oi], frames[ti]].astype(np.float64)
 
     return dict(edges=edges, edg_idx_map=edg_idx_map, g=g, edg_obs=edg_obs, edg_obs_mask=edg_obs_mask,
                 N_dyn_obs=int(dyn_kp_idx.size), dyn_kp_idx=dyn_kp_idx, dyn_frame=dyn_frame,

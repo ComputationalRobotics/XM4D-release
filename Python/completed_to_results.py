@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 import utils.definitions
+from utils.io import savez_compressed_fast
 
 
 def hold_fill(arr):
@@ -29,16 +30,19 @@ def hold_fill(arr):
         return arr, True
     out = arr.copy()
     pos = np.arange(arr.shape[0])
-    nearest = idx[np.abs(pos[:, None] - idx[None, :]).argmin(1)]
+    j = np.searchsorted(idx, pos)                                     # idx[j-1] < pos <= idx[j]
+    lo, hi = idx[np.maximum(j - 1, 0)], idx[np.minimum(j, idx.size - 1)]
+    nearest = np.where(pos - lo <= hi - pos, lo, hi)                  # ties -> the earlier frame, as argmin did
     out[~fin] = arr[nearest[~fin]]
     return out, True
 
 
-def convert(completed_path, base_path, out_path):
+def convert(completed_path, base_path, out_path, comp=None):
     """Write `out_path` = the completed EDG (from edg_completed.npz `completed_path`) in the results_all.npz
     contract, carrying every non-EDG key over from `base_path` unchanged. Safe when out_path == base_path
-    (the base is fully materialised into memory before writing). Returns (n_edg_nodes, n_dyn_tracks)."""
-    comp = np.load(str(completed_path))
+    (the base is fully materialised into memory before writing). `comp`: the completed arrays when the caller
+    still holds them (skips re-reading the file). Returns (n_edg_nodes, n_dyn_tracks)."""
+    comp = np.load(str(completed_path)) if comp is None else comp
     node_ids = np.asarray(comp["node_ids"], dtype=int)
     er = np.asarray(comp["edg_reconstruct"], dtype=np.float64)        # [M,T,3]
     ero = np.asarray(comp["edg_rotation"], dtype=np.float64)          # [M,T,3,3]
@@ -69,10 +73,10 @@ def convert(completed_path, base_path, out_path):
     out["edg_reconstruct"] = np.array(edg_tracks, dtype=object)
     out["edg_rotation"] = np.array(edg_rots, dtype=object)
     out["dynamics_points_reconstruct"] = np.array(dyn_tracks, dtype=object)
-    if "edg_edges" in comp.files:                                     # topology edges among the new nodes
+    if "edg_edges" in comp:                                           # topology edges among the new nodes
         out["edg_edges_union"] = np.asarray(comp["edg_edges"], dtype=np.int64).reshape(-1, 2)
 
-    np.savez_compressed(str(out_path), **out)
+    savez_compressed_fast(str(out_path), **out)
     T = er.shape[1]
     print(f"[convert] {out_path}: {len(edg_tracks)} EDG nodes (hold-filled {n_filled} node-frames), "
           f"{len(dyn_tracks)} dyn tracks, T={T}; base keys carried: "

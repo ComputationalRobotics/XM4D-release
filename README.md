@@ -203,6 +203,7 @@ For a scene without any moving object, set `"no_masks": true` in `config.json`.
 
 ```bash
 cd Python
+export NUMPY_MADVISE_HUGEPAGE=0      # see below
 
 conda activate da3
 python get_depths_clean.py           # 1. monocular depth (Depth Anything 3) -> outputs/depth_anything_3/
@@ -227,9 +228,22 @@ python ../build/gsplat_examples/simple_trainer.py default --data-dir ../datasets
     --edg-results ../datasets/<scene>/outputs/results_all.npz --edg-target-frame 0
 ```
 
+Steps 1–5 also run as one command from the repository root, `bash run_pipeline.sh`. It starts the steps that do not
+wait for each other at the same time: with two GPUs, step 1 and then step 3 on the first, the two trackers of step 2
+on the second (the moving-object tracker waits for the depth only for its 3D lift); with one GPU, step 3 next to the
+moving-object tracker. Each step runs in its conda environment (`DA3_ENV`, `TAPNET_ENV`, `XM_ENV`; `xm4d` for all three
+with the one-environment install), its output goes to `outputs/logs/run_<step>.log`, and `SEQUENTIAL=1` runs the steps
+one after the other. It checks and merges the masks first (`check_masks.py`), and with `"no_masks": true` it stops after
+step 3. It also sets `NUMPY_MADVISE_HUGEPAGE=0`: on our workstation numpy's requests for huge pages for
+big arrays stalled for seconds in memory compaction (step 5 took 233 s instead of 139 s); set it too when you run the
+steps one by one. On DyCheck teddy (472 frames), steps 1–4 took 3.0 min with two GPUs and 4.6 min with one; the same
+steps one by one took 10.9 min with the previous release (15.3 min without `NUMPY_MADVISE_HUGEPAGE=0`). Steps 1–5 took
+3.3 and 4.8 min (12.9 before).
+
 Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 2 writes its visualisation videos (`outputs/viz_*.mp4`) and the
-unfiltered static tracks (`outputs/tracks_debug.npz`), and step 3 its lifted tracks (`tracks_debug_3d_solver.npz`) and
-XM matrices (`Abar.bin`, `Q.mat`), only with `"DEBUG": true` in `config.json`. Step 6 reads its training settings
+unfiltered static tracks (`outputs/tracks_debug.npz`), step 3 its lifted tracks (`tracks_debug_3d_solver.npz`) and
+XM matrices (`Abar.bin`, `Q.mat`), and step 5 its depth-check and density images and videos (`dyn_depth_reject*`,
+`dyn_density_2d*`), only with `"DEBUG": true` in `config.json`. Step 6 reads its training settings
 (learning rates, loss weights, `max_steps`, `steps_scaler`) from `config.json` too; a command-line flag overrides them.
 
 Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's per-frame focals, with the principal
@@ -247,10 +261,12 @@ Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving 
   its longest stable part. With 20000 points it used up to about 45 GB of GPU memory on our videos (nvidia-smi),
   independent of the video length.
 - Moving objects: every `ALLTRACKER_KEYFRAME` frames (default 10), AllTracker adds points on a grid on the object
-  wherever no tracked point is visible nearby and tracks them forward in one dense pass at `ALLTRACKER_RES` px (512),
+  wherever no tracked point is visible nearby and tracks them forward in one dense pass at `ALLTRACKER_RES` px (384),
   to the end of the video. A point counts as visible while visibility × confidence is at least
   `ALLTRACKER_VIS_THRESHOLD` (0.6). `DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at the
-  tracking resolution. Each pass costs the same however few points it adds; `ALLTRACKER_MIN_NEW` (0, off) skips a
+  tracking resolution. At 384 px AllTracker tracked DyCheck's human keypoints as well as at 512 px (73.2 vs 72.9%
+  within 16 px) in 1.6 times less time per pass, and the coarser grid gives fewer points (teddy: 30k instead of 50k).
+  Each pass costs the same however few points it adds; `ALLTRACKER_MIN_NEW` (0, off) skips a
   keyframe that would add fewer new points than this share of the points visible there. On DyCheck, 0.05 made this
   tracking 1.4 times faster again but left up to 2% more of the object untracked.
 
@@ -265,20 +281,24 @@ Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauc
 (`CERES_OPTIMIZE_INTRINSICS`). Videos of at most 100 frames with at least 60 landmarks per frame use Ceres' dense
 Schur solver, all others the iterative one (`XM_CERES_LINEAR_SOLVER` forces either). On our 13 test videos of at most
 100 frames this made step 3 2.4 times faster (239 → 99 s) with the same cameras, except Sintel market_6 (position
-error 0.0095 → 0.0087, rotation error 0.025 → 0.035).
+error 0.0095 → 0.0087, rotation error 0.025 → 0.035). Ceres stops when an iteration lowers the cost by less than
+`CERES_FUNCTION_TOLERANCE` (1e-4) of it; Ceres' default 1e-6 took 2.7 to 3.7 times longer on our 16 test videos
+(316 → 85–118 s of Ceres) for the same cameras, except Syn4D casa4 (rotation error 0.0076 → 0.0083).
 
 Step 4 builds and solves the embedded deformation graph (EDG) of the moving objects:
 
 - `smooth_dynamic_tracks.py`: with the cameras fixed, each moving point's 3D track keeps its 2D track (Cauchy, 2 px)
   and its depth (10%, weaker) and is smooth in time (acceleration, `SMOOTH_SIGMA_ACC` = 3 px per frame²). Without it
-  the per-frame depth noise makes the graph zig-zag.
+  the per-frame depth noise makes the graph zig-zag. Its output is not compressed (1.3 GB on teddy), which saves
+  about 20 s here and a second in each of the four steps that read it.
 - `edg_topology.py`: graph nodes are tracks that already describe their neighbourhood: a fast-moving node removes the
   tracks within 0.4 of its motion radius, a slow one the tracks that keep a nearly constant distance to it; up to
   `EDG_MAX_NODES` (200). Two nodes are joined when they move together (score of their typical distance and their
   relative motion) at a nearly constant distance. Each moving point joins its two nearest nodes that stay close in
   every frame they share.
 - `EDG_test_fast.py`: the graph's motion over many short windows, each solved by XM; `complete_edg_table.py` turns
-  them into one motion over every frame (as-rigid-as-possible over gaps of 1 to 256 frames, smooth in time).
+  them into one motion over every frame (as-rigid-as-possible over gaps of 1 to 256 frames, smooth in time; 200 Adam
+  iterations: 400 lowered its final reprojection error by only 0.02 px on teddy).
 
 Step 5 lifts the moving-object depth pixels of every frame and binds each one to the graph at its own frame. With
 `DYN_BIND` `"motion"` (default) a pixel takes the nodes that best carry the track seen within `DYN_BIND_PX` px (3)

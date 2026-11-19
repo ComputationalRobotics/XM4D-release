@@ -422,22 +422,31 @@ def _assemble_normal_eqs_vec(*, edges, edg_idx_map, g, edg_obs, edg_obs_mask, N_
 
 	c = 0.0
 	# ---- observations: x_obs ~ sum_n w_n (R_{j_n,t} (x_rest - g_{j_n}) + g_{j_n} + p_{j_n,t})
-	by_k = {}
-	for k in range(N_dyn_obs):
-		kp = int(dyn_kp_idx[k])
-		if int(frame_to_trev[int(dyn_frame[k])]) == 1 or kp not in kp_neighbors or kp not in kp_weights or kp not in kp_rest:
-			continue
-		by_k.setdefault(len(kp_neighbors[kp]), []).append(k)
+	# observations used (t_rev > 1, keypoint known) grouped by neighbour count K, in observation order; the per-keypoint
+	# rows (node indices, weights, rest point) are built once per keypoint and gathered per observation (speed only)
+	ukp, inv = np.unique(np.asarray(dyn_kp_idx[:N_dyn_obs]).astype(np.int64), return_inverse=True)
+	ufr, finv = np.unique(np.asarray(dyn_frame[:N_dyn_obs]).astype(np.int64), return_inverse=True)
+	tr_all = np.array([int(frame_to_trev[int(f)]) for f in ufr.tolist()], dtype=np.int64)[finv.ravel()]
+	inv = inv.ravel()
+	K_kp = np.array([len(kp_neighbors[kp]) if kp in kp_neighbors and kp in kp_weights and kp in kp_rest else -1
+	                 for kp in ukp.tolist()], dtype=np.int64)
+	sel = np.nonzero((tr_all != 1) & (K_kp[inv] >= 0))[0]
+	K_sel = K_kp[inv[sel]]
+	uK, first = np.unique(K_sel, return_index=True)
+	by_k = {int(K): sel[K_sel == K] for K in uK[np.argsort(first)].tolist()}
 	dyn_global = np.asarray(dyn_global, dtype=float)
 	M_o = g.shape[0]; keys, Ds, us, vs, ss = [], [], [], [], []       # observation blocks summed per (node, node, frame)
 	for K, kk_all in by_k.items():
+		rows = np.unique(inv[kk_all]); kpsK = ukp[rows].tolist()
+		pos = np.full(ukp.size, -1, dtype=np.int64); pos[rows] = np.arange(rows.size)
+		js_K = np.array([[edg_idx_map[int(n)] for n in kp_neighbors[x]] for x in kpsK], dtype=np.int64).reshape(-1, K)
+		w_K = np.array([np.asarray(kp_weights[x], dtype=float) for x in kpsK]).reshape(-1, K)
+		xr_K = np.array([np.asarray(kp_rest[x], dtype=float).reshape(3) for x in kpsK])
 		step = max(1, int(2e7 // (12 * K) ** 2))
 		for c0 in range(0, len(kk_all), step):
-			kk = np.array(kk_all[c0:c0 + step]); kps = [int(x) for x in dyn_kp_idx[kk]]
-			tr = np.array([frame_to_trev[int(f)] for f in dyn_frame[kk]], dtype=np.int64)
-			js = np.array([[edg_idx_map[int(n)] for n in kp_neighbors[x]] for x in kps], dtype=np.int64).reshape(-1, K)
-			w = np.array([np.asarray(kp_weights[x], dtype=float) for x in kps]).reshape(-1, K)
-			xr = np.array([np.asarray(kp_rest[x], dtype=float).reshape(3) for x in kps])
+			kk = kk_all[c0:c0 + step]; rk = pos[inv[kk]]
+			tr = tr_all[kk]
+			js, w, xr = js_K[rk], w_K[rk], xr_K[rk]
 			d = xr[:, None, :] - g[js]                             # (N,K,3)
 			C = np.zeros((len(kk), 3, 12 * K))
 			for n in range(K):
@@ -515,6 +524,17 @@ def _assemble_normal_eqs_vec(*, edges, edg_idx_map, g, edg_obs, edg_obs_mask, N_
 			add(np.concatenate([st[jt, tt][:, None] + np.arange(n), st[jt, tt + 1][:, None] + np.arange(n)], 1),
 			    np.broadcast_to(2.0 * w_smooth * CC.T @ CC, (jt.size, 2 * n, 2 * n)), np.zeros((jt.size, 2 * n)))
 	return I_l, J_l, V_l, q, c
+
+
+_WORK = {}                                                         # dense work arrays kept across solves (speed only)
+
+
+def _work(name, shape, order="C"):
+	"""Uninitialised float64 array of `shape` on memory kept from earlier solves: no fresh pages per segment."""
+	n = int(np.prod(shape))
+	if name not in _WORK or _WORK[name].size < n:
+		_WORK[name] = np.empty(n)
+	return _WORK[name][:n].reshape(shape, order=order)
 
 
 def solve_qcqp_and_recover_until_part5(
@@ -843,14 +863,16 @@ def solve_qcqp_and_recover_until_part5(
 
 	if use_dense:
 		print(f"  Using dense solve for Qww (n={qww_n}, ~{est_dense_mb:.1f} MB)")
-		Qww_dense = Qww_reg.toarray()
-		Qwy_dense = Qwy_csc[:, 0::3].toarray()                   # XM takes Qred[0::3, 0::3] only: solve for those columns (2026-11-16)
+		Qww_dense = Qww_reg.toarray(out=_work("Qww", Qww_reg.shape, "F"))      # Fortran (csc) order, as toarray()
+		Qwy3 = Qwy_csc[:, 0::3]                                  # XM takes Qred[0::3, 0::3] only: solve for those columns (2026-11-16)
+		Qwy_dense = Qwy3.toarray(out=_work("Qwy", Qwy3.shape, "F"))           # both factored / solved in place below
 		try:                                                     # Qww is symmetric positive definite: Cholesky (2026-11-16, speed)
 			from scipy.linalg import cho_factor, cho_solve
-			cf = cho_factor(Qww_dense, lower=True, check_finite=False)
-			X = cho_solve(cf, Qwy_dense, check_finite=False).astype(float)
+			cf = cho_factor(Qww_dense, lower=True, overwrite_a=True, check_finite=False)
+			X = cho_solve(cf, Qwy_dense, overwrite_b=True, check_finite=False)
 			v = cho_solve(cf, qw, check_finite=False).astype(float)
 		except np.linalg.LinAlgError:
+			Qww_dense, Qwy_dense = Qww_reg.toarray(), Qwy_csc[:, 0::3].toarray()   # (may be overwritten above)
 			X = np.linalg.solve(Qww_dense, Qwy_dense).astype(float)
 			v = np.linalg.solve(Qww_dense, qw).astype(float)
 	else:
@@ -861,25 +883,38 @@ def solve_qcqp_and_recover_until_part5(
 		except Exception:
 			X = spsolve(Qww_reg, Qwy_csc[:, 0::3].tocsc()).astype(float)
 			v = spsolve(Qww_reg, qw).astype(float)
-	if use_dense:
-		Qred = (Qyy[0::3, 0::3] - sp.csr_matrix(Qyw[0::3, :] @ X)).tocsr()
+	if use_dense:                                                  # dense: the same values as the csr round trip (speed only)
+		Qyy3 = Qyy[0::3, 0::3]
+		Qred = Qyy3.toarray(out=_work("Qred", Qyy3.shape))
+		Xc = _work("Xc", X.shape)                                  # X in row order (the sparse product would copy it
+		Xc[...] = X                                                # to a fresh array)
+		Qred -= Qyw[0::3, :] @ Xc
 	else:
 		Qred = (Qyy[0::3, 0::3] - Qyw[0::3, :] @ X).tocsr()
 	qred = (qy - (Qyw @ v)).astype(float)
-
-	Qred = 0.5 * (Qred + Qred.T)
-	Q_XM = Qred                                                    # = the full Schur complement's [0::3, 0::3]
 	q_XM = qred.reshape(-1, 3)
 
-	I3 = sp.eye(3, format="csc")
-	Q_all = sp.bmat([[c_float * I3, q_XM.T], [q_XM, Q_XM]], format="csc").toarray()
+	n3 = q_XM.shape[0]                                             # Q_all = [[c I3, q_XM^T], [q_XM, Q_XM]], built dense
+	Q_all = _work("Q_all", (n3 + 3, n3 + 3))
+	Q_all[:3, :3] = c_float * np.eye(3)
+	Q_all[:3, 3:] = q_XM.T
+	Q_all[3:, :3] = q_XM
+	Q_XM = Q_all[3:, 3:]                                           # = the full Schur complement's [0::3, 0::3]
+	if use_dense:
+		np.add(Qred, Qred.T, out=Q_XM)                             # = 0.5 * (Qred + Qred.T)
+		Q_XM *= 0.5
+	else:
+		Q_XM[...] = (0.5 * (Qred + Qred.T)).toarray()
+	Q_all += 0.0                                                   # -0.0 -> +0.0, as the sparse bmat -> toarray gave
 
 	os.makedirs(output_dir, exist_ok=True)
 	filename_C = os.path.join(output_dir, "Q.bin")
-	with open(filename_C, "wb") as file:
+	# rewritten in place and then cut to size: the same bytes without freeing + reallocating the file per solve (speed only)
+	with os.fdopen(os.open(filename_C, os.O_WRONLY | os.O_CREAT, 0o666), "wb") as file:
 		file.write(np.array(Q_all.shape[0], dtype=np.int32).tobytes())
 		file.write(np.array(Q_all.shape[1], dtype=np.int32).tobytes())
-		Q_all.astype(np.float64).tofile(file)
+		Q_all.tofile(file)
+		file.truncate()
 
 	solve_Ronly_fn(output_dir, int(solver_rank), float(solver_tol), float(solver_mu), float(solver_max_iter))
 
@@ -907,16 +942,10 @@ def solve_qcqp_and_recover_until_part5(
 
 	R_real = _ensure_R_real_shape(R_real, n_poses)
 
-	y_est = np.zeros(ny, dtype=float)
-	pose = 0
-	for j in range(M):
-		for t in range(2, T_rev + 1):
-			blk = R_real[3 * pose : 3 * pose + 3, :]
-			R_jt = blk.T
-			s0 = int(R_start[j, t])
-			y_est[s0 : s0 + 9] = R_jt.reshape(9, order="F")
-			pose += 1
-	assert pose == n_poses
+	# R_start[j, t] = 9 * pose (pose = j * (T_rev - 1) + t - 2): y_est[R_start[j, t]:+9] = R_jt in column order = the pose's
+	# 3x3 block of R_real in row order -> one reshape (speed only)
+	y_est = R_real.reshape(-1).copy()
+	assert y_est.size == ny
 	print(f"Converted XM rotations to y_est with ny={ny} (poses={n_poses})")
 
 	rhs = (Qwy @ y_est) + qw
@@ -936,14 +965,8 @@ def solve_qcqp_and_recover_until_part5(
 	p_edg[:, 0, :] = 0.0
 	R_edg[:, 0, :, :] = np.eye(3)[None, :, :]
 
-	for j in range(M):
-		for t in range(2, T_rev + 1):
-			s_p = int(p_start[j, t])
-			w0 = s_p - ny
-			p_edg[j, t - 1, :] = w_est[w0 : w0 + 3]
-
-			s_R = int(R_start[j, t])
-			R_edg[j, t - 1, :, :] = y_est[s_R : s_R + 9].reshape(3, 3, order="F")
+	p_edg[:, 1:, :] = w_est.reshape(M, T_rev - 1, 3)              # p_start[j, t] - ny = 3 * pose (same layout)
+	R_edg[:, 1:, :, :] = R_real.reshape(M, T_rev - 1, 3, 3).transpose(0, 1, 3, 2)
 
 	print(f"Organized rotations/translations: R_edg {R_edg.shape}, p_edg {p_edg.shape}")
 
@@ -952,32 +975,33 @@ def solve_qcqp_and_recover_until_part5(
 	Nd_final = len(unique_kps_final)
 	dyn_mapped = np.zeros((Nd_final, T_rev, 3), dtype=float)
 
+	# batched over the keypoints with the same neighbour count (speed only): the same per-element operations in the
+	# same order (x_def = 0; x_def += w_n (R_jt @ (x_rest - g_j) + g_j + p_jt) for n = 0..K-1; the stacked matmul runs
+	# the same BLAS gemv per 3x3 block)
 	missing_rest = 0
+	by_K = {}
 	for kp_i, kp in enumerate(unique_kps_final.tolist()):
 		if kp not in kp_rest:
 			missing_rest += 1
 			continue
-		x_rest = kp_rest[kp].reshape(3,)
-
-		neigh_ids = np.asarray(kp_neighbors[kp], dtype=int)
-		wts = np.asarray(kp_weights[kp], dtype=float)
-
-		for t in range(1, T_rev + 1):
-			x_def = np.zeros((3,), dtype=float)
-			for n in range(len(neigh_ids)):
-				nid = int(neigh_ids[n])
-				if nid not in edg_idx_map:
-					continue
-				j = int(edg_idx_map[nid])
-				wj = float(wts[n])
-				g_j = g[j, :]
-
-				R_jt = R_edg[j, t - 1, :, :]
-				p_jt = p_edg[j, t - 1, :]
-
-				x_def += wj * (R_jt @ (x_rest - g_j) + g_j + p_jt)
-
-			dyn_mapped[kp_i, t - 1, :] = x_def
+		by_K.setdefault(len(kp_neighbors[kp]), []).append(kp_i)
+	for K, rows in by_K.items():
+		if K == 0:                                                     # no neighbours -> stays 0
+			continue
+		kps = unique_kps_final[rows].tolist()
+		x_rest = np.array([np.asarray(kp_rest[kp], dtype=float).reshape(3,) for kp in kps]).reshape(-1, 3)
+		nids = np.array([np.asarray(kp_neighbors[kp], dtype=int) for kp in kps], dtype=int).reshape(-1, K)
+		wts = np.array([np.asarray(kp_weights[kp], dtype=float) for kp in kps], dtype=float).reshape(-1, K)
+		js = np.array([[edg_idx_map.get(int(nid), -1) for nid in r] for r in nids.tolist()], dtype=np.int64).reshape(-1, K)
+		x_def = np.zeros((len(rows), T_rev, 3), dtype=float)
+		for n in range(K):
+			j = js[:, n]; has = j >= 0                               # neighbours outside the graph are skipped
+			if not has.any():
+				continue
+			jn, g_j = j[has], g[j[has]]
+			Rv = np.matmul(R_edg[jn], (x_rest[has] - g_j)[:, None, :, None])[..., 0]       # (N,T_rev,3)
+			x_def[has] += wts[has, n][:, None, None] * (Rv + g_j[:, None, :] + p_edg[jn])
+		dyn_mapped[rows] = x_def
 
 	print(f"Mapped {Nd_final} keypoints across {T_rev} time steps (missing rest={missing_rest})")
 	edg_deformed = g[:, None, :] + p_edg

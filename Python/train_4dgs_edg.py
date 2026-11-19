@@ -15,6 +15,7 @@ import glob
 import os
 import shlex
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -76,6 +77,10 @@ DA3_OUTLIER_STD_RATIO = 2.0  # remove if mean_k_dist > global_mean + ratio * glo
 # (object silhouettes) that lift into "flying-pixel curtains" between fg/bg and break at novel
 # views. 0 = off (legacy). Sweep ~0.05-0.2. Mirrors the GT path's DEPTH_GRAD_MAX filter.
 DA3_DEPTH_GRAD_MAX = float(os.environ.get("DA3_DEPTH_GRAD_MAX", "0.0"))
+DEBUG = dataset_config.get_bool("DEBUG", False, env="DEBUG")  # also write the depth-reject/density png, npz, videos
+# Threads of the KD-tree queries and per-frame loops (the results do not depend on them). workers=-1 spawns a thread per
+# core (huge overhead for the many small per-frame queries on a big machine).
+N_WORKERS = 16
 
 
 def _as_track_array(track_dict: Dict[int, np.ndarray], T: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -316,10 +321,10 @@ def _density_adaptive_downsample(pts, target_n, seed=0):
     if target_n <= 0 or n <= int(target_n):
         return np.arange(n)
     tree = cKDTree(pts)
-    d, _ = tree.query(pts, k=min(2, n))
+    d, _ = tree.query(pts, k=min(2, n), workers=-1)   # one big query: every core (same result)
     nn = d[:, 1] if d.ndim == 2 and d.shape[1] > 1 else np.ones(n)
     r = max(float(np.median(nn[np.isfinite(nn)])) * 3.0, 1e-9)
-    dens = np.asarray(tree.query_ball_point(pts, r, return_length=True), np.float64)
+    dens = np.asarray(tree.query_ball_point(pts, r, return_length=True, workers=-1), np.float64)
     dens = np.maximum(dens, 1.0)                       # local density (incl self); sparse -> small
     rng = np.random.default_rng(seed); u = rng.random(n)
     lo, hi, keep = 0.0, float(dens.max()), np.arange(n)
@@ -386,13 +391,17 @@ def _save_dyn_density_2d(output_dir, knn, w, rel, er, ero, R_raw, t_raw, K_all, 
         print(f"[dyn-density] viz failed (continuing): {exc}")
 
 
-def _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_cand=12, min_frames=3):
+def _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_cand=12, min_frames=3, n_tracks=None):
     """For DYN_BIND = "motion": per moving-point track (the tracks the EDG was built from), the K EDG nodes whose rigid
     motion carries it best: among the n_cand nodes nearest to the track at its first seen frame, the K with the smallest
     spread of the local coordinate R_m(f)^T (x(f) - X_m(f)) over the track's frames; weights 1 / spread.
-    Returns (xy (Q,T,2) image px, seen (Q,T), nodes (Q,K) node index or -1, weights (Q,K))."""
-    z = np.load(utils.definitions.dynamic_tracks_for_edg(), allow_pickle=True)
+    Returns (xy (Q,T,2) image px, seen (Q,T), nodes (Q,K) node index or -1, weights (Q,K)).
+    n_tracks: the track count the EDG was built from (its stamp); a different count means stale step-4 outputs."""
+    tracks_path = utils.definitions.dynamic_tracks_for_edg()
+    z = np.load(tracks_path, allow_pickle=True)
     xy = z["tracks_xy"][0].astype(np.float64); xyz = z["tracks_xyz"][0].astype(np.float64); Q = xy.shape[0]
+    if n_tracks is not None and Q != int(n_tracks):
+        raise ValueError(f"{tracks_path.name} has {Q} tracks but the EDG was built from {n_tracks}: rerun steps 4a-4d")
     T = min(xy.shape[1], er.shape[1], R_raw.shape[0])
     sc = np.ones(T) if frame_scales is None else np.where(np.isfinite(frame_scales[:T]), frame_scales[:T], 1.0)
     Xw = np.einsum("tij,qtj->qti", np.asarray(R_raw[:T], np.float64) * sc[:, None, None], xyz[:, :T]) + np.asarray(t_raw[:T], np.float64)[None]
@@ -401,7 +410,8 @@ def _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_cand=12, min_f
         vis &= z["dynamic_obs_mask"][:, :T].astype(bool)
     nodes = np.full((Q, K), -1, np.int64); wts = np.zeros((Q, K))
     ok = np.where(vis.sum(1) >= min_frames)[0]
-    for c0 in range(0, len(ok), 512):
+
+    def chunk(c0):   # tracks ok[c0:c0 + 512] -> their rows of nodes / wts
         q = ok[c0:c0 + 512]; vq = vis[q]; f0 = vq.argmax(1)
         d = np.linalg.norm(er[:, f0].transpose(1, 0, 2) - Xw[q, f0][:, None], axis=-1)        # (B, M) at the first frame
         d = np.where(np.isfinite(d), d, np.inf); cand = np.argsort(d, axis=1)[:, :n_cand]       # (B, C)
@@ -413,6 +423,8 @@ def _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_cand=12, min_f
         res = np.where(np.isfinite(res), res, np.inf); o = np.argsort(res, axis=1)[:, :K]
         nodes[q] = np.take_along_axis(cand, o, 1)
         w = 1.0 / (np.take_along_axis(res, o, 1) + 1e-12); wts[q] = w / w.sum(1, keepdims=True)
+    with ThreadPoolExecutor(N_WORKERS) as ex:   # independent chunks (numpy releases the GIL), disjoint rows
+        list(ex.map(chunk, range(0, len(ok), 512)))
     return xy[:, :T], vis, nodes, wts
 
 
@@ -425,7 +437,7 @@ def _img_wh(path, _c={}):
 def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_raw, K_all,
                                        image_paths, er, ero, node_ids, w2t, target_frame,
                                        k_neighbors, target_points, stride=2, sigma_frac=1.5,
-                                       frame_scales=None):
+                                       frame_scales=None, n_tracks=None):
     """Densely lift dynamic-region depth pixels from EVERY frame to 3D, EDG-bind each at ITS OWN frame
     (rest frame = the frame it was lifted from: rel = R_m(t)^T (X - X_m(t))), colour from the image, then
     ADAPTIVE-DENSITY voxel-downsample (uniform 3D density) to ~target_points. Returns per-point arrays in
@@ -436,15 +448,18 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
     M, T = er.shape[0], er.shape[1]
     K = int(k_neighbors)
     Tn = min(int(depth_maps.shape[0]), int(R_raw.shape[0]), int(K_all.shape[0]), len(image_paths), T)
-    Xw_all, rgb_all, knn_all, w_all, rel_all, sk_all = [], [], [], [], [], []
+    Xw_all, rgb_all, knn_all, w_all, rel_all, sk_all, pos_all = [], [], [], [], [], [], []
     # DYN_BIND "motion": a lifted pixel takes the nodes that best carry the track seen within DYN_BIND_PX px of it at its
     # frame (the nearest nodes in 3D often belong to another part and average its motion away); "nearest": K nearest nodes.
-    mot = _track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K) if DYN_BIND == "motion" else None
+    # (with fewer than K nodes no point can take K motion-fitted nodes: nearest nodes only)
+    mot = (_track_motion_nodes(er, ero, R_raw, t_raw, frame_scales, K, n_tracks=n_tracks)
+           if DYN_BIND == "motion" and M >= K else None)
     n_mot = 0
-    for t in range(Tn):
+
+    def frame(t):   # lift + bind frame t: (Xw, rgb, nl, w, rel, target-frame position, n motion-bound), None if empty
         present = np.where(np.isfinite(er[:, t]).all(1))[0]      # EDG nodes solved at frame t
-        if present.size < K:
-            continue
+        if present.size < min(K, M):                             # (a graph with fewer than K nodes binds to all of them)
+            return None
         dm = depth_maps[t].astype(np.float64); Hd, Wd = dm.shape
         msk = np.asarray(dynamic_masks[t], bool)
         if msk.shape != (Hd, Wd):
@@ -454,7 +469,7 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
         z = dm[yy, xx]
         ok = msk[yy, xx] & np.isfinite(z) & (z > 1e-6)
         if not ok.any():
-            continue
+            return None
         yy, xx, z = yy[ok], xx[ok], z[ok]
         if frame_scales is not None and t < len(frame_scales) and np.isfinite(frame_scales[t]):
             z = z * float(frame_scales[t])         # per-frame depth scale: world = R@(s*Xc)+t == (s*R)@Xc+t, as the
@@ -472,6 +487,7 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
         sigma = max(float(np.median(dist[:, 0])) * float(sigma_frac), 1e-6)
         w = np.exp(-(dist / sigma) ** 2); w /= np.clip(w.sum(1, keepdims=True), 1e-12, None)
         nl = present[nn]                                                  # node-ids-order local index (M-space)
+        n_hit = 0
         if mot is not None and t < mot[0].shape[1] and nl.shape[1] == K:   # the motion-fitted nodes of the nearest track
             tq = np.where(mot[1][:, t] & (mot[2][:, 0] >= 0))[0]
             wh = _img_wh(image_paths[t])
@@ -480,7 +496,7 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
                 dd, ii = cKDTree(mot[0][tq, t] / np.array([sxd, syd])).query(np.stack([xx, yy], 1).astype(np.float64))
                 hit = np.where(dd <= DYN_BIND_PX / sxd)[0]
                 hit = hit[np.isfinite(er[mot[2][tq[ii[hit]]], t]).all(-1).all(-1)]
-                nl[hit] = mot[2][tq[ii[hit]]]; w[hit] = mot[3][tq[ii[hit]]]; n_mot += hit.size
+                nl[hit] = mot[2][tq[ii[hit]]]; w[hit] = mot[3][tq[ii[hit]]]; n_hit = hit.size
         Xm = er[nl, t]; Rm = ero[nl, t]                                   # (N,K,3),(N,K,3,3)
         rel = np.einsum("nkji,nkj->nki", Rm, (Xw[:, None, :] - Xm))       # R_m(t)^T (X - X_m(t))
         img = cv2.imread(str(image_paths[t]), cv2.IMREAD_COLOR)
@@ -501,19 +517,25 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
             nl = np.concatenate([nl, np.repeat(nl[:, -1:], pad, 1)], 1)
             w = np.concatenate([w, np.zeros((w.shape[0], pad))], 1)
             rel = np.concatenate([rel, np.zeros((rel.shape[0], pad, 3))], 1)
-        Xw_all.append(Xw); rgb_all.append(rgb.astype(np.uint8))
-        knn_all.append(nl); w_all.append(w); rel_all.append(rel)
-        sk_all.append(np.full(Xw.shape[0], t, np.int64))
+        # init position = the point warped to the target frame (bind-frame-agnostic), then w2t -> target coords
+        warp_t = er[nl, target_frame] + np.einsum("nkij,nkj->nki", ero[nl, target_frame], rel)
+        pos = np.einsum("nk,nkd->nd", w, warp_t)                         # (N,3) solver, target frame
+        return Xw, rgb.astype(np.uint8), nl, w, rel, pos, n_hit
+    with ThreadPoolExecutor(N_WORKERS) as ex:   # independent frames (numpy/cv2/KD-tree release the GIL), in order
+        for t, res in enumerate(ex.map(frame, range(Tn))):
+            if res is None:
+                continue
+            Xw, rgb, nl, w, rel, pos, n_hit = res
+            Xw_all.append(Xw); rgb_all.append(rgb)
+            knn_all.append(nl); w_all.append(w); rel_all.append(rel); pos_all.append(pos)
+            sk_all.append(np.full(Xw.shape[0], t, np.int64)); n_mot += n_hit
     if not Xw_all:
         return (np.zeros((0, 3)), np.zeros((0, 3), np.uint8),
                 np.zeros((0, K), np.int64), np.zeros((0, K)), np.zeros((0, K, 3)), np.zeros((0,), np.int64))
     Xw_all = np.concatenate(Xw_all); rgb_all = np.concatenate(rgb_all)
     knn_all = np.concatenate(knn_all); w_all = np.concatenate(w_all)
     rel_all = np.concatenate(rel_all); sk_all = np.concatenate(sk_all)
-    # init positions = each point warped to the target frame (bind-frame-agnostic), then w2t -> target coords
-    Xm_t = er[knn_all, target_frame]; Rm_t = ero[knn_all, target_frame]
-    warp_t = Xm_t + np.einsum("nkij,nkj->nki", Rm_t, rel_all)
-    pos_target_solver = np.einsum("nk,nkd->nd", w_all, warp_t)           # (N,3) solver, target frame
+    pos_target_solver = np.concatenate(pos_all)                          # (N,3) solver, target frame (rows independent)
     finite = np.isfinite(pos_target_solver).all(1)
     keep = _density_adaptive_downsample(pos_target_solver[finite], int(target_points))
     gi = np.where(finite)[0][keep]
@@ -544,7 +566,7 @@ def _flyaway_reject(skin_fn, struct, T, k=8, std_ratio=3.0, frac=0.3, n_sample=2
             continue
         idx = np.where(fin)[0]
         tree = cKDTree(X[idx])
-        d, _ = tree.query(X[idx], k=k + 1)                       # includes self at col 0
+        d, _ = tree.query(X[idx], k=k + 1, workers=N_WORKERS)    # includes self at col 0
         mean_knn = d[:, 1:].mean(1)
         med = float(np.median(mean_knn))
         mad = float(np.median(np.abs(mean_knn - med))) * 1.4826 + 1e-9
@@ -569,7 +591,8 @@ def _depth_consistency_reject(sp, skin_fn, depth_maps, R_raw, t_raw, K_all,
     n_viol = np.zeros(P, np.int64)
     T = min(int(depth_maps.shape[0]), int(R_raw.shape[0]), int(K_all.shape[0]))
     gm = np.asarray(good_mask, bool)
-    for t in range(T):
+
+    def frame(t):   # (checked, violating) point masks of frame t, None if it checks nothing
         dm = depth_maps[t]
         Hd, Wd = dm.shape
         Xw = skin_fn(sp, t)                                   # (P,3) solver world
@@ -585,23 +608,27 @@ def _depth_consistency_reject(sp, skin_fn, depth_maps, R_raw, t_raw, K_all,
         ui = np.where(inb, u, 0).astype(np.int64); vi = np.where(inb, v, 0).astype(np.int64)
         inb &= (ui >= 0) & (ui < Wd) & (vi >= 0) & (vi < Hd)
         if not inb.any():
-            continue
+            return None
         dv = np.full(P, np.nan)
         dv[inb] = dm[vi[inb], ui[inb]]
         if frame_scales is not None and t < len(frame_scales) and np.isfinite(frame_scales[t]):
             dv = dv * float(frame_scales[t])       # scale the observed depth into the (s*R) world gauge
         valid = inb & np.isfinite(dv) & (dv > 1e-6)
         if not valid.any():
-            continue
+            return None
         # Per-frame scale between the point cloud's camera-z and the depth map (the solver world is
         # DA3-scaled, the depth map may be lidar/metric or a different scale). Normalize by the robust
         # median ratio so the test measures RELATIVE off-surface deviation, not a global scale offset.
         s_t = float(np.median(z[valid] / dv[valid]))
         if not np.isfinite(s_t) or s_t <= 1e-8:
-            continue
-        n_check[valid] += 1
+            return None
         rel = np.abs(z - s_t * dv) / np.clip(s_t * dv, 1e-6, None)
-        n_viol[valid & (rel > float(tol))] += 1
+        return valid, valid & (rel > float(tol))
+    with ThreadPoolExecutor(N_WORKERS) as ex:   # frames are independent (numpy releases the GIL), counts order-free
+        for res in ex.map(frame, range(T)):
+            if res is not None:
+                n_check[res[0]] += 1
+                n_viol[res[1]] += 1
     checked = n_check >= int(min_check)
     viol_frac = np.zeros(P)
     viol_frac[checked] = n_viol[checked] / np.clip(n_check[checked], 1, None)
@@ -786,18 +813,6 @@ def _build_edg_good_dynamic_points(
     dyn_ids = np.asarray(data["dyn_ids"], dtype=np.int64)
     dyn_reconstruct = np.asarray(data["dyn_reconstruct"], dtype=np.float64)
 
-    # Pick the right tracks table by the npz's n_tracks stamp (auto-switch is inside _load_2d_context).
-    stamp = int(data["n_tracks"]) if "n_tracks" in data.files else None
-    if stamp is None:
-        topo_p = Path(output_dir) / "edg_topology.npz"
-        if topo_p.exists():
-            topo = np.load(topo_p)
-            if "n_tracks" in topo.files and "edg_nodes" in topo.files:
-                tn = set(np.asarray(topo["edg_nodes"], int).tolist())
-                if set(node_ids.tolist()) <= tn:
-                    stamp = int(topo["n_tracks"])
-    ctx = _load_2d_context(True, stamp)
-
     # ---- PER-FRAME DENSE DEPTH LIFT (optional): fill coverage by lifting dynamic-mask depth pixels from
     # EVERY frame, EDG-binding each at its own frame, adaptive voxel density, THEN depth-reject floaters. ----
     if (lift_per_frame and depth_maps is not None and dynamic_masks is not None
@@ -808,7 +823,7 @@ def _build_edg_good_dynamic_points(
             image_paths=image_paths, er=er, ero=ero, node_ids=node_ids, w2t=w2t,
             target_frame=int(target_frame), k_neighbors=K,
             target_points=int(dyn_min_points) if int(dyn_min_points) > 0 else 50000,
-            frame_scales=frame_scales)
+            frame_scales=frame_scales, n_tracks=int(data["n_tracks"]) if "n_tracks" in data.files else None)
         if xyzL.shape[0] == 0:
             return (np.zeros((0, 3)), np.zeros((0, 3), np.uint8),
                     np.zeros((0, K), np.int64), np.zeros((0, K)), np.zeros((0, K, 3)))
@@ -832,10 +847,11 @@ def _build_edg_good_dynamic_points(
             n_rej = int(reject.sum())
             print(f"[dyn-lift] depth-reject: {n_rej}/{xyzL.shape[0]} lifted points floated off surface "
                   f"(>{100*float(depth_reject_frac):.0f}% frames) -> dropped; kept {xyzL.shape[0]-n_rej}.")
-            _save_depth_reject_overlay(output_dir, int(target_frame),
-                                       _apply_transform(xyzL, np.linalg.inv(w2t)),  # back to solver for proj
-                                       np.ones(xyzL.shape[0], bool), reject, R_raw, t_raw, K_all,
-                                       depth_maps, image_paths, sp=lifted, skin_fn=_lifted_skin)
+            if DEBUG:
+                _save_depth_reject_overlay(output_dir, int(target_frame),
+                                           _apply_transform(xyzL, np.linalg.inv(w2t)),  # back to solver for proj
+                                           np.ones(xyzL.shape[0], bool), reject, R_raw, t_raw, K_all,
+                                           depth_maps, image_paths, sp=lifted, skin_fn=_lifted_skin)
             keep = ~reject
             xyzL, rgbL, knnL, wL, relL, knnL_nl2 = (xyzL[keep], rgbL[keep], knnL[keep], wL[keep],
                                                     relL[keep], knnL_nl2[keep])
@@ -854,10 +870,22 @@ def _build_edg_good_dynamic_points(
             xyzL, rgbL, knnL, wL, relL, knnL_nl2 = (xyzL[k2], rgbL[k2], knnL[k2], wL[k2], relL[k2], knnL_nl2[k2])
         print(f"[dyn-lift] final dense dynamic cloud: {xyzL.shape[0]} points (per-frame lift + depth-reject "
               f"+ fly-away prune).")
-        if image_paths is not None:
+        if DEBUG and image_paths is not None:
             _save_dyn_density_2d(output_dir, knnL_nl2, wL, relL, er, ero, R_raw, t_raw, K_all,
                                  depth_maps, image_paths)
         return xyzL, rgbL.astype(np.uint8), knnL.astype(np.int64), wL, relL
+
+    # Pick the right tracks table by the npz's n_tracks stamp (auto-switch is inside _load_2d_context).
+    stamp = int(data["n_tracks"]) if "n_tracks" in data.files else None
+    if stamp is None:
+        topo_p = Path(output_dir) / "edg_topology.npz"
+        if topo_p.exists():
+            topo = np.load(topo_p)
+            if "n_tracks" in topo.files and "edg_nodes" in topo.files:
+                tn = set(np.asarray(topo["edg_nodes"], int).tolist())
+                if set(node_ids.tolist()) <= tn:
+                    stamp = int(topo["n_tracks"])
+    ctx = _load_2d_context(True, stamp)
 
     sp, pids = _build_dyn_skin(dyn_ids, dyn_reconstruct, node_ids, er, ero)
     if sp is None:
@@ -882,8 +910,8 @@ def _build_edg_good_dynamic_points(
           f"binding at each point's OWN rest frame (init positions fused to target frame {target_frame}).")
 
     # ---- DEPTH-CONSISTENCY REJECTION: drop points that float off the observed surface (violate the
-    # per-frame depth map in > depth_reject_frac of their checkable frames). Also saves a target-frame
-    # overlay marking kept (green) vs rejected (red). Skipped if depth/cameras unavailable or frac<=0.
+    # per-frame depth map in > depth_reject_frac of their checkable frames). With config DEBUG also saves a
+    # target-frame overlay marking kept (green) vs rejected (red). Skipped if depth/cameras unavailable or frac<=0.
     if (float(depth_reject_frac) > 0.0 and depth_maps is not None
             and R_raw is not None and t_raw is not None and K_all is not None):
         reject, viol_frac, n_check = _depth_consistency_reject(
@@ -892,7 +920,7 @@ def _build_edg_good_dynamic_points(
         n_rej = int((good & reject).sum())
         print(f"[edg-good] depth-reject: {n_rej}/{int(good.sum())} good points violate depth in "
               f">{100*float(depth_reject_frac):.0f}% of checkable frames (rel-tol {depth_reject_tol:g}) -> dropped.")
-        if image_paths is not None:
+        if DEBUG and image_paths is not None:
             _save_depth_reject_overlay(output_dir, target_frame,
                                        _skin_dyn_frame(sp, int(target_frame)),
                                        good.copy(), reject, R_raw, t_raw, K_all, depth_maps, image_paths,
@@ -1296,7 +1324,7 @@ def _statistical_outlier_mask(points: np.ndarray, k: int, std_ratio: float) -> n
     k = min(int(k), n - 1)
     if k < 1:
         return np.zeros(n, dtype=bool)
-    dists, _ = cKDTree(points).query(points, k=k + 1, workers=-1)
+    dists, _ = cKDTree(points).query(points, k=k + 1, workers=N_WORKERS)
     mean_dists = dists[:, 1:].mean(axis=1)   # skip self (col 0, dist=0)
     threshold = mean_dists.mean() + float(std_ratio) * mean_dists.std()
     return mean_dists > threshold
@@ -1308,6 +1336,13 @@ def _load_intrinsics_for_training(T: int) -> np.ndarray:
     # 4DGS dataset is internally consistent with the solver.
     root = Path(utils.definitions.rootpath)
     return _load_da3_intrinsics_for_depth_lifting(root, T)
+
+
+def _image_hw(path) -> tuple[int, int]:
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Failed to read image: {path}")
+    return img.shape[:2]
 
 
 def _export_colmap_text_dataset(
@@ -1329,11 +1364,10 @@ def _export_colmap_text_dataset(
     cameras = {}
     images = {}
     n_frames = min(len(image_paths), c2w_all.shape[0], K_all.shape[0])
+    with ThreadPoolExecutor(N_WORKERS) as ex:   # decoded on threads (cv2 releases the GIL), only for their size
+        hw = list(ex.map(_image_hw, image_paths[:n_frames]))
     for i in range(n_frames):
-        img = cv2.imread(str(image_paths[i]), cv2.IMREAD_COLOR)
-        if img is None:
-            raise RuntimeError(f"Failed to read image: {image_paths[i]}")
-        h, w = img.shape[:2]
+        h, w = hw[i]
         K = np.asarray(K_all[i], dtype=np.float64).reshape(3, 3)
         camera_id = i + 1
         cameras[camera_id] = {
@@ -1355,11 +1389,12 @@ def _export_colmap_text_dataset(
             "name": image_paths[i].name,
         }
 
+    xyz_list, rgb_list = points.tolist(), rgb.tolist()   # Python floats/ints: str() prints the same text, 3x faster
     points3D = {
         i + 1: {
             "id": i + 1,
-            "xyz": points[i].astype(np.float64),
-            "rgb": rgb[i].astype(np.uint8),
+            "xyz": xyz_list[i],
+            "rgb": rgb_list[i],
             "error": 0.0,
         }
         for i in range(points.shape[0])
@@ -1518,7 +1553,7 @@ def _lift_da3_static_points_to_target(
     else:
         frame_losses = np.asarray(frame_losses, dtype=np.float64)
 
-    for t in range(T):
+    def frame(t):   # (p_target, rgb, log line) of frame t, None if it keeps no point
         depth = depth_maps[t].astype(np.float32)
         K = K_da3_all[t].astype(np.float64)
         R = R_raw[t].astype(np.float64)
@@ -1545,7 +1580,7 @@ def _lift_da3_static_points_to_target(
             depth_grad = _compute_depth_grad(depth)
             ok &= depth_grad[yy, xx] <= float(DA3_DEPTH_GRAD_MAX)
         if not np.any(ok):
-            continue
+            return None
 
         yy = yy[ok]
         xx = xx[ok]
@@ -1564,7 +1599,7 @@ def _lift_da3_static_points_to_target(
         if black_removed:
             yy, xx, z, rgb = yy[nonblack], xx[nonblack], z[nonblack], rgb[nonblack]
         if z.shape[0] == 0:
-            continue
+            return None
 
         if z.shape[0] > int(max_points_per_frame):
             frame_rng = np.random.default_rng(seed + int(t))
@@ -1597,16 +1632,20 @@ def _lift_da3_static_points_to_target(
             rgb = rgb[~outlier]
 
         if p_world.shape[0] == 0:
-            continue
+            return None
 
         p_target = _apply_transform(p_world, w2t)
-        pts_all.append(p_target)
-        rgb_all.append(rgb)
-        print(
+        return p_target, rgb, (
             f"[da3-lift] frame={t}: kept={p_target.shape[0]} "
             f"scale={frame_scale:.6g} loss={frame_loss:.6g} "
             f"dyn_removed={int(np.count_nonzero(dyn))} black_removed={black_removed} outlier_removed={outlier_removed}"
         )
+    with ThreadPoolExecutor(N_WORKERS) as ex:   # independent frames (own seeded RNG; numpy/cv2/KD-tree release the GIL)
+        for res in ex.map(frame, range(T)):     # in frame order
+            if res is not None:
+                pts_all.append(res[0])
+                rgb_all.append(res[1])
+                print(res[2])
 
     if len(pts_all) == 0:
         return (
@@ -2041,14 +2080,7 @@ def prepare_4dgs_dataset(
             raise RuntimeError("Cannot bind EDG-good dynamics without EDG tracks.")
         _dyn_masks_for_lift = None
         if bool(dyn_lift_per_frame) and depth_maps is not None:
-            try:
-                _dyn_masks_for_lift = _load_dynamic_masks_for_depth(
-                    mask_dir=Path(utils.definitions.rootpath) / "masks",
-                    pattern=utils.definitions.mask_pattern,
-                    t_expected=depth_maps.shape[0],
-                    target_hw=(depth_maps.shape[1], depth_maps.shape[2]))
-            except Exception as _e:
-                print(f"[dyn-lift] could not load dynamic masks for per-frame lift: {_e}")
+            _dyn_masks_for_lift = dynamic_masks   # the static lift's masks (same files, frames and size)
         (dyn_xyz_target, dyn_rgb, dyn_knn_idx, dyn_knn_w, dyn_rel) = _build_edg_good_dynamic_points(
             output_dir=output_dir,
             target_frame=target_frame,
@@ -2413,7 +2445,7 @@ def main() -> None:
         default=0.3,
         help="(--dyn-source edg-good) reject a dynamic point that floats off the surface: if its warped "
              "depth violates the per-frame depth map in MORE than this fraction of its checkable frames, "
-             "drop it. Saves a target-frame overlay (kept=green, rejected=red). 0 disables.",
+             "drop it. With config DEBUG saves a target-frame overlay (kept=green, rejected=red). 0 disables.",
     )
     parser.add_argument(
         "--dyn-flyaway-std",
@@ -2432,7 +2464,7 @@ def main() -> None:
         help="(--dyn-source edg-good) build the dynamic cloud by DENSELY lifting dynamic-mask depth pixels "
              "from EVERY frame (EDG-bound at each point's own frame, adaptive voxel density to --dyn-min-points), "
              "then depth-rejecting floaters -- gives clean AND dense coverage (fixes the holes left by "
-             "good-track selection). Saves before/after depth videos.",
+             "good-track selection). With config DEBUG saves before/after depth videos.",
     )
     parser.add_argument(
         "--dyn-depth-reject-tol",

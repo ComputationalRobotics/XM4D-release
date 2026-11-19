@@ -46,6 +46,7 @@ Run (GPU torch lives in the `tapnet` env; no XM needed):
     XM_DATASET_NAME=<scene> conda run -n tapnet python complete_edg_table.py --merged [--iters 1000]
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,7 @@ import torch
 
 import utils.definitions
 from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
+from utils.io import savez_compressed_fast
 
 
 # --------------------------------------------------------------------------------------- data loading
@@ -195,7 +197,7 @@ def _load_dyn_mask_images(T, dilate_px):
         return None
     try:
         import cv2
-        from utils.track_tapnet import load_dynamic_masks, dilate_dynamic_masks
+        from utils.masks import load_dynamic_masks, dilate_dynamic_masks   # torch-free (utils.track_tapnet imports tapnet)
         image_paths = sorted(_glob.glob(str(Path(utils.definitions.video_dir) / utils.definitions.image_pattern)))
         H, W = cv2.imread(image_paths[0]).shape[:2]
         masks = load_dynamic_masks(str(mask_dir), utils.definitions.mask_pattern, t_expected=T,
@@ -514,22 +516,36 @@ def build_skinning(D, c_init):
     return tracks
 
 
+def pair_arrays(tracks, frames):
+    """Observations = (track i, frame t) for t in frames[i], track by track; pairs = each observation with every
+    neighbour of its track, in nb order. Returns per observation (track index, frame) and per pair (obs, node,
+    weight, frame, source frame, source point) -- the order the old nested append loops produced."""
+    n_f = np.array([f.size for f in frames], dtype=np.int64)
+    n_nb = np.array([tr["nb"].size for tr in tracks], dtype=np.int64)
+    o_i = np.repeat(np.arange(len(tracks)), n_f)                      # track of each observation
+    o_t = np.concatenate(frames).astype(np.int64)
+    n_p = n_nb[o_i]                                                   # pairs of each observation
+    p_o = np.repeat(np.arange(o_i.size), n_p)
+    p_first = np.cumsum(n_p) - n_p                                    # first pair of each observation
+    nb_first = np.cumsum(n_nb) - n_nb                                 # first neighbour of each track (flat)
+    j = (nb_first[o_i] - p_first)[p_o] + np.arange(p_o.size)          # flat neighbour index of each pair
+    p_i = o_i[p_o]
+    nb = np.concatenate([tr["nb"] for tr in tracks]).astype(np.int64)
+    w = np.concatenate([tr["w"] for tr in tracks])
+    sk = np.array([tr["sk"] for tr in tracks], dtype=np.int64)
+    xsrc = np.stack([tr["xsrc"] for tr in tracks])
+    return o_i, o_t, p_o, nb[j], w[j], o_t[p_o], sk[p_i], xsrc[p_i]
+
+
 def obs_pairs(tracks, glob, xy, device):
     """Flatten to per-(observation, neighbour) tensors so L_obs is one scatter-add. One observation = a
     (track, target-frame) pair; Phi is the neighbour-blend of the source->target warp. Also records each
     observation's frame + 2D pixel target (for the 2D reprojection loss on the warped point)."""
-    o_t, o_x, o_xy, p_o, p_m, p_w, p_t, p_s, p_xsrc = [], [], [], [], [], [], [], [], []
-    o = 0
-    for tr in tracks:
-        for t in tr["targets"].tolist():
-            o_t.append(t); o_x.append(glob[tr["k"], t]); o_xy.append(xy[tr["k"], t])
-            for mi in range(tr["nb"].size):
-                p_o.append(o); p_m.append(int(tr["nb"][mi])); p_w.append(float(tr["w"][mi]))
-                p_t.append(t); p_s.append(tr["sk"]); p_xsrc.append(tr["xsrc"])
-            o += 1
-    T_ = lambda a, dt: torch.as_tensor(np.asarray(a), dtype=dt, device=device)
-    return dict(O=o,
-                obs_x=T_(o_x, torch.float32), obs_xy=T_(o_xy, torch.float32),
+    o_i, o_t, p_o, p_m, p_w, p_t, p_s, p_xsrc = pair_arrays(tracks, [tr["targets"] for tr in tracks])
+    o_k = np.array([tr["k"] for tr in tracks], dtype=np.int64)[o_i]
+    T_ = lambda a, dt: torch.as_tensor(a, dtype=dt, device=device)
+    return dict(O=int(o_i.size),
+                obs_x=T_(glob[o_k, o_t], torch.float32), obs_xy=T_(xy[o_k, o_t], torch.float32),
                 obs_t=T_(o_t, torch.long),
                 p_o=T_(p_o, torch.long), p_m=T_(p_m, torch.long),
                 p_w=T_(p_w, torch.float32), p_t=T_(p_t, torch.long),
@@ -554,11 +570,31 @@ def make_projector(D, device):
     return project
 
 
+_SIDE_STREAMS = {}
+
+
+def _side_gather(x, i, j, k):
+    """x[i, j], on CUDA run on side stream k: its backward (run by autograd on the same stream) is then free to
+    overlap with the rest of the backward. Same kernels, same summation order -> same result."""
+    if not x.is_cuda:
+        return x[i, j]
+    cur = torch.cuda.current_stream(x.device)
+    side = _SIDE_STREAMS.setdefault((x.device, k), torch.cuda.Stream(x.device))
+    side.wait_stream(cur)
+    with torch.cuda.stream(side):
+        y = x[i, j]
+    cur.wait_stream(side)
+    y.record_stream(cur)                                              # allocated on side, used on cur
+    return y
+
+
 def warp_phi(c, R, p_o, p_m, p_w, p_t, p_s, p_xsrc, O):
-    """Phi_k(t) = sum_m w_km [ R_{m,t} R_{m,s}^T (xsrc - c_{m,s}) + c_{m,t} ], as a scatter over pairs."""
-    Rms = R[p_m, p_s]                                                 # [P,3,3]
+    """Phi_k(t) = sum_m w_km [ R_{m,t} R_{m,s}^T (xsrc - c_{m,s}) + c_{m,t} ], as a scatter over pairs.
+    The source-frame gathers' backward is a serial sum over every pair sharing a (node, s_k) cell (~190k pairs
+    in one cell on teddy: most tracks start at frame 0), so they run on side streams (_side_gather)."""
+    Rms = _side_gather(R, p_m, p_s, 0)                                # [P,3,3]
     Rmt = R[p_m, p_t]
-    cms = c[p_m, p_s]                                                 # [P,3]
+    cms = _side_gather(c, p_m, p_s, 1)                                # [P,3]
     cmt = c[p_m, p_t]
     rel = torch.einsum("pji,pj->pi", Rms, p_xsrc - cms)              # R_{m,s}^T (xsrc - c_{m,s})
     warped = torch.einsum("pij,pj->pi", Rmt, rel) + cmt              # R_{m,t} rel + c_{m,t}
@@ -707,29 +743,16 @@ def warp_dyn_output(tracks, c_fin, R_fin, D, device):
     valid = D["valid"]; T = D["T"]
     c = torch.as_tensor(c_fin, dtype=torch.float32, device=device)
     R = torch.as_tensor(R_fin, dtype=torch.float32, device=device)
-    dyn_ids, out = [], []
-    p_o, p_m, p_w, p_t, p_s, p_xsrc, span = [], [], [], [], [], [], []
-    o = 0
-    for tr in tracks:
-        vk = np.where(valid[tr["k"]])[0]
-        lo, hi = int(vk[0]), int(vk[-1])
-        frames = np.arange(lo, hi + 1)
-        dyn_ids.append(tr["k"]); span.append((lo, hi))
-        for t in frames.tolist():
-            for mi in range(tr["nb"].size):
-                p_o.append(o); p_m.append(int(tr["nb"][mi])); p_w.append(float(tr["w"][mi]))
-                p_t.append(t); p_s.append(tr["sk"]); p_xsrc.append(tr["xsrc"])
-            o += 1
-    Tn = lambda a, dt: torch.as_tensor(np.asarray(a), dtype=dt, device=device)
+    dyn_ids = np.array([tr["k"] for tr in tracks], dtype=np.int64)
+    vt = valid[dyn_ids]                                               # every skinned track has >= 2 valid frames
+    lo, hi = vt.argmax(1), T - 1 - vt[:, ::-1].argmax(1)
+    o_i, o_t, p_o, p_m, p_w, p_t, p_s, p_xsrc = pair_arrays(tracks, [np.arange(a, b + 1) for a, b in zip(lo, hi)])
+    Tn = lambda a, dt: torch.as_tensor(a, dtype=dt, device=device)
     phi = warp_phi(c, R, Tn(p_o, torch.long), Tn(p_m, torch.long), Tn(p_w, torch.float32),
-                   Tn(p_t, torch.long), Tn(p_s, torch.long), Tn(p_xsrc, torch.float32), o).cpu().numpy()
+                   Tn(p_t, torch.long), Tn(p_s, torch.long), Tn(p_xsrc, torch.float32), int(o_i.size)).cpu().numpy()
     dyn = np.full((len(tracks), T, 3), np.nan, dtype=np.float64)
-    oi = 0
-    for i, (lo, hi) in enumerate(span):
-        n = hi - lo + 1
-        dyn[i, lo:hi + 1] = phi[oi:oi + n]
-        oi += n
-    return np.asarray(dyn_ids, dtype=np.int64), dyn
+    dyn[o_i, o_t] = phi
+    return dyn_ids, dyn
 
 
 # ------------------------------------------------- bad ("red") EDG-node deletion + dynamic reassignment
@@ -792,7 +815,7 @@ def main():
     ap.add_argument("--edges-npz", default=None,
                     help="optionally override the EDG edges with a rebuilt set "
                          "(outputs/edg_edges_rebuilt.npz from rebuild_edg_edges.py); default = edg_topology.npz")
-    ap.add_argument("--iters", type=int, default=400)
+    ap.add_argument("--iters", type=int, default=200)    # 400 lowered the final reprojection median by only ~0.02 px
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--gaps", type=int, nargs="+", default=None,
                     help="ARAP temporal gaps D (default 1 4 16 64 128 256, those shorter than the video): the long gaps keep a node's "
@@ -882,12 +905,11 @@ def main():
                      dtype=np.int64).reshape(-1, 2)
 
     out = Path(args.out) if args.out else Path(utils.definitions.output_dir) / "edg_test" / "edg_completed.npz"
-    np.savez_compressed(out, node_ids=node_ids, edg_reconstruct=c_fin, edg_rotation=R_fin,
-                        edg_edges=edges, dyn_ids=dyn_ids, dyn_reconstruct=dyn_reconstruct,
-                        n_tracks=int(D["Q"]))                          # track-id space stamp (merged vs raw)
-    print(f"\n[done] {out}  ({node_ids.size} nodes, DENSE, T={D['T']}, {dyn_ids.size} dyn tracks)")
-    print(f"       visualize: conda run -n XM python visualize_edg_solution_open3d.py "
-          f"--npz {out} --no-scale-search")
+    completed = dict(node_ids=node_ids, edg_reconstruct=c_fin, edg_rotation=R_fin,
+                     edg_edges=edges, dyn_ids=dyn_ids, dyn_reconstruct=dyn_reconstruct,
+                     n_tracks=int(D["Q"]))                             # track-id space stamp (merged vs raw)
+    pool = ThreadPoolExecutor(1)                                      # zlib releases the GIL: written while the
+    written = pool.submit(savez_compressed_fast, out, **completed)    # results_all update below runs
 
     # Also push this completed EDG into results_all.npz (the EDG the 4DGS trainer AND
     # visualize_training_input_dynamic.py read) so that viewer shows the SAME EDG as
@@ -905,7 +927,7 @@ def main():
             if not bak.exists():
                 shutil.copy2(ra, bak)
                 print(f"[results_all] backed up existing base -> {bak.name}")
-            convert(out, ra, ra)                                     # overwrite results_all.npz EDG in place
+            convert(out, ra, ra, comp=completed)                     # overwrite results_all.npz EDG in place
             print(f"[results_all] updated {ra.name} with this completed EDG. "
                   f"visualize_training_input_dynamic.py + the 4DGS trainer now use the SAME EDG as "
                   f"visualize_best_color_2d.py. NOTE: re-run train_4dgs_edg.py to rebuild the dynamic "
@@ -914,6 +936,10 @@ def main():
             print(f"[results_all] {ra} not found -- skipping the results_all update (need an existing "
                   f"results_all.npz to supply static/prior/da3 keys). Pass --results-all or run the "
                   f"static/prior pipeline first; or pass --no-results-all to silence this.")
+    written.result(); pool.shutdown()
+    print(f"\n[done] {out}  ({node_ids.size} nodes, DENSE, T={D['T']}, {dyn_ids.size} dyn tracks)")
+    print(f"       visualize: conda run -n XM python visualize_edg_solution_open3d.py "
+          f"--npz {out} --no-scale-search")
 
 
 if __name__ == "__main__":

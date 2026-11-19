@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
 
 import numpy as np
@@ -36,8 +37,11 @@ args = SimpleNamespace(
     iters=10, min_obs=3, workers=min(32, os.cpu_count() or 1), out="tracks_dynamic_only_smoothed.npz")
 
 O = str(utils.definitions.output_dir)
-d = np.load(f"{O}/tracks_dynamic_only.npz", allow_pickle=True)
-UV = d["tracks_xy"][0].astype(np.float64)
+src = f"{O}/tracks_dynamic_only.npz"
+keys = np.load(src).files
+with ThreadPoolExecutor(4) as ex:                         # every key once (all are written back), decompressed in parallel
+    d = dict(zip(keys, ex.map(lambda k: np.load(src, allow_pickle=True)[k], keys)))   # (a handle per key: thread safe)
+UV = np.asarray(d["tracks_xy"][0], np.float64)           # read only: no copy when it is float64 already
 XC = d["tracks_xyz"][0].astype(np.float64)
 Q, T = UV.shape[:2]
 rt = np.load(f"{O}/result_XM.npz", allow_pickle=True)
@@ -47,7 +51,19 @@ K = np.load(f"{O}/depth_anything_3/intrinsics.npy").astype(np.float64)[0]
 fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
 f_mean = 0.5 * (fx + fy)
 camok = np.isfinite(C).all(1)
-X0 = np.einsum("tij,qtj->qti", R * s[:, None, None], XC) + C[None]
+
+
+def rotate(Rt, X, blk=2048):
+    """np.einsum("tij,qtj->qti", Rt, X), the same einsum on blocks of tracks in threads (speed only)."""
+    out = np.empty(X.shape, np.result_type(Rt, X))
+    def one(a):
+        out[a:a + blk] = np.einsum("tij,qtj->qti", Rt, X[a:a + blk])
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(one, range(0, len(X), blk)))
+    return out
+
+
+X0 = rotate(R * s[:, None, None], XC) + C[None]
 V = np.isfinite(X0).all(-1) & ~d["occluded"][0].astype(bool) & d["dynamic_obs_mask"].astype(bool) & camok[None]
 # frames without a solved camera: borrow the nearest solved camera for the acceleration weight only
 near = np.array([np.flatnonzero(camok)[np.argmin(np.abs(np.flatnonzero(camok) - t))] for t in range(T)])
@@ -59,7 +75,7 @@ BW = 8                                                    # band half-width: xyz
 def cost_terms(X, t0, v, u, dd):
     """Per-term costs and pieces for one track span. X (L,3) world; frames t0..t0+L-1."""
     L = len(X)
-    tt = np.arange(t0, t0 + L)
+    tt = slice(t0, t0 + L)                                # views, not copies (speed)
     xc = np.einsum("tij,tj->ti", RT[tt], X - Cn[tt])
     if (xc[:, 2] < 0.05 * (s[tt] * dd).min()).any():     # in front of every camera: the robust losses alone would let a
         return np.inf, None, None, None, None, None      # point escape behind the camera, so such a step is rejected
@@ -88,7 +104,7 @@ def solve_track(q):
     X = np.empty((L, 3))
     for k in range(3):                                    # hidden frames start on the line between their neighbours
         X[:, k] = np.interp(np.arange(L), np.flatnonzero(v), X0[q, t0:t1][v, k])
-    tt = np.arange(t0, t1)
+    tt = slice(t0, t1)
     cost, xc, z, r, r2, e = cost_terms(X, t0, v, u, dd)
     if not np.isfinite(cost):                             # the raw lift itself is behind a camera: leave it as is
         return q, t0, X
@@ -107,19 +123,17 @@ def solve_track(q):
         H = wr[:, None, None] * np.einsum("tai,taj->tij", J, J) + wd[:, None, None] * Jd[:, :, None] * Jd[:, None, :]
         g = wr[:, None] * np.einsum("tai,ta->ti", J, r) + wd[:, None] * Jd * e[:, None]
         ab = np.zeros((BW + 1, 3 * L))
-        idx = 3 * np.arange(L)
         for k in range(3):
             for l in range(k, 3):
-                ab[BW + k - l, idx + l] += H[:, k, l]
+                ab[BW + k - l, l::3] += H[:, k, l]
         # acceleration: weight beta per interior frame, coefficients (1, -2, 1) on frames (t-1, t, t+1), each axis
         beta = (f_mean / (z[1:-1] * args.sigma_acc)) ** 2
         acc = X[2:] - 2 * X[1:-1] + X[:-2]
         cf = (1.0, -2.0, 1.0)
         for a in range(3):
             g[a:L - 2 + a] += cf[a] * beta[:, None] * acc
-            for b in range(a, 3):
-                for k in range(3):
-                    ab[BW - 3 * (b - a), 3 * (np.arange(L - 2) + b) + k] += beta * cf[a] * cf[b]
+            for b in range(a, 3):                         # (all three axes at once: the same sums per entry, speed)
+                ab[BW - 3 * (b - a), 3 * b:3 * (L - 2 + b)] += np.repeat(beta * cf[a] * cf[b], 3)
         diag = ab[BW].copy()
         for _try in range(8):
             ab[BW] = diag * (1 + lam) + 1e-12
@@ -147,8 +161,8 @@ if __name__ == "__main__":
     np.seterr(invalid="ignore", divide="ignore")
     ids = list(range(Q))
     t_start = time.time()
-    XS = np.full((Q, T, 3), np.nan)
     with Pool(args.workers) as pool:
+        XS = np.full((Q, T, 3), np.nan)                   # after the fork (smaller workers start faster)
         for q, t0, X in pool.imap_unordered(solve_track, ids, chunksize=64):
             if X is not None:
                 XS[q, t0:t0 + len(X)] = X
@@ -156,35 +170,43 @@ if __name__ == "__main__":
     solved = np.isfinite(XS).all(-1).any(1)
     print(f"{utils.definitions.dataset_name}: solved {solved.sum()} of {len(ids)} tracks in {t_solve:.1f} s on {args.workers} workers "
           f"(sigma_depth {args.sigma_depth}, sigma_acc {args.sigma_acc} px/frame^2, Cauchy {args.cauchy_px} px)")
+    if args.out:                                          # written in the background while the statistics run (speed)
+        xcam = rotate(np.transpose(R, (0, 2, 1)) / s[:, None, None], XS - C[None])
+        xcam[~V] = np.nan
+        out = dict(d)
+        out["tracks_xyz"] = xcam[None]
+        out["tracks_world_smoothed"] = XS.astype(np.float32)
+        writer = ThreadPoolExecutor(1)                    # uncompressed: 1.3 GB (0.4 GB compressed) on teddy, but ~20 s
+                                                          # faster to write and ~1 s faster to read for each later step
+        written = writer.submit(np.savez, f"{O}/{args.out}", **out)
 
-    # ---- statistics over the observations of the solved tracks ----
+    # ---- statistics over the observations of the solved tracks (evaluated at those observations only) ----
     m = V & solved[:, None]
-    xcs = np.einsum("tij,qtj->qti", RT, XS - Cn[None])
-    zs = xcs[..., 2]
-    us = np.stack([fx * xcs[..., 0] / zs + cx, fy * xcs[..., 1] / zs + cy], -1)
-    rep = np.linalg.norm(us - UV, axis=-1)[m]
-    z0 = XC[..., 2] * s[None]                             # raw camera depth in world units = s_t * d_t
-    dz = np.abs(np.log(zs / z0))[m]
+    fm = np.flatnonzero(m)                                # observations as flat (track, frame) indices
+    xcs = rotate(RT, XS - Cn[None]).reshape(-1, 3)
+    xm = xcs[fm]; zm = xm[:, 2]
+    du = np.stack([fx * xm[:, 0] / zm + cx, fy * xm[:, 1] / zm + cy], -1) - UV.reshape(-1, 2)[fm]
+    rep = np.sqrt(du[:, 0] * du[:, 0] + du[:, 1] * du[:, 1])  # = np.linalg.norm(du, axis=-1), bit for bit
+    z0 = XC.reshape(-1, 3)[fm, 2] * s[fm % T]             # raw camera depth in world units = s_t * d_t
+    dz = np.abs(np.log(zm / z0))
+    aq, at = np.nonzero(m[:, 2:] & m[:, 1:-1] & m[:, :-2])
+    fa = aq * T + at + 1                                  # middle frame of a run of 3 visible frames
 
     def accel(X):                                         # px-equivalent acceleration on runs of 3 visible frames
-        a = np.linalg.norm(X[:, 2:] - 2 * X[:, 1:-1] + X[:, :-2], axis=-1) * f_mean / zs[:, 1:-1]
-        ok = m[:, 2:] & m[:, 1:-1] & m[:, :-2]
-        return a[ok]
-    a0, a1 = accel(X0), accel(XS)
-    pct = lambda x: " / ".join(f"{np.percentile(x, p):.2f}" for p in (50, 90))
+        X = X.reshape(-1, 3)
+        a = X[fa + 1] - 2 * X[fa] + X[fa - 1]
+        return np.sqrt((a[:, 0] * a[:, 0] + a[:, 1] * a[:, 1]) + a[:, 2] * a[:, 2]) * f_mean / xcs[fa, 2]
+    with ThreadPoolExecutor(2) as ex:
+        a0, a1 = ex.map(accel, (X0, XS))
+    pct = lambda x: " / ".join(f"{v:.2f}" for v in np.percentile(x, (50, 90)))
     print(f"  reprojection of smoothed points  median / p90 {pct(rep)} px, > 5 px {100 * (rep > 5).mean():.1f}%")
-    print(f"  depth change |log(z/z_DA3)|      median / p90 {pct(dz)}; behind a camera: {int((zs[m] <= 0).sum())}")
+    print(f"  depth change |log(z/z_DA3)|      median / p90 {pct(dz)}; behind a camera: {int((zm <= 0).sum())}")
     print(f"  acceleration (px-eq./frame^2)    raw {pct(a0)}  ->  smoothed {pct(a1)}")
     stats = dict(sigma_depth=args.sigma_depth, sigma_acc=args.sigma_acc, cauchy_px=args.cauchy_px,
                  reproj_med=float(np.median(rep)), reproj_p90=float(np.percentile(rep, 90)), reproj_gt5=float((rep > 5).mean()),
                  dz_med=float(np.median(dz)), acc_raw=float(np.median(a0)), acc_smooth=float(np.median(a1)),
                  solve_seconds=t_solve, workers=args.workers, tracks=int(solved.sum()), obs=int(m.sum()))
     if args.out:
-        xcam = np.einsum("tij,qtj->qti", np.transpose(R, (0, 2, 1)) / s[:, None, None], XS - C[None])
-        xcam[~V] = np.nan
-        out = {k: d[k] for k in d.files}
-        out["tracks_xyz"] = xcam[None]
-        out["tracks_world_smoothed"] = XS.astype(np.float32)
-        np.savez_compressed(f"{O}/{args.out}", **out)
+        written.result(); writer.shutdown()
         json.dump(stats, open(f"{O}/{os.path.splitext(args.out)[0]}.json", "w"), indent=1)
         print(f"  wrote {O}/{args.out}")

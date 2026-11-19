@@ -24,6 +24,7 @@ plus the EDG.md params.
 """
 import argparse
 import glob
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,10 +82,12 @@ def _dilate_dyn_mask(D, dilate_px):
     H, W = cv2.imread(D["image_paths"][0]).shape[:2]
     masks = load_dynamic_masks(str(mask_dir), utils.definitions.mask_pattern,
                                t_expected=D["T"], mask_mode="dynamic_positive", target_size=(W, H))  # (T,H,W) bool
+    D["dyn_masks"] = masks                    # loaded once: _dyn_region_near_px reuses them
     masks = dilate_dynamic_masks(masks, int(dilate_px))
     xy = D["tracks_xy"][0]                    # (Q, T, 2) native px
     dyn = np.asarray(D["dyn_mask"]).astype(bool).copy()  # start from original -> only grows
-    for t in range(D["T"]):
+
+    def one(t):                               # one frame (its own column of dyn): frames in threads (speed)
         m = masks[t]
         finite = np.isfinite(xy[:, t, 0]) & np.isfinite(xy[:, t, 1])
         x = np.round(np.where(finite, xy[:, t, 0], -1.0)).astype(np.int64)
@@ -92,6 +95,8 @@ def _dilate_dyn_mask(D, dilate_px):
         ok = finite & (x >= 0) & (x < W) & (y >= 0) & (y < H)
         idx = np.where(ok)[0]
         dyn[idx, t] |= m[y[idx], x[idx]].astype(bool)
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(one, range(D["T"])))
     print(f"[dyn-mask] dilated dynamic masks by {dilate_px}px: dynamic obs "
           f"{int(np.asarray(D['dyn_mask']).sum())} -> {int(dyn.sum())}")
     return dyn
@@ -113,8 +118,8 @@ def _dyn_region_near_px(D, frac, fallback=15.0):
         print(f"[edg-near] cannot load masks ({e}); using fixed {fallback}px")
         return float(fallback)
     H, W = cv2.imread(D["image_paths"][0]).shape[:2]
-    masks = load_dynamic_masks(str(mask_dir), utils.definitions.mask_pattern,
-                               t_expected=D["T"], mask_mode="dynamic_positive", target_size=(W, H))
+    masks = D["dyn_masks"] if "dyn_masks" in D else load_dynamic_masks(
+        str(mask_dir), utils.definitions.mask_pattern, t_expected=D["T"], mask_mode="dynamic_positive", target_size=(W, H))
     areas = masks[::10].reshape(-1, H * W).sum(1)
     areas = areas[areas > 0]
     if areas.size == 0:
@@ -293,10 +298,11 @@ def _stack_sampled(D, s, sampled):
     """Return Ps (S,Q,3) lifted positions and Vs (S,Q) reliability over the sampled frames."""
     Ps = np.empty((sampled.size, D["tracks_xyz"].shape[1], 3), dtype=np.float64)
     Vs = np.empty((sampled.size, D["tracks_xyz"].shape[1]), dtype=bool)
-    for k, f in enumerate(sampled):
-        P, v = _valid_at(D, s, int(f))
-        Ps[k] = P
-        Vs[k] = v
+
+    def one(k):
+        Ps[k], Vs[k] = _valid_at(D, s, int(sampled[k]))
+    with ThreadPoolExecutor(8) as ex:                         # frames in threads (speed)
+        list(ex.map(one, range(sampled.size)))
     return Ps, Vs
 
 
@@ -663,11 +669,9 @@ def _link_rigid_components(D, cfg, edges, scores, Ps, Vs, verbose=True):
 # (This is the exact algorithm that visualize_edg_suppressed.py uses/visualizes.)
 def _frame_trees_2d(xy, Vs, T):
     """Per-frame KD-tree over the reliable tracks' 2D image positions (for candidate gathering)."""
-    idx_per, tree_per = [], []
-    for t in range(T):
-        idx = np.where(Vs[t])[0]
-        idx_per.append(idx)
-        tree_per.append(cKDTree(xy[idx, t]) if idx.size else None)
+    idx_per = [np.where(Vs[t])[0] for t in range(T)]
+    with ThreadPoolExecutor(8) as ex:                         # the builds release the GIL (speed)
+        tree_per = list(ex.map(lambda t: cKDTree(xy[idx_per[t], t]) if idx_per[t].size else None, range(T)))
     return idx_per, tree_per
 
 
@@ -1014,20 +1018,26 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
     elif cand_near and cand_near < K:                         # no track graph (sandbox 2026-11-17, speed): the cand_near
         nodes_P = Ps[:, edg_nodes]                           # nodes nearest at up to 5 of the point's frames (min distance)
         nodes_V = Vs[:, edg_nodes]
-        for c0 in range(0, dyn_ids.size, 2048):
+
+        def _near(c0):                                        # one block of points (numpy only: blocks in threads)
             qs = dyn_ids[c0:c0 + 2048]; dmin = np.full((qs.size, K), np.inf)
-            fr = [np.where(Vs[:, q])[0] for q in qs]
-            pick = np.array([f[np.linspace(0, f.size - 1, min(5, f.size)).astype(int)] if f.size else np.zeros(0, int) for f in fr], dtype=object)
+            vq = Vs[:, qs].T; n = vq.sum(1); m = np.minimum(5, n)          # frame j of point i: its seen frame number
+            fr = np.nonzero(vq)[1]; s0 = np.cumsum(n) - n                    # np.linspace(0, n - 1, m).astype(int)[j], same float ops
+            step = (n - 1).astype(np.float64) / np.maximum(m - 1, 1)
             for j in range(5):
-                ok = np.array([len(f) > j for f in pick]); 
-                if not ok.any():
+                ii = np.where(m > j)[0]
+                if not ii.size:
                     break
-                ii = np.where(ok)[0]; tj = np.array([pick[i][j] for i in ii])
-                d = np.linalg.norm(nodes_P[tj] - Ps[tj, qs[ii]][:, None, :], axis=2)          # (n, K)
+                tj = fr[s0[ii] + np.where(j == m[ii] - 1, n[ii] - 1, (j * step[ii]).astype(int))]
+                v = nodes_P[tj] - Ps[tj, qs[ii]][:, None, :]
+                d = np.sqrt((v[..., 0] * v[..., 0] + v[..., 1] * v[..., 1]) + v[..., 2] * v[..., 2])   # (n, K) = np.linalg.norm
                 d = np.where(nodes_V[tj], d, np.inf); dmin[ii] = np.minimum(dmin[ii], d)
             near = np.argsort(dmin, axis=1)[:, :int(cand_near)]
-            for i, q in enumerate(qs.tolist()):
-                cand[q] = {int(n) for n in near[i] if np.isfinite(dmin[i, n])}
+            return qs, near, np.isfinite(np.take_along_axis(dmin, near, 1))
+        with ThreadPoolExecutor(8) as ex:
+            for qs, near, fin in ex.map(_near, range(0, dyn_ids.size, 2048)):
+                for q, nr, f in zip(qs.tolist(), near.tolist(), fin.tolist()):
+                    cand[q] = {nl for nl, ok in zip(nr, f) if ok}
     else:                                                    # no track graph: every node is a candidate
         for q in dyn_ids.tolist():
             cand[q] = set(range(K))
@@ -1037,69 +1047,67 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
     for q, nls in cand.items():
         for nl in nls:
             node_pts[nl].append(q)
-    stats = defaultdict(dict)                                 # q -> {node_gid: (robust, dmin, dmax)}
-    for nl, pts in tqdm(node_pts.items(), desc="[EDG] dyn->EDG dist", disable=not verbose):
+
+    def _node_stats(item):                                    # one node; distances only at the co-visible frames (speed)
+        nl, pts = item
         pts = np.asarray(pts, np.int64)
         n_gid = int(edg_nodes[nl])
-        covis = Vs[:, pts] & Vs[:, n_gid][:, None]           # (T, n_pts)
-        d = np.linalg.norm(Ps[:, pts, :] - Ps[:, n_gid][:, None, :], axis=2)   # (T, n_pts)
-        d = np.where(covis, d, np.nan)
+        tn = np.flatnonzero(Vs[:, n_gid])
+        if not tn.size:                                       # a node never seen: no distance, as the NaN rows before
+            nan = np.full(pts.size, np.nan)
+            return pts, np.full(pts.size, n_gid), nan, nan, nan
+        ti, pi = np.nonzero(Vs[tn][:, pts])                  # co-visible (frame, point)
+        v = Ps[tn[ti], pts[pi]] - Ps[tn[ti], n_gid]
+        d = np.full((pts.size, tn.size), np.nan)             # (n_pts, T_node), NaN where not co-visible
+        d[pi, ti] = np.sqrt((v[:, 0] * v[:, 0] + v[:, 1] * v[:, 1]) + v[:, 2] * v[:, 2])   # = np.linalg.norm
         with np.errstate(all="ignore"):
-            rob = _nanquantile_fast(d, quantile / 100.0, axis=0)   # (n_pts,) robust over co-visible frames (= np.nanpercentile)
-            dmn = np.nanmin(d, axis=0)
-            dmx = np.nanmax(d, axis=0)
-        for pi, q in enumerate(pts.tolist()):
-            if np.isfinite(rob[pi]):
-                stats[q][n_gid] = (float(rob[pi]), float(dmn[pi]), float(dmx[pi]))
+            rob = _nanquantile_fast(d, quantile / 100.0, axis=1)   # (n_pts,) robust over co-visible frames (= np.nanpercentile)
+            dmn = np.nanmin(d, axis=1)
+            dmx = np.nanmax(d, axis=1)
+        return pts, np.full(pts.size, n_gid), rob, dmn, dmx
+
+    with ThreadPoolExecutor(8) as ex:                         # nodes in threads, results in node order
+        res = list(tqdm(ex.map(_node_stats, node_pts.items()), total=len(node_pts), desc="[EDG] dyn->EDG dist", disable=not verbose))
+    # every candidate link with a co-visible frame as flat arrays (point, node gid, robust, dmin, dmax), grouped by point and
+    # ranked nearest first; ties keep the node order, like the stable sort of per-point dicts this replaces (speed)
+    lq, lg, rob, dmn, dmx = (np.concatenate(x) for x in zip(*res)) if res else [np.zeros(0)] * 5
+    o = np.isfinite(rob); lq, lg, rob, dmn, dmx = lq[o], lg[o], rob[o], dmn[o], dmx[o]
+    if not lq.size:
+        return np.zeros((0, 2), np.int64)
+    o = np.lexsort((rob, lq)); lq, lg, rob, dmn, dmx = lq[o], lg[o], rob[o], dmn[o], dmx[o]
+    first = np.r_[True, lq[1:] != lq[:-1]]                   # each point's nearest link
+    grp = np.cumsum(first) - 1
 
     # --- adaptive cap + HARD stability filters. "far" is relative to node spacing (scale = median
     # nearest-node robust distance). A link needs (a) p90 <= max_factor*scale (soft cap, has a skinnable
     # fallback), AND (b) MAX co-visible distance <= max_dist_factor*scale, AND (c) it must not vary a lot
     # (min >= min_max_ratio*max, applied only when the point ever gets far, dmax > scale). (b),(c) are HARD:
     # a point whose every candidate fails them gets NO link. ---
-    nearest = np.array([min(v[0] for v in nd.values()) for nd in stats.values() if nd], dtype=np.float64)
+    nearest = rob[first]
     scale = float(np.median(nearest)) if nearest.size else float(thr)
     cap = float(max_factor) * scale
     max_cap = float(max_dist_factor) * scale
 
-    def _unstable(s):                                        # None if OK, else reason it is rejected
-        _r, dmn, dmx = s
-        if max_dist_factor > 0 and dmx > max_cap:
-            return "far"
-        if min_max_ratio > 0 and dmx > scale and dmn < float(min_max_ratio) * dmx:
-            return "vary"
-        return None
+    far = (dmx > max_cap) if max_dist_factor > 0 else np.zeros(rob.size, bool)
+    vary = (~far & (dmx > scale) & (dmn < float(min_max_ratio) * dmx)) if min_max_ratio > 0 else np.zeros(rob.size, bool)
+    stable = ~far & ~vary
+    under = stable & (rob <= cap)
 
-    conn = defaultdict(set)
-    n_capped = n_far = n_vary = n_dropped = 0
-    for q, nd in stats.items():
-        ranked = sorted(nd.items(), key=lambda kv: kv[1][0])  # (node_gid, (rob,dmin,dmax)) nearest first
-        stable = []
-        for g, s in ranked:
-            why = _unstable(s)
-            if why == "far":
-                n_far += 1
-            elif why == "vary":
-                n_vary += 1
-            else:
-                stable.append((g, s))
-        under = [(g, s[0]) for g, s in stable if s[0] <= cap]
-        n_capped += max(0, len(stable) - len(under))
-        if under:
-            conn[q].update(g for g, _ in under[:int(min_conn)])
-        elif stable:
-            conn[q].add(stable[0][0])                         # skinnable fallback: closest that passes (b)&(c)
-        else:
-            n_dropped += 1                                    # every candidate far / varying -> no link
+    def _rank(m):                                             # rank of each True entry among its point's True entries
+        c = np.cumsum(m)
+        return c - 1 - (c - m)[first][grp]
+    has_under = np.bincount(grp, under)[grp] > 0
+    keep = np.where(has_under, under & (_rank(under) < int(min_conn)),   # the min_conn nearest under the p90 cap, else
+                    stable & (_rank(stable) == 0))                       # skinnable fallback: closest that passes (b)&(c)
+    n_far, n_vary, n_capped = int(far.sum()), int(vary.sum()), int((stable & ~under).sum())
+    n_dropped = int((np.bincount(grp, stable) == 0).sum())   # every candidate far / varying -> no link
 
-    if not conn:
+    if not keep.any():
         return np.zeros((0, 2), np.int64)
-    trk = np.fromiter((t for t, nds in conn.items() for _ in nds), dtype=np.int64)
-    nod = np.fromiter((nd for nds in conn.values() for nd in nds), dtype=np.int64)
-    und = np.unique(np.stack([trk, nod], axis=1), axis=0)     # (E,2) = (dynamic track, edg node)
+    und = np.unique(np.stack([lq[keep], lg[keep]], axis=1), axis=0)   # (E,2) = (dynamic track, edg node)
     if verbose:
-        deg = np.array([len(v) for v in conn.values()])
-        print(f"[EDG] dyn->EDG: {und.shape[0]} orange edges over {len(conn)} dynamic points "
+        deg = np.unique(lq[keep], return_counts=True)[1]
+        print(f"[EDG] dyn->EDG: {und.shape[0]} orange edges over {deg.size} dynamic points "
               f"({min_conn} nearest by robust p{quantile} co-visible dist; scale {scale:.4f}, p90-cap "
               f"{cap:.4f} (x{max_factor:g}), max-cap {max_cap:.4f} (x{max_dist_factor:g})). Dropped links: "
               f"{n_capped} over p90-cap, {n_far} max-dist too large, {n_vary} varying(min<{min_max_ratio:g}max); "
