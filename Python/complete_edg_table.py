@@ -52,6 +52,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import utils.dataset_config as dataset_config
 import utils.definitions
 from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
 from utils.io import savez_compressed_fast
@@ -736,6 +737,32 @@ def complete(D, args, device):
     return c_fin, R_fin, tracks
 
 
+def rigid_ends(c, R, filled, k=6):
+    """Before a node's first / after its last table cell nothing observes it: replace those cells by a rigid follow of its
+    observed neighbourhood: the k nodes nearest to it at the boundary frame b that are table-observed at both b and t,
+    Kabsch on their solved POSITIONS b -> t (the rotation table is mostly interpolated), applied to the node's position and
+    rotation at b."""
+    M, T, _ = c.shape; n = 0
+    for m in range(M):
+        f = np.where(filled[m])[0]
+        if f.size == 0:
+            continue
+        for ts, b in ((range(f[0] - 1, -1, -1), f[0]), (range(f[-1] + 1, T), f[-1])):
+            cand = np.array([j for j in range(M) if j != m and filled[j, b]], dtype=np.int64)
+            if cand.size < 3:
+                continue
+            cand = cand[np.argsort(np.linalg.norm(c[cand, b] - c[m, b], axis=1))]
+            for t in ts:
+                nb = cand[filled[cand, t]][:k]
+                if nb.size < 3:
+                    continue
+                P, Q = c[nb, b].astype(np.float64), c[nb, t].astype(np.float64); mp, mq = P.mean(0), Q.mean(0)
+                U, _, Vt = np.linalg.svd((Q - mq).T @ (P - mp)); Dg = np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))])
+                Rk = U @ Dg @ Vt
+                c[m, t] = Rk @ (c[m, b] - mp) + mq; R[m, t] = Rk @ R[m, b]; n += 1
+    return n
+
+
 # --------------------------------------------------------------------------- warp dynamic points for output
 def warp_dyn_output(tracks, c_fin, R_fin, D, device):
     """Deform every skinned track over its observed lifetime [min V_k, max V_k] with the COMPLETED table,
@@ -828,6 +855,10 @@ def main():
     ap.add_argument("--hold-ends", action="store_true",
                     help="hold a node constant before its first / after its last observed cell (old init) instead of "
                          "moving it with its EDG neighbours")
+    ap.add_argument("--rigid-ends", action=argparse.BooleanOptionalAction,
+                    default=dataset_config.get_bool("EDG_RIGID_ENDS", False),
+                    help="after the solve, a node's cells before its first / after its last table cell follow its observed "
+                         "neighbours rigidly (Kabsch on their positions); default: config.json EDG_RIGID_ENDS")
     ap.add_argument("--lambda-2d", type=float, default=1.0,
                     help="2D reprojection loss (dyn warped points + EDG nodes vs their pixel tracks); 0 = off")
     ap.add_argument("--eta-coord", type=float, default=1.0)
@@ -876,6 +907,8 @@ def main():
     masks = _load_dyn_mask_images(D["T"], args.mask_dilate_px) if args.mask_del else None
     clean_table(D, args, masks)                                       # delete bad cells, THEN solve
     c_fin, R_fin, tracks = complete(D, args, torch.device(device))
+    if args.rigid_ends:
+        print(f"[rigid-ends] {rigid_ends(c_fin, R_fin, D['filled'])} node-frames before/after a node's table cells follow its neighbours rigidly")
     dyn_ids, dyn_reconstruct = warp_dyn_output(tracks, c_fin, R_fin, D, torch.device(device))
 
     node_ids = D["edg_nodes"]

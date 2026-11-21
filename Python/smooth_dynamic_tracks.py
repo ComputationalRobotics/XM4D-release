@@ -10,7 +10,9 @@ Without it the lifted points jitter frame to frame with the per-frame depth and 
 
 Writes outputs/tracks_dynamic_only_smoothed.npz: the input keys with tracks_xyz replaced by the smoothed points in each frame's
 camera (x_cam = R^T (X - t) / s, NaN where the input is invalid), plus tracks_world_smoothed (Q, T, 3).
-config.json: SMOOTH_SIGMA_DEPTH (0.1), SMOOTH_CAUCHY_DEPTH (2), SMOOTH_SIGMA_ACC (3 px/frame^2), SMOOTH_CAUCHY_PX (2 px).
+config.json: SMOOTH_SIGMA_DEPTH (0.1), SMOOTH_CAUCHY_DEPTH (2), SMOOTH_SIGMA_ACC (30 px/frame^2), SMOOTH_CAUCHY_PX (2 px),
+SMOOTH_DEPTH_REPAIR (0 = off): before the solve, an observation whose log-depth is more than this from its track's own
+smoothed log-depth (depth spike) is moved along its ray onto that smoothed depth.
 usage: python smooth_dynamic_tracks.py
 """
 import json
@@ -31,8 +33,11 @@ from utils.edg import scatter_solved_frame_vector, scatter_solved_poses
 args = SimpleNamespace(
     sigma_depth=dataset_config.get_float("SMOOTH_SIGMA_DEPTH", 0.1),   # relative depth noise (log); larger = weaker depth term
     cauchy_depth=dataset_config.get_float("SMOOTH_CAUCHY_DEPTH", 2.0), # Cauchy scale of the depth term, in sigma-depth units
-    sigma_acc=dataset_config.get_float("SMOOTH_SIGMA_ACC", 3.0),       # acceleration, px-equivalent per frame^2
+    sigma_acc=dataset_config.get_float("SMOOTH_SIGMA_ACC", 30.0),      # acceleration, px-equivalent per frame^2
     cauchy_px=dataset_config.get_float("SMOOTH_CAUCHY_PX", 2.0),       # Cauchy scale of the reprojection term, px
+    depth_repair=dataset_config.get_float("SMOOTH_DEPTH_REPAIR", 0.0), # log-depth distance from the track's smoothed depth
+                                                                       # above which an observation is repaired (0 = off)
+    sigma_logz=0.02,                                      # repair reference: log-depth 2nd difference per frame^2
     iters=10, min_obs=3, workers=min(32, os.cpu_count() or 1), out="tracks_dynamic_only_smoothed.npz")
 
 O = str(utils.definitions.output_dir)
@@ -156,10 +161,57 @@ def solve_track(q):
     return q, t0, X
 
 
+def smooth_logz(v, lo):
+    """Robust temporal smoothing of one track's log-depth lo (valid where v): Cauchy data term + 2nd difference / sigma_logz."""
+    L = len(v)
+    l = np.interp(np.arange(L), np.flatnonzero(v), lo[v])
+    D = np.zeros((3, L))                                  # (D2^T D2) / sigma_logz^2 in upper banded form (bandwidth 2)
+    if L >= 3:
+        c = np.zeros(L); c[:L - 2] += 1; c[1:L - 1] += 4; c[2:] += 1
+        D[2] = c
+        o1 = np.zeros(L - 1); o1[:L - 2] -= 2; o1[1:] -= 2
+        D[1, 1:] = o1
+        D[0, 2:] = 1
+        D /= args.sigma_logz ** 2
+    for _ in range(args.iters):
+        e = (l - lo) / args.sigma_depth
+        w = np.where(v, 1.0 / (1.0 + e * e / args.cauchy_depth ** 2), 0.0) / args.sigma_depth ** 2
+        ab = D.copy(); ab[2] += w + 1e-12
+        l_new = solveh_banded(ab, w * lo, lower=False, check_finite=False)
+        done = np.abs(l_new - l).max() < 1e-6
+        l = l_new
+        if done:
+            break
+    return l
+
+
+def depth_spikes(q):
+    """Observations of track q whose log-depth is more than depth_repair from its own smoothed log-depth, and the depth
+    ratio that moves each onto it."""
+    obs = np.flatnonzero(V[q])
+    if len(obs) < args.min_obs:
+        return q, obs[:0], np.zeros(0)
+    t0, t1 = obs[0], obs[-1] + 1
+    v = V[q, t0:t1]
+    lo = np.where(v, np.log(np.where(v, s[t0:t1] * XC[q, t0:t1, 2], 1.0)), 0.0)
+    l = smooth_logz(v, lo)
+    bad = v & (np.abs(lo - l) > args.depth_repair)
+    return q, t0 + np.flatnonzero(bad), np.exp(l - lo)[bad]
+
+
 if __name__ == "__main__":
     np.seterr(invalid="ignore", divide="ignore")
     ids = list(range(Q))
     t_start = time.time()
+    if args.depth_repair > 0:                             # before the solve's workers fork, so they see the repaired lift
+        n_bad = 0
+        with Pool(args.workers) as pool:
+            for q, bad, ratio in pool.imap_unordered(depth_spikes, ids, chunksize=64):
+                XC[q, bad] *= ratio[:, None]
+                X0[q, bad] = np.einsum("tij,tj->ti", R[bad] * s[bad, None, None], XC[q, bad]) + C[bad]
+                n_bad += len(bad)
+        print(f"depth spikes (> {args.depth_repair} in log-depth from the track's smoothed depth): {n_bad} of {int(V.sum())} "
+              f"observations moved onto it along their ray")
     with Pool(args.workers) as pool:
         XS = np.full((Q, T, 3), np.nan)                   # after the fork (smaller workers start faster)
         for q, t0, X in pool.imap_unordered(solve_track, ids, chunksize=64):

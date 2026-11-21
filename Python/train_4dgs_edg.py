@@ -36,7 +36,9 @@ from utils.convertCOLMAP import (
 
 ### S0: CONFIG
 DEFAULT_TARGET_FRAME = 0
-MAX_CANONICAL_POINTS = 500_00_0
+MAX_CANONICAL_POINTS = dataset_config.get_int("GS_MAX_POINTS", 500_000)   # initial Gaussians (static + moving), at most
+GS_DYN_MIN_POINTS = dataset_config.get_int("GS_DYN_MIN_POINTS", 50_000)   # --dyn-min-points default
+GS_DATA_FACTOR = dataset_config.get_int("GS_DATA_FACTOR", 1)   # step 6 trains on the frames downscaled by this (images_<f>/)
 K_NEIGHBORS = 6
 POINT_SAMPLE_SEED = 0
 STATIC_SAMPLE_STRIDE = 4
@@ -2422,7 +2424,7 @@ def main() -> None:
     parser.add_argument(
         "--dyn-min-points",
         type=int,
-        default=50000,
+        default=GS_DYN_MIN_POINTS,
         help="(--dyn-source edg-good) UPSAMPLE the good dynamic cloud to at least this many points by "
              "replicating each point with a small jitter (sigma = --dyn-jitter x median NN distance); each "
              "replica gets its own EDG binding. <=0 disables the upsampling.",
@@ -2499,6 +2501,14 @@ def main() -> None:
     )
 
     print(f"Prepared 4DGS dataset at: {gs_dir}")
+    if GS_DATA_FACTOR > 1:                                # read by step 6's --data-factor
+        small = gs_dir / f"images_{GS_DATA_FACTOR}"
+        small.mkdir(exist_ok=True)
+        for p in sorted((gs_dir / "images").iterdir()):
+            im = cv2.imread(str(p))
+            cv2.imwrite(str(small / p.name), cv2.resize(im, (im.shape[1] // GS_DATA_FACTOR, im.shape[0] // GS_DATA_FACTOR),
+                                                        interpolation=cv2.INTER_AREA))
+        print(f"Frames downscaled by {GS_DATA_FACTOR} for training: {small}")
 
     gsplat_result_dir = Path(args.gsplat_result_dir) if args.gsplat_result_dir else gs_dir.parent / "gsplat"
     simple_trainer = Path(__file__).resolve().parents[1] / "build" / "gsplat_examples" / "simple_trainer.py"   # install/gs.sh
@@ -2513,7 +2523,7 @@ def main() -> None:
         "--result-dir",
         str(gsplat_result_dir),
         "--data-factor",
-        "1",
+        str(GS_DATA_FACTOR),
         "--edg-results",
         str(results_npz),
         "--edg-target-frame",

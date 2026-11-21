@@ -434,6 +434,33 @@ def _apply_depth_scale_to_prediction(pred, scale: float):
     return pred
 
 
+def _lidar_filled(scene_dir, da3):
+    """config.json LIDAR_DEPTH: the scene's sensor depth where it has one, Depth Anything 3 in its holes.
+    <scene>/depth/*.png: one 16-bit PNG per frame in mm (0 = no depth), resized (nearest) to the frames. Each frame's
+    DA3 depth is scale+shift fitted to the LiDAR pixels (least squares) before it fills that frame's holes."""
+    pngs = sorted(glob.glob(str(Path(scene_dir) / "depth" / "*.png")))
+    if len(pngs) < len(da3):
+        raise RuntimeError(f"LIDAR_DEPTH: {len(pngs)} depth PNGs in {Path(scene_dir) / 'depth'} for {len(da3)} frames")
+    H, W = da3.shape[1:]
+    out = np.empty_like(da3)
+    holes = 0
+    for t in range(len(da3)):
+        lidar = cv2.imread(pngs[t], cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
+        if lidar.shape != (H, W):
+            lidar = cv2.resize(lidar, (W, H), interpolation=cv2.INTER_NEAREST)
+        holes += int((lidar <= 1e-3).sum())
+        aligned = da3[t]
+        m = (lidar > 1e-3) & np.isfinite(da3[t])
+        if int(m.sum()) > 50:
+            A = np.stack([da3[t][m], np.ones(int(m.sum()), np.float32)], 1)
+            (a, b), *_ = np.linalg.lstsq(A, lidar[m], rcond=None)
+            aligned = float(a) * da3[t] + float(b)
+        out[t] = np.where(lidar > 1e-3, lidar, np.clip(aligned, 0.0, None))
+    print(f"[depth] LIDAR_DEPTH: {len(da3)} frames of {Path(scene_dir) / 'depth'}, holes "
+          f"({100 * holes / da3.size:.1f}% of the pixels) filled with scale/shift-fitted DA3")
+    return out
+
+
 def main() -> None:
     # --------------------------------------------------------------
     # CONFIG (no argparse) — follow utils.definitions
@@ -728,6 +755,21 @@ def main() -> None:
         conf_maps = conf_maps_resized
 
     print(f"Original image size: {(H_orig, W_orig)} | Pred size: {(H_pred, W_pred)}")
+
+    # Known intrinsics (config.json INTRINSICS, per scene): every frame gets them instead of Depth Anything 3's;
+    # DA3 runs without them, so the depth is the same.
+    known = (utils.definitions.active_config.get("INTRINSICS") or {}).get(dataset_name)
+    if known:
+        kx, ky = W_orig / known["width"], H_orig / known["height"]   # to the size of the frames in images/
+        K_known = np.array([[known["fx"] * kx, 0.0, known["cx"] * kx],
+                            [0.0, known["fy"] * ky, known["cy"] * ky],
+                            [0.0, 0.0, 1.0]], dtype=np.float32)
+        intrinsics = np.repeat(K_known[None], intrinsics.shape[0], axis=0)
+        print(f"[intrinsics] config.json INTRINSICS[{dataset_name}]: fx={K_known[0, 0]:.3f} fy={K_known[1, 1]:.3f} "
+              f"cx={K_known[0, 2]:.3f} cy={K_known[1, 2]:.3f}")
+
+    if dataset_config.get_bool("LIDAR_DEPTH", False):
+        depth_maps = _lidar_filled(dataset_root, depth_maps)
 
     # ------------------------------------------------------------------
     # Save intrinsics, depth, and confidence for all frames

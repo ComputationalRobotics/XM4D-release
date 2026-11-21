@@ -228,6 +228,14 @@ python ../build/gsplat_examples/simple_trainer.py default --data-dir ../datasets
     --edg-results ../datasets/<scene>/outputs/results_all.npz --edg-target-frame 0
 ```
 
+**DyCheck, NVIDIA and Syn4D:** `configs/` holds our tuned config for each of these datasets. Copy
+`configs/dycheck.json`, `configs/nvidia.json`, `configs/syn4d_bear.json` (bear1–4) or `configs/syn4d_casa.json`
+(casa1–4) over `config.json` and set `"scene"` (the scene folder keeps the dataset's scene name, e.g. `apple`). They set
+each scene's intrinsics from the dataset (`INTRINSICS`; the focal is then not refined), DyCheck's LiDAR depth
+(`LIDAR_DEPTH`), and the 4D Gaussian settings and training length of each dataset (NVIDIA trains at half resolution);
+the Syn4D configs also turn on `SMOOTH_DEPTH_REPAIR` and `EDG_RIGID_ENDS` (step 4 below). Everything else is as in
+`config.json`, the config for any other video.
+
 Steps 1–5 also run as one command from the repository root, `bash run_pipeline.sh`. It starts the steps that do not
 wait for each other at the same time: with two GPUs, step 1 and then step 3 on the first, the two trackers of step 2
 on the second (the moving-object tracker waits for the depth only for its 3D lift); with one GPU, step 3 next to the
@@ -236,9 +244,9 @@ with the one-environment install), its output goes to `outputs/logs/run_<step>.l
 one after the other. It checks and merges the masks first (`check_masks.py`), and with `"no_masks": true` it stops after
 step 3. It also sets `NUMPY_MADVISE_HUGEPAGE=0`: on our workstation numpy's requests for huge pages for
 big arrays stalled for seconds in memory compaction (step 5 took 233 s instead of 139 s); set it too when you run the
-steps one by one. On DyCheck teddy (472 frames), steps 1–4 took 3.0 min with two GPUs and 4.6 min with one; the same
-steps one by one took 10.9 min with the previous release (15.3 min without `NUMPY_MADVISE_HUGEPAGE=0`). Steps 1–5 took
-3.3 and 4.8 min (12.9 before).
+steps one by one. On DyCheck teddy (472 frames), steps 1–4 took 3.9 min with two GPUs and 5.5 min with one; the same
+steps one by one took 10.9 min with an earlier release (15.3 min without `NUMPY_MADVISE_HUGEPAGE=0`). Steps 1–5 took
+4.3 and 5.8 min (12.9 before).
 
 Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 2 writes its visualisation videos (`outputs/viz_*.mp4`) and the
 unfiltered static tracks (`outputs/tracks_debug.npz`), step 3 its lifted tracks (`tracks_debug_3d_solver.npz`) and
@@ -248,7 +256,11 @@ XM matrices (`Abar.bin`, `Q.mat`), and step 5 its depth-check and density images
 
 Step 1 gives every frame the same intrinsics: the median of Depth Anything 3's per-frame focals, with the principal
 point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are squeezed to 2:1 for Depth Anything 3
-(`DA3_ASPECT_CAP`).
+(`DA3_ASPECT_CAP`). Known intrinsics replace them: `"INTRINSICS": {"<scene>": {"fx": …, "fy": …, "cx": …, "cy": …,
+"width": …, "height": …}}`, in px of frames of that width and height (scaled to the size of yours), with
+`"CERES_OPTIMIZE_INTRINSICS": false` so that step 3 keeps them. With `"LIDAR_DEPTH": true` the depth is the scene's
+sensor depth, `<scene>/depth/*.png` (one 16-bit PNG per frame, in mm, 0 where there is none), and Depth Anything 3's
+depth, fitted to it by a scale and a shift per frame, fills its holes.
 
 Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving objects with AllTracker
 (`DYNAMIC_TRACKER`). A static point is hidden while it is on a moving object, a moving point while it is off its object.
@@ -261,11 +273,10 @@ Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving 
   its longest stable part. With 20000 points it used up to about 45 GB of GPU memory on our videos (nvidia-smi),
   independent of the video length.
 - Moving objects: every `ALLTRACKER_KEYFRAME` frames (default 10), AllTracker adds points on a grid on the object
-  wherever no tracked point is visible nearby and tracks them forward in one dense pass at `ALLTRACKER_RES` px (384),
+  wherever no tracked point is visible nearby and tracks them forward in one dense pass at `ALLTRACKER_RES` px (512),
   to the end of the video. A point counts as visible while visibility × confidence is at least
   `ALLTRACKER_VIS_THRESHOLD` (0.6). `DYN_ALLTRACKER_GRID` (2) is the spacing of the moving points, in px at the
-  tracking resolution. At 384 px AllTracker tracked DyCheck's human keypoints as well as at 512 px (73.2 vs 72.9%
-  within 16 px) in 1.6 times less time per pass, and the coarser grid gives fewer points (teddy: 30k instead of 50k).
+  tracking resolution. 384 px takes 1.6 times less time per pass and gives fewer points (teddy: 30k instead of 50k).
   Each pass costs the same however few points it adds; `ALLTRACKER_MIN_NEW` (0, off) skips a
   keyframe that would add fewer new points than this share of the points visible there. On DyCheck, 0.05 made this
   tracking 1.4 times faster again but left up to 2% more of the object untracked.
@@ -287,8 +298,10 @@ Schur solver, all others the iterative one (`XM_CERES_LINEAR_SOLVER` forces eith
 Step 4 builds and solves the embedded deformation graph (EDG) of the moving objects:
 
 - `smooth_dynamic_tracks.py`: with the cameras fixed, each moving point's 3D track keeps its 2D track (Cauchy, 2 px)
-  and its depth (10%, weaker) and is smooth in time (acceleration, `SMOOTH_SIGMA_ACC` = 3 px per frame²). Its output is not compressed (1.3 GB on teddy), which saves
-  about 20 s here and a second in each of the four steps that read it.
+  and its depth (10%, weaker) and is smooth in time (acceleration, `SMOOTH_SIGMA_ACC` = 30 px per frame²). With
+  `SMOOTH_DEPTH_REPAIR` > 0 (0, off), an observation whose log-depth is farther than that from its track's own smoothed
+  log-depth is first moved along its ray onto it. The output is not compressed (1.3 GB on teddy), which saves about
+  20 s here and a second in each of the four steps that read it.
 - `edg_topology.py`: graph nodes are tracks that already describe their neighbourhood: a fast-moving node removes the
   tracks within 0.4 of its motion radius, a slow one the tracks that keep a nearly constant distance to it; up to
   `EDG_MAX_NODES` (200). Two nodes are joined when they move together (score of their typical distance and their
@@ -296,11 +309,14 @@ Step 4 builds and solves the embedded deformation graph (EDG) of the moving obje
   every frame they share.
 - `EDG_test_fast.py`: the graph's motion over many short windows, each solved by XM; `complete_edg_table.py` turns
   them into one motion over every frame (as-rigid-as-possible over gaps of 1 to 256 frames, smooth in time; 200 Adam
-  iterations: 400 lowered its final reprojection error by only 0.02 px on teddy).
+  iterations: 400 lowered its final reprojection error by only 0.02 px on teddy). With `EDG_RIGID_ENDS` (`false`), a
+  node's frames before its first and after its last solved window follow its 6 nearest solved neighbours rigidly.
 
 Step 5 lifts the moving-object depth pixels of every frame and binds each one to the graph at its own frame. With
 `DYN_BIND` `"motion"` (default) a pixel takes the nodes that best carry the track seen within `DYN_BIND_PX` px (3)
-of it, fitted over that track's frames; `"nearest"` takes the 6 nearest nodes.
+of it, fitted over that track's frames; `"nearest"` takes the 6 nearest nodes. The 4D Gaussians start from at most
+`GS_MAX_POINTS` points (500000), about `GS_DYN_MIN_POINTS` (50000) of them on the moving objects. With
+`GS_DATA_FACTOR` > 1 (1), step 5 also writes the frames downscaled by it and the step-6 command it prints trains on them.
 
 ### Optional: swap the trackers
 
