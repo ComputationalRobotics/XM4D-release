@@ -720,8 +720,7 @@ def main() -> None:
         cy_final = H_orig / 2.0
         # Use the focal of the axis NOT squashed by the 3:2 resize = the SHORTER image
         # dimension: for landscape (cx>cy) the width was shrunk, so fy (height) is the
-        # reliable focal; for portrait, fx. Empirically beats the squashed-axis focal
-        # ~3x on average (subset ATE-T 0.072 vs 0.21).
+        # reliable focal; for portrait, fx.
         if cx_final > cy_final:
             f_single = float(np.median(fy_all)); axis = "fy"
         else:

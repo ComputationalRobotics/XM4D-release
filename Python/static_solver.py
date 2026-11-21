@@ -169,9 +169,7 @@ DA3_SCALE_REFERENCE_KEEP_PERCENTILE = env_float("DA3_SCALE_REFERENCE_KEEP_PERCEN
 # reverse-Chamfer KD-tree rebuild. Frames after the first use a narrow local
 # search around the running-median log-scale (all frames share a similar scale).
 DA3_SCALE_REVERSE_TOPK = env_int("DA3_SCALE_REVERSE_TOPK", 3)
-# One level of 9 over +-0.1 keeps the old final grid step (~0.025): fitted scales sit at most 0.107 from the window
-# centre (teddy; <= 0.07 on Sintel/TUM/Syn4D) and the ICP refinement below is not bounded by the window. Same error vs
-# GT depth as the old +-0.35 x 3 levels on teddy, market_6, tum4 and casa3 (casa3 identical), 1.9x faster search.
+# One level of 9 over +-0.1 keeps the old final grid step (~0.025); the ICP refinement below is not bounded by the window.
 DA3_SCALE_LOCAL_RADIUS = env_float("DA3_SCALE_LOCAL_RADIUS", 0.1)  # log-scale half-width
 DA3_SCALE_LOCAL_LEVELS = env_int("DA3_SCALE_LOCAL_LEVELS", 1)
 DA3_SCALE_LOCAL_CANDIDATES = env_int("DA3_SCALE_LOCAL_CANDIDATES", 9)
