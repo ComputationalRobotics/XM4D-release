@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Build the fixed EDG connectivity over ALL tracks (per Notes/EDG.md) and visualize it.
+"""Build the fixed EDG connectivity over ALL tracks and visualize it.
 
 Same builder as visualize_track_edges.py, with two differences: the topology is built from the FULL
 video (every frame, not a subsample), and the viewer draws ALL dynamic points in a single PURPLE colour
 (the red EDG nodes/edges and cyan track edges are unchanged).
 
-Edges are decided by *persistent* world-space proximity, not single-frame closeness (Notes/EDG.md):
-  1. lift every reliable track observation to world 3D (same lift as visualize_lifted_dynamic_frame0.py:
-     X_world = da3_frame_scale[f] * R_raw[f] @ tracks_xyz[:, f] + t_raw[f]);
+Edges are decided by *persistent* world-space proximity, not single-frame closeness:
+  1. lift every reliable track observation to world 3D:
+     X_world = da3_frame_scale[f] * R_raw[f] @ tracks_xyz[:, f] + t_raw[f];
   2. over EVERY frame of the video, KD-tree per frame -> candidate neighbour pairs (union);
   3. for each candidate, over reliable co-visible frames, require enough overlap and a robust
      (quantile) separation <= edge_distance_threshold;
@@ -20,7 +20,7 @@ move per frame. SPACE = next frame, B = previous, S = save current frame (points
 Run (from Python/):
     XM_DATASET_NAME=<scene> conda run -n XM python build_edg.py
 Flags: --start N, --no-scale, --edge-thresh X (0=auto), --max-sampled-frames 0 (0=full video),
-plus the EDG.md params.
+plus the EdgeConfig params.
 """
 import argparse
 import glob
@@ -36,8 +36,7 @@ import utils.definitions
 from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
 
 
-# ----------------------------------------------------------------------------- data loading (matches
-# visualize_lifted_dynamic_frame0.py so the lift/validity are identical)
+# ----------------------------------------------------------------------------- data loading
 def _load_all(tracks_path=None):
     root = Path(utils.definitions.rootpath)
     data = np.load(tracks_path or utils.definitions.tracks_dynamics_path, allow_pickle=True)
@@ -258,7 +257,7 @@ def _disable_depth_move_filter(D):
     print(f"[keep-depth-move] un-occluded {int(undo.sum())} obs (depth+large-move), re-lifted {filled} 3D positions")
 
 
-# ----------------------------------------------------------------------------- edge builder (EDG.md)
+# ----------------------------------------------------------------------------- edge builder
 @dataclass
 class EdgeConfig:
     max_sampled_frames: int = 0          # 0 = full video (every frame); >0 subsamples that many
@@ -365,7 +364,7 @@ def _prune_redundant_tracks(Ps, Vs, Ocount, thr, radius_factor, verbose=True):
 
 
 def build_edg_edges(D, s, cfg: EdgeConfig, verbose=True):
-    """Implements Notes/EDG.md. Returns edges (E,2) int track-index pairs and scores (E,) distances."""
+    """Returns edges (E,2) int track-index pairs and scores (E,) distances."""
     T = D["T"]
     if cfg.max_sampled_frames and cfg.max_sampled_frames > 0:
         sampled = np.unique(np.linspace(0, T - 1, min(cfg.max_sampled_frames, T)).astype(int))
@@ -666,7 +665,6 @@ def _link_rigid_components(D, cfg, edges, scores, Ps, Vs, verbose=True):
 # frames). Repeat on the survivors. A near track that is temporally DISJOINT is kept -- it covers a
 # different time span of the same region, so it is a useful separate node. EDG EDGES then connect node
 # pairs within edge_hops on the persistent-proximity track graph (independent objects stay separate).
-# (This is the exact algorithm that visualize_edg_suppressed.py uses/visualizes.)
 def _frame_trees_2d(xy, Vs, T):
     """Per-frame KD-tree over the reliable tracks' 2D image positions (for candidate gathering)."""
     idx_per = [np.where(Vs[t])[0] for t in range(T)]
@@ -857,8 +855,8 @@ def build_edg_graph(edges, Q, xy, Ps, Vs, Ocount, thr, near_px=15.0, overlap_fra
                   f"{int((keep_cap & keep_far & ~keep_var).sum())} varying, {int((~_fin).sum())} never-co-visible)")
         edg_edges = edg_edges[keep]
 
-    # --- MIN-DEGREE kNN FALLBACK: the hop graph fragments on large / occlusion-heavy dynamic regions
-    # (e.g. block: 91/130 nodes isolated), leaving the deformation graph disconnected so ARAP has nothing
+    # --- MIN-DEGREE kNN FALLBACK: the hop graph can fragment on large / occlusion-heavy dynamic regions,
+    # leaving the deformation graph disconnected so ARAP has nothing
     # to regularize. Guarantee every EDG node connects to >= min_degree nearest co-visible nodes (robust
     # p90 3D distance over co-visible frames -- same metric as the cap), adding edges as needed. ---
     if min_degree and min_degree > 0 and nodes.size > 1:
@@ -948,7 +946,7 @@ def _augment_edg_min_degree(edg_edges, nodes, Ps, Vs, min_degree, verbose=True,
 
 
 def _nanquantile_fast(a, q, axis=0):
-    """np.nanquantile(a, q, axis) with the default linear method, vectorised (sandbox 2026-11-17, speed only: numpy loops over
+    """np.nanquantile(a, q, axis) with the default linear method, vectorised (speed only: numpy loops over
     columns in Python when NaNs are present). Same interpolation (numpy's _lerp); NaN where a slice has no finite value."""
     a = np.moveaxis(np.asarray(a, np.float64), axis, 0)
     fin = ~np.isnan(a); n = fin.sum(0)
@@ -1015,7 +1013,7 @@ def build_dyn_to_edg_edges(edges, Q, edg_nodes, Ps, Vs, Ocount, thr, hop_lt=2, m
             keep = ~node_mask[qi]
             for nl, q in zip(ni[keep].tolist(), qi[keep].tolist()):
                 cand[q].add(int(nl))
-    elif cand_near and cand_near < K:                         # no track graph (sandbox 2026-11-17, speed): the cand_near
+    elif cand_near and cand_near < K:                         # no track graph (speed): the cand_near
         nodes_P = Ps[:, edg_nodes]                           # nodes nearest at up to 5 of the point's frames (min distance)
         nodes_V = Vs[:, edg_nodes]
 

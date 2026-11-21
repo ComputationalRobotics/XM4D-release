@@ -6,8 +6,7 @@ last observation minimise
 (frames where the point is hidden are tied in by the acceleration term only). Cameras: X = s R x_cam + t (result_XM.npz),
 K from outputs/depth_anything_3/intrinsics.npy, u_t / d_t = the 2D track and its depth (tracks_dynamic_only.npz). Gauss-Newton
 with IRLS weights; each track's normal equations are banded (xyz interleaved, bandwidth 8) and solved exactly.
-Without it the lifted points jitter frame to frame with the per-frame depth, the deformation graph inherits the zig-zag and
-the segment solves lose their optimality certificate more often.
+Without it the lifted points jitter frame to frame with the per-frame depth and the deformation graph inherits the zig-zag.
 
 Writes outputs/tracks_dynamic_only_smoothed.npz: the input keys with tracks_xyz replaced by the smoothed points in each frame's
 camera (x_cam = R^T (X - t) / s, NaN where the input is invalid), plus tracks_world_smoothed (Q, T, 3).

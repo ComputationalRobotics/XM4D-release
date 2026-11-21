@@ -288,11 +288,9 @@ def _rescale_to_mask_projection(verts, intrinsics, comp_mask):
     """Scale the aligned model (about its centroid) so its 2D projection fills the
     component mask's image region, optionally recentering onto the mask.
 
-    The depth chamfer/ICP fit often under-scales the model (chamfer is minimized by a
-    smaller model nested inside the depth cloud), so its projected footprint is smaller
-    than the mask. We match the RMS spread and mean of the projected points to those of
-    the mask pixels -- a consistent, outlier-robust statistic for both sides (bbox
-    min/max would over-scale on stray points). Returns (verts_new, scale).
+    The uniform scale is the geometric mean of the per-axis ratios of the mask's and the
+    projected model's 2D bounding boxes; recentering moves the projected mean onto the mean
+    of the mask pixels. Returns (verts_new, scale).
     """
     K = np.asarray(intrinsics, dtype=np.float64)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
@@ -694,7 +692,7 @@ def main() -> None:
     aligned_mesh.export(str(out_mesh_path))
     print(f"Saved combined aligned mesh ({len(components)} components, {verts_aligned.shape[0]} verts):", out_mesh_path)
 
-    # Combined foreground mask (indices into the merged vertex array), for EDG_sam3d.py.
+    # Combined foreground mask (indices into the merged vertex array).
     fg_mask_path = OUTPUT_DIR / f"sam3d_{image_path.stem}_foreground_mask.npz"
     np.savez_compressed(
         fg_mask_path,

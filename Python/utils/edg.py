@@ -408,7 +408,7 @@ def draw_world_trajectories_from_glob_all(
 
 def _assemble_normal_eqs_vec(*, edges, edg_idx_map, g, edg_obs, edg_obs_mask, N_dyn_obs, dyn_kp_idx, dyn_frame, dyn_global,
 							 frame_to_trev, kp_neighbors, kp_weights, kp_rest, R_start, p_start, T_rev, nz, w_obs, w_arap, w_smooth, w_edg_obs):
-	"""Batched version of the normal-equation loops of solve_qcqp_and_recover_until_part5 (2026-11-16, speed only): the same
+	"""Batched version of the normal-equation loops of solve_qcqp_and_recover_until_part5 (speed only): the same
 	blocks (2 w C^T C, -2 w C^T b, w b^T b) of the observation, ARAP, EDG-observation and smoothness terms, built per batch
 	instead of one 3x3 / 9x9 block at a time. Returns Q_I_list, Q_J_list, Q_V_list, q_accum, c_accum."""
 	I_l, J_l, V_l = [], [], []
@@ -465,7 +465,7 @@ def _assemble_normal_eqs_vec(*, edges, edg_idx_map, g, edg_obs, edg_obs_mask, N_
 					keys.append((js[:, n] * M_o + js[:, m]) * (T_rev + 1) + tr)
 					Ds.append((ww[:, None, None] * d[:, n, :, None] * d[:, m, None, :]).reshape(-1, 9))
 					us.append(ww[:, None] * d[:, n]); vs.append(ww[:, None] * d[:, m]); ss.append(ww)
-	if keys:                                                       # sandbox 2026-11-17 (speed only): one 12x12 block per
+	if keys:                                                       # one 12x12 block per
 		uk, inv = np.unique(np.concatenate(keys), return_inverse=True)   # (node, node, frame) instead of one per observation
 		U = uk.size; inv = inv.ravel()
 		acc = lambda X: np.stack([np.bincount(inv, weights=X[:, i], minlength=U) for i in range(X.shape[1])], 1)
@@ -864,9 +864,9 @@ def solve_qcqp_and_recover_until_part5(
 	if use_dense:
 		print(f"  Using dense solve for Qww (n={qww_n}, ~{est_dense_mb:.1f} MB)")
 		Qww_dense = Qww_reg.toarray(out=_work("Qww", Qww_reg.shape, "F"))      # Fortran (csc) order, as toarray()
-		Qwy3 = Qwy_csc[:, 0::3]                                  # XM takes Qred[0::3, 0::3] only: solve for those columns (2026-11-16)
+		Qwy3 = Qwy_csc[:, 0::3]                                  # XM takes Qred[0::3, 0::3] only: solve for those columns
 		Qwy_dense = Qwy3.toarray(out=_work("Qwy", Qwy3.shape, "F"))           # both factored / solved in place below
-		try:                                                     # Qww is symmetric positive definite: Cholesky (2026-11-16, speed)
+		try:                                                     # Qww is symmetric positive definite: Cholesky
 			from scipy.linalg import cho_factor, cho_solve
 			cf = cho_factor(Qww_dense, lower=True, overwrite_a=True, check_finite=False)
 			X = cho_solve(cf, Qwy_dense, overwrite_b=True, check_finite=False)

@@ -46,7 +46,7 @@ def save_object(name, category, frames, masks):
     """Write one object to masks/<category>_<name>/: masks (T, H, W) bool, one per frame path in frames. category is
     "rigid" (moves as one rigid body), "human" (a person, hands included) or "other" (anything else that moves).
     Saving the same name again replaces its masks and keeps its place in the adding order."""
-    if category == "hand":   # TODO: hand category (own folder, priority over human), supported soon
+    if category == "hand":
         raise NotImplementedError("hand masks are not supported yet (coming soon): save hands as part of 'human'")
     if category not in CATEGORIES:
         raise ValueError(f"category {category!r}: use 'rigid', 'human' or 'other'")

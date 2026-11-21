@@ -75,7 +75,7 @@ DA3_OUTLIER_K = 10        # neighbours for mean-distance computation
 DA3_OUTLIER_STD_RATIO = 2.0  # remove if mean_k_dist > global_mean + ratio * global_std
 # Relative depth-gradient gate on the DA3 static lift: drop pixels at depth discontinuities
 # (object silhouettes) that lift into "flying-pixel curtains" between fg/bg and break at novel
-# views. 0 = off (legacy). Sweep ~0.05-0.2. Mirrors the GT path's DEPTH_GRAD_MAX filter.
+# views. 0 = off. Typical values ~0.05-0.2. Mirrors the GT path's DEPTH_GRAD_MAX filter.
 DA3_DEPTH_GRAD_MAX = float(os.environ.get("DA3_DEPTH_GRAD_MAX", "0.0"))
 DEBUG = dataset_config.get_bool("DEBUG", False, env="DEBUG")  # also write the depth-reject/density png, npz, videos
 # Threads of the KD-tree queries and per-frame loops (the results do not depend on them). workers=-1 spawns a thread per
@@ -502,9 +502,7 @@ def _lift_edg_bound_dynamic_from_depth(*, depth_maps, dynamic_masks, R_raw, t_ra
         img = cv2.imread(str(image_paths[t]), cv2.IMREAD_COLOR)
         if img is not None:
             # Sample colour whenever the image loads. The scale is a no-op when the image and
-            # depth-map sizes match (the common case) and resamples when they differ. Previously
-            # this branch REQUIRED the sizes to differ, so equal-size scenes (e.g. Syn4D 960x1280)
-            # fell through to flat gray -> colourless dynamic points.
+            # depth-map sizes match (the common case) and resamples when they differ.
             sxi, syi = img.shape[1] / float(Wd), img.shape[0] / float(Hd)
             ui = np.clip((xx * sxi).astype(np.int64), 0, img.shape[1] - 1)
             vi = np.clip((yy * syi).astype(np.int64), 0, img.shape[0] - 1)
@@ -788,8 +786,8 @@ def _build_edg_good_dynamic_points(
     """Dynamic cloud from the EDG-skinned photometrically-GOOD tracks (edg_completed.npz).
 
     Reuses edg_viz_common (the single source of truth for the skinning + render-colour scorer). GOOD tracks
-    = finite fused colour AND not a render-colour outlier -- exactly the set visualize_best_color_2d
-    --use-color draws. Each good track keeps its binding at ITS OWN first-finite frame s_k
+    = finite fused colour AND not a render-colour outlier.
+    Each good track keeps its binding at ITS OWN first-finite frame s_k
     (complete_edg_table.build_skinning semantics: rel = R_m(s_k)^T (x_k(s_k) - X_m(s_k))), so NO frame is
     special -- the trainer's bind-frame-agnostic warp X_m(t) + R_m(t) rel fuses every point to whatever
     frame is rendered. `target_frame` is only the COLMAP dataset's coordinate gauge (init positions).
@@ -898,7 +896,7 @@ def _build_edg_good_dynamic_points(
     flag, score, fused = detect_render_color_outliers(
         sp, pids, dyn_ids, dyn_reconstruct, ctx, scorer_args, return_color=True)
 
-    good = np.isfinite(fused).all(1) & (~flag)   # the visualize_best_color_2d --use-color GOOD set
+    good = np.isfinite(fused).all(1) & (~flag)
     if int(dyn_best) > 0:
         fin = np.where(good & np.isfinite(score))[0]
         order = fin[np.argsort(score[fin])]      # lowest render-colour score = best-aligned first
@@ -932,8 +930,7 @@ def _build_edg_good_dynamic_points(
     # rel_km = R_m(s_k)^T (x_k(s_k) - X_m(s_k)). The trainer's warp X_m(t) + R_m(t) rel is bind-frame-
     # agnostic, so rendering ANY frame t fuses every point to t -- all frames are equal/symmetric. rel is
     # invariant under the rigid world->target transform, so the solver-world binding is valid in the
-    # target-frame coordinates the trainer uses. (The old code re-bound everything AT the target frame,
-    # anchoring 90+% of points at back-extrapolated positions -- the frame-0-special problem.)
+    # target-frame coordinates the trainer uses.
     pos_world = _skin_dyn_frame(sp, int(target_frame))   # fused positions AT the target frame (COLMAP init)
     gi = np.where(good & np.isfinite(pos_world).all(1))[0]
     K = int(k_neighbors)
@@ -1966,7 +1963,7 @@ def prepare_4dgs_dataset(
 
     depth_maps = None
 
-    # Add static points. For DA3, mirror lift_da3_points.py exactly, then
+    # Add static points lifted from depth, then
     # transform the resulting solver-world points into the target frame.
     depth_maps, depth_src_desc = _load_depth_maps_for_static_lifting(
         depth_source=depth_source,
@@ -2039,9 +2036,7 @@ def prepare_4dgs_dataset(
                 depth_maps=depth_maps,
                 dynamic_masks=dynamic_masks,
                 K_all=K_all[:T_depth],
-                # RAW world cameras: the lift produces world points and applies w2t ITSELF. Passing the
-                # already-target-transformed c2w_all here double-applied w2t (harmless at target 0 where
-                # w2t~identity, catastrophic for target!=0 -- found by the overnight-3 review).
+                # RAW world cameras: the lift produces world points and applies w2t ITSELF.
                 c2w_all=c2w_raw_all[:T_depth],
                 w2t=w2t,
                 image_paths=image_paths[:T_depth],

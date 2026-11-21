@@ -40,9 +40,8 @@ output_dir = utils.definitions.output_dir
 
 BUILD_EDG_SEGMENR_LENGTH = 11  # step in tracking + 1 to include last frame
 # Cap total EDG node count. The segment solver is ~O(M^3) in node count M, and
-# EDG_old otherwise GROWS nodes across segments (apple->589, wheel->491), making it
-# very slow. Capping keeps it fast (like EDG_prior/EDG_mosca) with ~no render-quality
-# loss (they tie). Env-overridable: MAX_EDG_NODES=0 disables the cap (original behavior).
+# EDG_old GROWS nodes across segments, so the cap keeps it fast.
+# Env-overridable: MAX_EDG_NODES=0 disables the cap.
 MAX_EDG_NODES = int(os.environ.get("MAX_EDG_NODES", "150"))
 
 data = np.load(utils.definitions.tracks_dynamics_path, allow_pickle=True)
@@ -86,7 +85,7 @@ else:
     gt_items = []
     intrinsics_all = None
 
-# load gt extrinsics
+# load the static solver's extrinsics (result_XM.npz)
 rt = np.load(str(utils.definitions.rootpath / "outputs" / "result_XM.npz"))
 landmarks = rt["p"].T if "p" in rt else None
 # The static solver may drop frames (checklandmarks / XM^2), so R/t/s are stored in
@@ -1148,7 +1147,7 @@ import os as _os, sys as _sys
 if _os.environ.get("EDG_NO_VIZ"):
     print("EDG_NO_VIZ set -> skipping Open3D visualization; results_all.npz saved.")
     _sys.stdout.flush(); _sys.stderr.flush()
-    _os._exit(0)   # hard exit: avoid SIGABRT from native (Open3D/TEASER) thread cleanup at interpreter shutdown
+    _os._exit(0)   # hard exit (skip the interpreter shutdown)
 
 ########################################################################
 ### Visualization using Open3D

@@ -240,7 +240,7 @@ def _eval_rgb_metric(
     if pred.shape[:2] != gt.shape[:2]:
         return None
     finite = np.isfinite(pred).all(axis=-1) & np.isfinite(gt).all(axis=-1)
-    # honest all-covisible mask (MoSca protocol): every co-visible pixel scored over the opaque
+    # all-covisible mask (MoSca protocol): every co-visible pixel scored over the opaque
     # black-bg render, holes count as error. alpha here is already co-visibility-folded.
     covis = finite & (cov_mask if cov_mask is not None else np.ones_like(finite))
     valid = finite.copy()
@@ -265,7 +265,7 @@ def _eval_rgb_metric(
     pred_t, gt_t = _make_metric_tensors(pred, gt, valid, device)
     ssim = float(ssim_metric(pred_t, gt_t).detach().cpu().item())
     lpips = float(lpips_metric(pred_t, gt_t).detach().cpu().item())
-    # Always report the honest all-covisible PSNR (MoSca-comparable) for reference, whatever the
+    # Always report the all-covisible PSNR (MoSca-comparable) for reference, whatever the
     # primary metric_mask is. Uses simple masked MSE (holes=black count as error), no full-denom.
     psnr_covis = _psnr_masked(pred, gt, covis) if np.any(covis) else None
     # Alpha-gated PSNR for reference (optimistic; drops holes).
@@ -692,7 +692,7 @@ def _evaluate_novel(
     if not collected:
         return [], None
 
-    # Fit the color calibration (scene-global by default per the DyCheck sensor-offset argument).
+    # Fit the color calibration ('scene' = one affine shared by all novel views; 'none' = identity).
     gain, bias = _fit_color_affine([(c["pred"], c["gt"], c["valid"]) for c in collected], color_calib)
 
     # Phase 2: apply calibration, score, save.

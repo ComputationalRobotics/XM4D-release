@@ -797,8 +797,8 @@ def _render_depth(
     if app_module is not None:
         # app_embed_mode: 'base' = this frame's learned exposure embedding (default);
         # 'zero' = neutral (no embedding); 'mean' = average over all training embeddings.
-        # For NOVEL views, base imposes a training frame's exposure on a different physical
-        # test camera -> a self-inflicted offset; 'zero'/'mean' render a neutral appearance.
+        # For NOVEL views, base applies a training frame's exposure to a different physical
+        # test camera; 'zero'/'mean' render a neutral appearance.
         image_ids: torch.Tensor | None = torch.tensor([int(frame_index)], device=device, dtype=torch.long)
         embed_override = None
         if app_embed_mode == "zero":

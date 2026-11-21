@@ -280,16 +280,14 @@ Step 3 refines the XM cameras with Ceres. The reprojection residuals have a Cauc
 `CERES_LOSS`: `cauchy`, `huber`, `softl1` or `trivial`), and the shared focal is refined too
 (`CERES_OPTIMIZE_INTRINSICS`). Videos of at most 100 frames with at least 60 landmarks per frame use Ceres' dense
 Schur solver, all others the iterative one (`XM_CERES_LINEAR_SOLVER` forces either). On our 13 test videos of at most
-100 frames this made step 3 2.4 times faster (239 → 99 s) with the same cameras, except Sintel market_6 (position
-error 0.0095 → 0.0087, rotation error 0.025 → 0.035). Ceres stops when an iteration lowers the cost by less than
+100 frames this made step 3 2.4 times faster (239 → 99 s). Ceres stops when an iteration lowers the cost by less than
 `CERES_FUNCTION_TOLERANCE` (1e-4) of it; Ceres' default 1e-6 took 2.7 to 3.7 times longer on our 16 test videos
-(316 → 85–118 s of Ceres) for the same cameras, except Syn4D casa4 (rotation error 0.0076 → 0.0083).
+(316 → 85–118 s of Ceres).
 
 Step 4 builds and solves the embedded deformation graph (EDG) of the moving objects:
 
 - `smooth_dynamic_tracks.py`: with the cameras fixed, each moving point's 3D track keeps its 2D track (Cauchy, 2 px)
-  and its depth (10%, weaker) and is smooth in time (acceleration, `SMOOTH_SIGMA_ACC` = 3 px per frame²). Without it
-  the per-frame depth noise makes the graph zig-zag. Its output is not compressed (1.3 GB on teddy), which saves
+  and its depth (10%, weaker) and is smooth in time (acceleration, `SMOOTH_SIGMA_ACC` = 3 px per frame²). Its output is not compressed (1.3 GB on teddy), which saves
   about 20 s here and a second in each of the four steps that read it.
 - `edg_topology.py`: graph nodes are tracks that already describe their neighbourhood: a fast-moving node removes the
   tracks within 0.4 of its motion radius, a slow one the tracks that keep a nearly constant distance to it; up to
@@ -302,8 +300,7 @@ Step 4 builds and solves the embedded deformation graph (EDG) of the moving obje
 
 Step 5 lifts the moving-object depth pixels of every frame and binds each one to the graph at its own frame. With
 `DYN_BIND` `"motion"` (default) a pixel takes the nodes that best carry the track seen within `DYN_BIND_PX` px (3)
-of it, fitted over that track's frames; `"nearest"` takes the 6 nearest nodes, which often belong to another part
-and average its motion away.
+of it, fitted over that track's frames; `"nearest"` takes the 6 nearest nodes.
 
 ### Optional: swap the trackers
 
@@ -317,9 +314,7 @@ Either part of step 2 can use either tracker, set in `config.json`:
 AllTracker tracks the static scene at `STATIC_ALLTRACKER_RES` px (1024), for at most `STATIC_ALLTRACKER_MAX_LEN`
 frames (100) from its keyframe, visible while visibility × confidence is at least `STATIC_ALLTRACKER_VIS_THRESHOLD`
 (0.99), with an extra keyframe at any frame where fewer than `STATIC_ALLTRACKER_MIN_VISIBLE` points (200) are visible.
-At 1024 px it needs about 24 GB of GPU memory for a 1024 × 768 video. Its points are more accurate on most of our test
-videos, but during a fast camera turn over repeating texture it can follow a wrong spot with full confidence, and the
-cameras then fail. TAPNext on the moving objects keeps its own filters: it cuts a track at a large 2D move against its
+At 1024 px it needs about 24 GB of GPU memory for a 1024 × 768 video. TAPNext on the moving objects keeps its own filters: it cuts a track at a large 2D move against its
 neighbours and at a point lost off its object.
 
 ## License

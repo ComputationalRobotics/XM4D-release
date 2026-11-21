@@ -180,7 +180,7 @@ DA3_SCALE_LOCAL_CANDIDATES = env_int("DA3_SCALE_LOCAL_CANDIDATES", 9)
 # scale: s = sum(dir . (nn - center)) / sum(dir . dir) over trimmed correspondences.
 DA3_SCALE_REFINE_ITERS = env_int("DA3_SCALE_REFINE_ITERS", 4)
 # KD-tree query threads (the result does not depend on them). workers=-1 spawns a thread per core (huge overhead
-# for the many tiny per-frame queries on a big machine); 4 is fastest for these sizes (1.4x vs 1, 16 is slower).
+# for the many tiny per-frame queries on a big machine); 4 is fastest for these sizes.
 DA3_SCALE_QUERY_WORKERS = env_int("DA3_SCALE_QUERY_WORKERS", 4)
 RESULT_POINT_MAX_NORM = env_float("XM_RESULT_POINT_MAX_NORM", 2.0)
 
@@ -2065,13 +2065,6 @@ def eval_mosca_style_with_evo(R_real, t_est, s_real, R_gt, t_gt, apply_coordinat
 
     return ate, rpe_trans, rpe_rot
 
-############################
-# For experiment in paper only
-# download the dataset from:
-# https://drive.google.com/drive/folders/13_2mcKGKVU0ibWck2n4ajUrN2MaDfR7y?usp=sharing
-# and put it in the folder './assets/Experiment/**'
-############################
-
 ### S0: CONFIG
 dataset_cat = utils.definitions.dataset_cat
 dataset_path = str(utils.definitions.rootpath)
@@ -2184,7 +2177,7 @@ N = int(np.max(edges[:, 0]))
 M = int(np.max(edges[:, 1]))
 
 # Drop frames whose observation count is <= FRAME_MIN_POINTS in checklandmarks.
-# Raise it to remove weakly-observed cameras (often the largest-error ones).
+# Raise it to remove weakly-observed cameras.
 FRAME_MIN_POINTS = dataset_config.get_int("FRAME_MIN_POINTS", 10, env="XM_FRAME_MIN_POINTS")
 
 PENALTY_T_MULT = dataset_config.get_float("PENALTY_T_MULT", 0.0, env="XM_PENALTY_T_MULT")
@@ -2297,7 +2290,6 @@ if USE_XM2:
   sR_real = build_sR_real(R_real, s_real, N)
 
   # XM^2
-  # some times the result is not good, so we need to remove some outliers
   # this is basically a robust outlier removal, you delete landmarks that has the largest error
 
   src_idx = edges[:, 0] - 1  # Convert from 1-based to 0-based indexing
@@ -2386,8 +2378,7 @@ if USE_XM2:
   p_est = np.asarray(p_est, dtype=np.float64)
   t_est = np.asarray(t_est, dtype=np.float64)
 
-# If you still do not have a good result, consider using Ceres to refine using 2D observations.
-# But make sure your 2D observation is good enough -- otherwise this won't help
+# Ceres refinement with the 2D observations (--no-use-ceres skips it).
 
 landmarks_2D = landmarks[:, :2] / landmarks[:, 2, None]
 nan_mask = np.isnan(landmarks_2D).any(axis=1)

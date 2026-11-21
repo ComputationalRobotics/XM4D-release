@@ -2,7 +2,7 @@
 """Extend 2D tracks across occlusion, then LINK fragmented tracks that are actually the same point into
 single longer tracks (1-to-1 chains, not groups).
 
-Idea (tracks are too short -- a point gets re-tracked under a new id after an occlusion). When A becomes
+Idea (a point gets re-tracked under a new id after an occlusion). When A becomes
 invisible the tracker KEEPS predicting A's 2D position (finite but occluded), so:
   * For each track A, take its predicted positions AFTER its last visible frame, in the window
     [last_vis_A + 1, last_vis_A + WINDOW], and find a continuation B that (a) is VISIBLE and extends A

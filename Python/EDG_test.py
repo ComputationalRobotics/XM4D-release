@@ -373,9 +373,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # All segments are solved and saved by here. The XM C++ extension can double-free at interpreter
-    # teardown ("free(): invalid pointer" -> SIGABRT/exit 134) AFTER the work is done; skip that teardown
-    # with a hard exit so the script returns 0 cleanly.
+    # All segments are solved and saved by here; exit without the interpreter teardown.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)

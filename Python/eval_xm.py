@@ -212,7 +212,7 @@ def teaser_align_camera_centers(
 		vis.add_geometry(line_set)
 
 		opt = vis.get_render_option()
-		opt.point_size = 10.0        # increase/decrease this
+		opt.point_size = 10.0
 		opt.line_width = 3.0        # may not work on all platforms
 
 		vis.run()

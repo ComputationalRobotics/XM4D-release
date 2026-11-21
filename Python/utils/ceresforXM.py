@@ -124,9 +124,8 @@ def XM_Ceres_interface(
 
     options = pyceres.SolverOptions()
     # Linear solver: DENSE_SCHUR for short videos with many landmarks per frame (<= 100 frames, >= 60 landmarks per
-    # frame: 1.2-15x faster on the 16-scene test set, same cameras), ITERATIVE_SCHUR otherwise (long videos, where the
-    # dense reduced camera system grows with frames^2, and few landmarks per frame, as TUM: dense was 1.1-2.8x slower).
-    # XM_CERES_LINEAR_SOLVER forces one.
+    # frame), ITERATIVE_SCHUR otherwise (long videos, where the dense reduced camera system grows with frames^2, and
+    # few landmarks per frame). XM_CERES_LINEAR_SOLVER forces one.
     linear_solver = os.environ.get("XM_CERES_LINEAR_SOLVER") or (
         "DENSE_SCHUR" if N <= 100 and M >= 60 * N else "ITERATIVE_SCHUR"
     )

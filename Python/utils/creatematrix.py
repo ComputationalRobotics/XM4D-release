@@ -8,7 +8,7 @@ from scipy.sparse import coo_matrix, csr_matrix, dia_matrix, lil_matrix, bmat, h
 
 from utils.io import save_matrix_to_bin
 
-# will use it in final release, not now for simplicity just comment
+# optional GPU (cupy) backend, disabled (USE_GPU = 0)
 # import cupy
 # import cupyx
 
@@ -72,8 +72,6 @@ def process_observation_old(i, observation_index, landmarks, weight):
 
 # create matrix function; returns Abar (written to Abar.bin, and Q.mat, only with debug)
 def create_matrix(weight, edges, landmarks, output_path, penalty_t = 0.0, debug = False):
-
-    # TODO: implement sparse Q matrix construction
     DEFINE_DENSE = 1
     USE_GPU = 0
 
@@ -228,7 +226,6 @@ def create_matrix(weight, edges, landmarks, output_path, penalty_t = 0.0, debug 
     start_time_mul = time.perf_counter()
     
     if USE_GPU:
-        # TODO: add cupy and deal with CUDA OUT OF MEMORY
         print("TODO: add cupy and deal with CUDA OUT OF MEMORY")
         # RHS_B = cupy.array(RHS_B)
         # RHS_A = cupy.array(RHS_A)

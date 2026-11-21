@@ -4,7 +4,7 @@
 Pure numpy/cv2 + utils (NO open3d, NO torch). Provides the world -> camera -> pixel projection, the 2D
 reprojection context (initial 2D tracks + XM lift poses + per-frame intrinsics + frame images), the
 embedded-deformation skinning of the dynamic tracks, and the photometric render-colour scorer. Imported by
-visualize_longest_track_2d.py, visualize_best_color_2d.py and visualize_edg_filtered_open3d.py so the exact
+complete_edg_table.py, train_4dgs_edg.py and visualize_tracks_2d.py so the exact
 same projection / skinning / scoring is used everywhere. This module has NO __main__.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ def project_to_frame(pts_world, ctx, f):
     return u, v, ok
 
 
-# ------------------------------------------------- Filter 3: photometric render-colour outlier detection
+# ------------------------------------------------- photometric render-colour outlier detection
 def _build_dyn_skin(dyn_ids, dr, node_ids, edg_pos, edg_rot):
     """Embedded-deformation skinning for the dynamic tracks (same rule as visualize_edg_solution_open3d's
     _build_dyn_skinning) but ALSO returning `pids` = the dyn global id of every skinned row, so the render-
@@ -104,7 +104,7 @@ def _skin_dyn_frame(sp, frame):
 def _sample_frame_color(img, positions, Rf, tf, sf, Kf, patch):
     """Project `positions` (N,3 solver-world) into one image (inverse XM lift + pinhole) and sample a BGR
     patch-median colour, returned as HSV hue/sat and the BGR median. Returns hue(N), sat(N), bgr(N,3), inb(N)
-    -- exactly the projection used by the --viz-2d path so the sampled pixel matches what is drawn there."""
+    -- the same projection as project_to_frame."""
     import cv2
     N = positions.shape[0]
     H, W = img.shape[:2]

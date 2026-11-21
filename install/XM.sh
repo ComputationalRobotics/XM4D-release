@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Conda env for steps 3-5 (Python/static_solver.py, EDG_old.py, train_4dgs_edg.py): the XM solver.
+# Conda env for steps 3-5 (Python/static_solver.py, EDG_test_fast.py, train_4dgs_edg.py): the XM solver.
 # The solver ships compiled in XM/build (Python 3.10, CUDA 12.4); its CUDA libraries come from pip, so no system CUDA
 # toolkit is needed. TEASER++ is built from source, which needs a C++ compiler.
 # usage: bash install/XM.sh [env name]      (default env name: XM)

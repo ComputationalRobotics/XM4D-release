@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """2D inspector for the RAW dynamic tracking output (outputs/tracks_dynamic_only.npz from
-dynamic_tracking.py, or tracks_dynamic_merged.npz with --merged) -- same interaction pattern as
-visualize_edg_filtered_open3d.py --viz-2d:
+dynamic_tracking.py, or tracks_dynamic_merged.npz with --merged):
 
   SPACE / B : next / previous frame
   N / P     : next / previous RANK (tracks ranked by visible-frame count; 1 = longest)

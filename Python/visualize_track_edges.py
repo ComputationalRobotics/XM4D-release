@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Build the fixed EDG connectivity over ALL tracks (per Notes/EDG.md) and visualize it.
+"""Build the fixed EDG connectivity over ALL tracks and visualize it.
 
-Edges are decided by *persistent* world-space proximity, not single-frame closeness (Notes/EDG.md):
-  1. lift every reliable track observation to world 3D (same lift as visualize_lifted_dynamic_frame0.py:
-     X_world = da3_frame_scale[f] * R_raw[f] @ tracks_xyz[:, f] + t_raw[f]);
+Edges are decided by *persistent* world-space proximity, not single-frame closeness:
+  1. lift every reliable track observation to world 3D
+     (X_world = da3_frame_scale[f] * R_raw[f] @ tracks_xyz[:, f] + t_raw[f]);
   2. sample <= max_sampled_frames frames, KD-tree per frame -> candidate neighbour pairs (union);
   3. for each candidate, over reliable co-visible sampled frames, require enough overlap and a robust
      (quantile) separation <= edge_distance_threshold;
   4. keep each node's max_neighbors closest, symmetrized by union.
 
-Then it shows the graph the SAME way as visualize_lifted_dynamic_frame0.py: the tracks lifted at the
+Then it shows the graph: the tracks lifted at the
 current frame (points) with the fixed edges drawn as lines that follow the points; the edge SET is
 global (fixed in time), only the 3D endpoints move per frame. SPACE = next frame, B = previous,
 S = save current frame (points+edges) as PLY/OBJ, Q/ESC = close.
 
 Run (from Python/):
     XM_DATASET_NAME=<scene> conda run -n XM python visualize_track_edges.py
-Flags: --start N, --no-scale, --color {image,gray}, --edge-thresh X (0=auto), plus EDG.md params.
+Flags: --start N, --no-scale, --color {image,gray}, --edge-thresh X (0=auto), plus the edge-builder params.
 """
 import argparse
 import glob
@@ -31,8 +31,7 @@ import utils.definitions
 from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
 
 
-# ----------------------------------------------------------------------------- data loading (matches
-# visualize_lifted_dynamic_frame0.py so the lift/validity are identical)
+# ----------------------------------------------------------------------------- data loading
 def _load_all():
     root = Path(utils.definitions.rootpath)
     data = np.load(utils.definitions.tracks_dynamics_path, allow_pickle=True)
@@ -235,7 +234,7 @@ def _disable_depth_move_filter(D):
     print(f"[keep-depth-move] un-occluded {int(undo.sum())} obs (depth+large-move), re-lifted {filled} 3D positions")
 
 
-# ----------------------------------------------------------------------------- edge builder (EDG.md)
+# ----------------------------------------------------------------------------- edge builder
 @dataclass
 class EdgeConfig:
     max_sampled_frames: int = 300
@@ -341,7 +340,7 @@ def _prune_redundant_tracks(Ps, Vs, Ocount, thr, radius_factor, verbose=True):
 
 
 def build_edg_edges(D, s, cfg: EdgeConfig, verbose=True):
-    """Implements Notes/EDG.md. Returns edges (E,2) int track-index pairs and scores (E,) distances."""
+    """Edge rule of the module docstring. Returns edges (E,2) int track-index pairs and scores (E,) distances."""
     T = D["T"]
     sampled = np.unique(np.linspace(0, T - 1, min(cfg.max_sampled_frames, T)).astype(int))
     Ps, Vs = _stack_sampled(D, s, sampled)

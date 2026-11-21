@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Global completion of the partially-observed EDG table produced by EDG_test_fast.py.
 
-Implements Notes/edg_table_completion(1).pdf: one SINGLE global optimisation over the whole M x T table of
+One SINGLE global optimisation over the whole M x T table of
 EDG poses Q_{m,t} = (R_{m,t}, c_{m,t}) in SE(3), combining
 
   L_obs   -- dynamic-point observations via a rest-frame-free source->target warp
@@ -19,7 +19,7 @@ EDG poses Q_{m,t} = (R_{m,t}, c_{m,t}) in SE(3), combining
              recovered from the stored tracks), must match their ORIGINAL 2D pixel tracks. Depth-free, so it
              pins the image-plane drift that the depth-noisy 3D lift cannot see.
 
-BEFORE solving, the input table is CLEANED cell-by-cell (same rules as visualize_edg_filtered_open3d.py):
+BEFORE solving, the input table is CLEANED cell-by-cell:
 filter 1 deletes cells that jump from their track's smoothed trajectory (--smooth-win/--smooth-sigma);
 filter 2 deletes cells whose 2D projection is farther than --reproj-del-px from the node's initial 2D
 observation or falls outside the (dilated) dynamic mask. Deleted cells become holes -- no init prior, no
@@ -30,8 +30,8 @@ each residual whitened by a robust scale sigma (est. from reliable cells) and no
 N_j; L_obs and L_arap additionally pass through a Huber robust kernel rho so a single bad track/edge cannot
 dominate. AFTER solving, a track whose solved trajectory fails the same 2D criterion in more than
 --post-del-frac (default 80%) of its evaluable frames is deleted WHOLE from the output; and the BAD ("red")
-EDG nodes -- whose skinning-weighted fraction of render-colour-OUTLIER dynamic points is >= --bad-node-frac
-(the visualize_edg_filtered_open3d --edg-quality classification) -- are DELETED, their dynamic points
+EDG nodes -- whose skinning-weighted fraction of render-colour-OUTLIER dynamic points is >= --bad-node-frac --
+are DELETED, their dynamic points
 reassigned to the surviving nodes (weights renormalized; fully-orphaned points re-skinned to the nearest
 surviving nodes) and re-warped.
 Rotations live on SO(3) via the 6D continuous representation (Zhou et al.); holes are initialised by linear
@@ -89,7 +89,7 @@ def load_inputs(merged, smoothed=True, edges_npz=None, table_path=None):
     topo = np.load(out_dir / "edg_topology.npz")
     edg_nodes = np.asarray(topo["edg_nodes"], dtype=int)
     edg_edges = np.asarray(topo["edg_edges"], dtype=int).reshape(-1, 2)
-    if edges_npz:                                                      # rebuilt topology (rebuild_edg_edges.py)
+    if edges_npz:                                                      # rebuilt topology
         edg_edges = np.asarray(np.load(edges_npz)["edg_edges"], dtype=int).reshape(-1, 2)
         print(f"[edges] using rebuilt edges from {edges_npz}: {edg_edges.shape[0]} edges")
     dyn_edg = np.asarray(topo["dyn_edg_edges"], dtype=int).reshape(-1, 2)
@@ -169,8 +169,8 @@ def fit_frame_intrinsics(xyz_cam, xy, occ, T):
 # ------------------------------------------------------------------- pre-solve table cleaning (per cell)
 def _smooth_traj_nan(arr, win):
     """NaN-aware centred moving average of a [T,3] trajectory. At the clip ends the window shrinks symmetrically
-    (half-width min(half, t, T-1-t); user 2026-11-16): a cut-off one-sided window lags a moving track, so every fast
-    node used to look like an outlier in the first / last frames and its table cells were deleted there."""
+    (half-width min(half, t, T-1-t)): a cut-off one-sided window lags a moving track, so a fast node would look
+    like an outlier in the first / last frames."""
     half = max(1, int(win)) // 2
     T = arr.shape[0]
     fin = np.isfinite(arr).all(axis=1)
@@ -271,7 +271,7 @@ def post_delete_tracks(c_fin, D, args, masks):
 
 
 def clean_table(D, args, masks):
-    """DELETE bad cells from the input table BEFORE solving (same per-cell rules as the filtered viewer):
+    """DELETE bad cells from the input table BEFORE solving:
       filter 1 (--smooth-win/--smooth-sigma): cell's residual to the track's NaN-aware moving average is a
         pooled robust outlier (> median + sigma * 1.4826*MAD over all cells);
       filter 2 (--reproj-del-px / --mask-dilate-px / --no-mask-del): the cell's PROJECTED pixel is farther
@@ -345,7 +345,7 @@ def _follow_neighbours(c, R, filled, edges):
     """Before a node's first / after its last observed cell, move it rigidly with its EDG neighbours frame by frame
     (from the known frame p = t -+ 1: c_m(t) = mean_n [c_n(t) + Q_n (c_m(p) - c_n(p))], Q_n = R_n(t) R_n(p)^T,
     R_m(t) = mean Q_n projected to SO(3) times R_m(p)); a held-constant end leaves a node behind on a moving object
-    and the temporal terms make it too stiff to catch up (car-roundabout, user 2026-11-16). Sweeps repeat until no node
+    and the temporal terms make it too stiff to catch up. Sweeps repeat until no node
     gains a frame; a node with no known neighbour keeps its held-constant end."""
     M, T, _ = c.shape
     nbr = [[] for _ in range(M)]
@@ -434,7 +434,7 @@ def so3_log(R):
 
 
 def huber(s, delta):
-    """The PDF's robust penalty rho applied to a WHITENED SQUARED residual s = ||r||^2 / sigma^2: quadratic
+    """Robust penalty rho applied to a WHITENED SQUARED residual s = ||r||^2 / sigma^2: quadratic
     (=s) while ||r|| <= delta*sigma, linear beyond -> a single outlier contributes O(||r||) not O(||r||^2)."""
     r = torch.sqrt(s.clamp_min(1e-12))
     return torch.where(r <= delta, s, 2.0 * delta * r - delta * delta)
@@ -451,7 +451,7 @@ def robustscale(x, floor):
 
 
 def estimate_scales(c_init, R_init, filled, rot_filled, e, gaps, OB, phi_init, scene, sig_rot):
-    """Robust residual scales from RELIABLE (originally-observed) init cells only (PDF section 6). Estimating
+    """Robust residual scales from RELIABLE (originally-observed) init cells only. Estimating
     them from the interpolated holes would whiten the model error into the noise and unbalance the terms."""
     T = c_init.shape[1]
     fl = 1e-3 * scene
@@ -487,7 +487,7 @@ def estimate_scales(c_init, R_init, filled, rot_filled, e, gaps, OB, phi_init, s
 def build_skinning(D, c_init):
     """Fix N_k and w_km at each track's first visible frame s_k (inverse-distance, treated as constants).
     Returns per-track: s_k, x_{k,s_k}, and flat (node, weight) lists. Excludes EDG-node tracks (those are
-    constrained by L_init). Per the PDF, N_k is restricted to nodes whose SOURCE pose is observed at s_k
+    constrained by L_init). N_k is restricted to nodes whose SOURCE pose is observed at s_k
     ((m,s_k) in Omega) so the warp is anchored to a real cell, not an interpolated/free hole; a track with no
     such neighbour is dropped."""
     glob, valid, filled = D["glob"], D["valid"], D["filled"]
@@ -519,7 +519,7 @@ def build_skinning(D, c_init):
 def pair_arrays(tracks, frames):
     """Observations = (track i, frame t) for t in frames[i], track by track; pairs = each observation with every
     neighbour of its track, in nb order. Returns per observation (track index, frame) and per pair (obs, node,
-    weight, frame, source frame, source point) -- the order the old nested append loops produced."""
+    weight, frame, source frame, source point)."""
     n_f = np.array([f.size for f in frames], dtype=np.int64)
     n_nb = np.array([tr["nb"].size for tr in tracks], dtype=np.int64)
     o_i = np.repeat(np.arange(len(tracks)), n_f)                      # track of each observation
@@ -649,7 +649,7 @@ def complete(D, args, device):
     a = weight / max(np.median(weight[weight > 0]), 1e-9)                           # confidence ~1
     a = torch.as_tensor(np.clip(a, 0.0, 4.0), dtype=torch.float32, device=device)
 
-    # ---- robust residual scales from the RELIABLE (originally observed) init cells (PDF section 6)
+    # ---- robust residual scales from the RELIABLE (originally observed) init cells
     gaps = args.gaps if args.gaps else [g for g in (1, 4, 16, 64, 128, 256) if g < T]
     with torch.no_grad():
         phi_init = warp_phi(torch.as_tensor(c_init, dtype=torch.float32, device=device), R0t,
@@ -757,9 +757,8 @@ def warp_dyn_output(tracks, c_fin, R_fin, D, device):
 
 # ------------------------------------------------- bad ("red") EDG-node deletion + dynamic reassignment
 def node_bad_fraction(node_ids, c_fin, R_fin, dyn_ids, dyn_rec, D):
-    """Per-node skinning-weighted fraction of attached dynamic points that are render-colour OUTLIERS --
-    the SAME classification as visualize_edg_filtered_open3d.py --edg-quality (its RED nodes). Uses the
-    shared edg_viz_common scorer on the just-completed arrays. NaN = no dynamic points attached."""
+    """Per-node skinning-weighted fraction of attached dynamic points that are render-colour OUTLIERS.
+    Uses the shared edg_viz_common scorer on the just-completed arrays. NaN = no dynamic points attached."""
     import glob as _glob
     from types import SimpleNamespace
     from edg_viz_common import _build_dyn_skin, detect_render_color_outliers
@@ -815,7 +814,7 @@ def main():
     ap.add_argument("--edges-npz", default=None,
                     help="optionally override the EDG edges with a rebuilt set "
                          "(outputs/edg_edges_rebuilt.npz from rebuild_edg_edges.py); default = edg_topology.npz")
-    ap.add_argument("--iters", type=int, default=200)    # 400 lowered the final reprojection median by only ~0.02 px
+    ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--gaps", type=int, nargs="+", default=None,
                     help="ARAP temporal gaps D (default 1 4 16 64 128 256, those shorter than the video): the long gaps keep a node's "
@@ -884,7 +883,7 @@ def main():
     # post-solve: delete WHOLE tracks that fail the same 2D criterion in > --post-del-frac of frames
     if args.post_del_frac > 0:
         keep &= post_delete_tracks(c_fin, D, args, masks)
-    # DELETE the BAD ("red") EDG nodes -- the --edg-quality classification -- and reassign their points.
+    # DELETE the BAD ("red") EDG nodes and reassign their points.
     if args.bad_node_frac > 0:
         frac = node_bad_fraction(node_ids, c_fin, R_fin, dyn_ids, dyn_reconstruct, D)
         if frac is not None:
@@ -911,9 +910,7 @@ def main():
     pool = ThreadPoolExecutor(1)                                      # zlib releases the GIL: written while the
     written = pool.submit(savez_compressed_fast, out, **completed)    # results_all update below runs
 
-    # Also push this completed EDG into results_all.npz (the EDG the 4DGS trainer AND
-    # visualize_training_input_dynamic.py read) so that viewer shows the SAME EDG as
-    # visualize_best_color_2d.py (which reads edg_completed.npz directly).
+    # Also push this completed EDG into results_all.npz (the EDG the 4DGS trainer reads).
     if not args.no_results_all:
         import shutil
         from completed_to_results import convert

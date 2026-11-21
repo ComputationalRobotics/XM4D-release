@@ -14,7 +14,7 @@
 set -eo pipefail
 cd "$(dirname "$0")/Python"
 # numpy asks the kernel for huge pages for big arrays; on a machine with fragmented memory every such request can stall
-# for seconds in memory compaction (step 5 took 233 s instead of 139 s on our 251 GB workstation). Same results.
+# for seconds in memory compaction. Same results.
 export NUMPY_MADVISE_HUGEPAGE=${NUMPY_MADVISE_HUGEPAGE:-0}
 source "$(conda info --base)/etc/profile.d/conda.sh"
 DA3=${DA3_ENV:-da3}; TAP=${TAPNET_ENV:-tapnet}; XM=${XM_ENV:-XM}

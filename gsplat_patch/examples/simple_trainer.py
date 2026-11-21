@@ -157,10 +157,8 @@ class Config:
     edg_lr_decay_gamma: float = 0.1
     # EDG ARAP regularization weight (0 = disabled).
     # Penalises deviation from rigid edge lengths using the middle frame as rest pose.
-    # NOTE: the ARAP/smooth losses are now COUNT-NORMALIZED (means, not sums), so these lambdas are
-    # stable across scene size. Old sum-form equivalents: arap 1e-7 x ~537k terms ~= 0.05 mean-weight;
-    # smooth 5e-6 x ~312k terms ~= 1.6 mean-weight (that huge effective weight was pinning the EDG at
-    # its init -- see the freeze diagnosis -- so smooth is deliberately retuned DOWN here).
+    # NOTE: the ARAP/smooth losses are COUNT-NORMALIZED (means, not sums), so these lambdas are
+    # stable across scene size.
     edg_arap_lambda: float = 5e-3
     # ARAP temporal gaps (complete_edg_table L_arap form: rigidity between ALL (t, t+delta) pairs
     # for delta in this list; rest-frame-free).
@@ -236,7 +234,7 @@ class Config:
     # Auto-found by searching upwards from data_dir for a "masks" folder if None.
     seg_dyn_mask_dir: Optional[str] = None
 
-    # --- Dynamic-appearance & mask experiments (opt-in; defaults preserve current behavior) ---
+    # --- Dynamic-appearance & mask options ---
     # Render dynamic Gaussians as a single view-independent color: bypass the appearance
     # module and any SH beyond DC for dynamic points (each dynamic Gaussian = one flat RGB).
     dyn_flat_color: bool = True
@@ -342,7 +340,7 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = True
 
-    # LR for 3D point positions (raised from 3e-4 for faster convergence)
+    # LR for 3D point positions
     means_lr: float = 3e-4
     # LR for Gaussian scale factors
     scales_lr: float = 1e-3
@@ -783,15 +781,14 @@ class EDGWarp:
                 L_arap = arap_lambda * mean( ||rc||^2 + arap_eta_len * rl^2 )
 
             No fixed rest frame: rigidity is enforced between ALL (t, t+delta) pairs, so it does not
-            pin the graph to any single frame (the old mid-frame-rest form's optimum was the init,
-            which contributed to the EDG freezing). (complete_edg_table additionally sigma-whitens +
+            pin the graph to any single frame. (complete_edg_table additionally sigma-whitens +
             Hubers these residuals; here arap_lambda is the single knob.)
 
-        Temporal smoothness (unchanged form, now COUNT-NORMALIZED like the ARAP):
+        Temporal smoothness (COUNT-NORMALIZED like the ARAP):
             L_smooth = smooth_lambda * mean over (N,T-1) of ( ||dpos||^2 + ||drot||_F^2 )
 
         Both losses are MEANS (not sums), so the lambdas are stable across scene size; see the
-        Config defaults for the retuned values.
+        Config defaults.
 
         Returns:
             arap_loss  : scalar tensor (0 if no edges or arap_lambda==0)
@@ -1039,7 +1036,7 @@ class EDGWarp:
             return
 
         # Work only on the valid subset, then reconstruct full arrays
-        # For invalid entries: they are simply dropped (they were bogus anyway).
+        # (invalid entries are dropped).
         vi = self.dyn_indices[valid]
 
         # 1. Which valid dynamic points survive? (their GS is NOT in the remove mask)
@@ -1473,7 +1470,7 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
                 too_big_2d = None
             # Prune ALL too-big Gaussians (big Gaussians corrupt novel-view depth). The
             # depth_error_prune_max_fraction cap + largest-3D-scale tie-break below bound
-            # how many are removed per step, so this no longer collapses the reconstruction.
+            # how many are removed per step.
             is_prune = is_prune | is_too_big
         else:
             scales_max = torch.exp(params["scales"]).max(dim=-1).values
@@ -1520,7 +1517,7 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
         if n_prune_requested > max_prune:
             prune_idx = torch.where(is_prune)[0]
             # When the cap is hit, remove the LARGEST-3D-scale candidates first: big
-            # Gaussians are what corrupt novel-view depth. (Was: lowest-opacity first.)
+            # Gaussians are what corrupt novel-view depth.
             cand_scale3d = torch.exp(params["scales"]).max(dim=-1).values[prune_idx]
             keep_order = torch.argsort(cand_scale3d, descending=True)[:max_prune]
             capped_mask = torch.zeros_like(is_prune)
@@ -2834,9 +2831,9 @@ class Runner:
                 loss = loss + edg_obs_t + dyn_obs_t
 
             # Dynamic/static segmentation losses, all keyed off the per-frame dynamic mask.
-            #   seg_dyn_lambda        -- penalize STATIC contribution INSIDE  the mask (existing)
-            #   dyn_outside_lambda    -- penalize DYNAMIC contribution OUTSIDE the mask (change 2a)
-            #   static_only_region_.. -- supervise a STATIC-ONLY render vs GT OUTSIDE the mask (change 2b)
+            #   seg_dyn_lambda        -- penalize STATIC contribution INSIDE  the mask
+            #   dyn_outside_lambda    -- penalize DYNAMIC contribution OUTSIDE the mask
+            #   static_only_region_.. -- supervise a STATIC-ONLY render vs GT OUTSIDE the mask
             seg_loss_val = 0.0
             dyn_out_loss_val = 0.0
             static_only_loss_val = 0.0
@@ -2949,7 +2946,7 @@ class Runner:
                     self.writer.add_scalar("train/edg_tracks_dist", edg_tracks_dist, step)
                     self.writer.add_scalar("train/edg_rots_dist",   edg_rots_dist,   step)
                     # PRINT the EDG pose change vs its INITIAL state (positions in solver units,
-                    # rotations as Frobenius norm of R - R_init) so a frozen EDG is visible live.
+                    # rotations as Frobenius norm of R - R_init) so the EDG updates are visible live.
                     pbar.write(
                         f"[EDG-drift] step {step}: pos mean={edg_tracks_dist:.6f} max={edg_tracks_max:.6f} | "
                         f"rot(Frob) mean={edg_rots_dist:.6f} max={edg_rots_max:.6f}"
@@ -3584,7 +3581,7 @@ class Runner:
             name="edg/nodes",
             points=node_pts,
             colors=np.tile(np.array([255, 30, 30], dtype=np.uint8), (len(node_pts), 1)),
-            point_size=0.01,  # Reduced from 0.03 for thinner nodes
+            point_size=0.01,
             point_shape="circle",
         )
         
@@ -3746,7 +3743,7 @@ class Runner:
         if self.edg_warp is not None and self._edg_frame_slider is not None:
             edg_frame = self._edg_frame_slider.value
             frame_idx_tensor = torch.tensor([edg_frame], device=self.device)
-            # Debug print (can be removed later)
+            # Debug print
             if hasattr(self, '_last_edg_frame') and self._last_edg_frame != edg_frame:
                 print(f"[EDG] Viewer rendering frame {edg_frame}")
             self._last_edg_frame = edg_frame
@@ -3858,9 +3855,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             edg_state = ckpts[0].get("edg_warp")
             if edg_state is not None:
                 runner.edg_warp.load_state_dict(edg_state)
-        # Restore the trained appearance module and pose refinement too -- otherwise eval renders
-        # with a ZERO-INIT app module (app_opt=True models), corrupting exposure/colour and tanking
-        # PSNR (e.g. 34 during training -> 27 at ckpt-eval). The ckpt saves both (see save block above).
+        # Restore the trained appearance module and pose refinement too (app_opt=True models need the
+        # trained app module for exposure/colour). The ckpt saves both (see save block above).
         if getattr(runner, "app_module", None) is not None:
             app_state = ckpts[0].get("app_module")
             if app_state is not None:

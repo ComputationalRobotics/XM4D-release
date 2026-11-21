@@ -145,13 +145,12 @@ def teaser_align_camera_centers(
     show_alignment: bool = False,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """
-    Align estimated camera centers to GT with the previous TEASER style.
+    Align estimated camera centers to GT with TEASER.
 
     TEASER estimates a robust rigid transform on normalized trajectories. The
     final returned transform is Sim(3)-style:
         C_est_aligned = s * R @ C_est + t
-    where s comes from the GT/source trajectory scale ratio, matching the
-    earlier eval_replica_colmap_vs_gt.py alignment logic.
+    where s comes from the GT/source trajectory scale ratio.
     """
     assert C_est.shape == C_gt.shape
     assert C_est.shape[0] == 3
@@ -166,7 +165,7 @@ def teaser_align_camera_centers(
     src = src_all
     dst = dst_all
 
-    # Same trim-mean + 90th-percentile distance filtering as the previous code.
+    # Trim-mean + 90th-percentile distance filtering of the camera centers used for the fit.
     dst_avg = trim_mean(dst, proportiontocut=0.05, axis=1)
     src_avg = trim_mean(src, proportiontocut=0.05, axis=1)
     dst_dis = np.linalg.norm(dst - dst_avg.reshape(3, 1), axis=0)
@@ -260,7 +259,7 @@ def teaser_align_camera_centers(
         vis.add_geometry(line_set)
 
         opt = vis.get_render_option()
-        opt.point_size = 10.0        # increase/decrease this
+        opt.point_size = 10.0
         opt.line_width = 3.0        # may not work on all platforms
 
         vis.run()

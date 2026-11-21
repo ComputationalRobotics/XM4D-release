@@ -245,7 +245,7 @@ def _make_uncovered_query_points_at_frame(
         return None
     cand = np.stack([cols[inb].astype(np.float64), rows[inb].astype(np.float64)], axis=1)  # (M,2) as (x,y)
 
-    # Subsample mask candidates by keep_frac BEFORE the distance test (it used to be applied after), so
+    # Subsample mask candidates by keep_frac BEFORE the distance test, so
     # DYN_MASK_KEEP_FRAC also bounds the per-frame pairwise cost. This makes the resample as light as the
     # static tracker's fixed small candidate set instead of scanning every mask pixel each frame.
     if keep_frac < 1.0 and cand.shape[0] > 1:

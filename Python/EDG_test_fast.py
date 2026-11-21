@@ -27,8 +27,7 @@ LATE solves have huge dense systems. Instead, do MANY short RUNS:
     finished POSITION table -- the Kabsch rotation mapping the node's EDG-neighbourhood cloud from its rest
     frame to frame f (the ARAP local-rotation step), world-referenced because the positions are. R[node,rest]
     = I; NaN where the cell is a hole or < --rot-min-nbr neighbours are shared;
-  * NO local optimization / fill -- cells no run ever anchored stay HOLES (NaN). The point is exactly to see
-    which parts of the table are covered and which are not.
+  * NO local optimization / fill -- cells no run ever anchored stay HOLES (NaN).
 
 Outputs:
   * edg_test/edg_global.npz          -- same schema as EDG_test (holey now, real fitted edg_rotation), for
@@ -115,11 +114,11 @@ def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn,
             print(f"  --> sample {run_id}/{n_runs} (gap {gap}) | iter {seg_i}/{n_seg}: "
                   f"segment frames {a}-{b}  nodes={inp['M']} ({inp['n_carried']} carried) "
                   f"dyn-obs={inp['N_dyn_obs']}", flush=True)
-            try:                                                       # strided/degenerate segments can make
+            try:
                 ed, R_edg, dyn, ukps = ET.solve_segment(inp, out_dir, w_arap, w_smooth)
-            except Exception as e:                                     # the XM rotation solver return a bad-
+            except Exception as e:
                 print(f"  --> sample {run_id}/{n_runs} | iter {seg_i}: solve FAILED "
-                      f"({type(e).__name__}); ending this sample early", flush=True)  # size R -> ValueError
+                      f"({type(e).__name__}); ending this sample early", flush=True)
                 break
             present, frames, rest = inp["present"], inp["frames"], inp["rest"]
             for j, gid in enumerate(present.tolist()):                  # carry + compose (like EDG_test)

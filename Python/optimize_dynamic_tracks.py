@@ -53,7 +53,7 @@ def load_eroded_masks(mask_dir, pattern, T, hw, erode_px):
 
 def lift_camera_xyz(txy, occ, depth, K, masks_ok=None, depth_grad_thresh=0.0):
     """(Q,T,3) camera-frame lift of the 2D tracks from `depth` + per-frame K -- the 3D is fully (re)built HERE
-    from the specified depth (definitions.active_depth_maps), matching dynamic_tracking.py:1089 / relift_tracks.py.
+    from the specified depth (definitions.active_depth_maps), matching dynamic_tracking.py.
     NaN where occluded or depth invalid (<=1e-3). Also DROPS an observation (leaves it NaN) when:
       (a) masks_ok is given and the pixel is NOT in the eroded dynamic mask (i.e. within erode_px of the boundary),
       (b) depth_grad_thresh>0 and the valid 3x3 depth range exceeds depth_grad_thresh * center depth (discontinuity).

@@ -43,8 +43,7 @@ EDG_SOLVER_TOL = float(os.environ.get("EDG_SOLVER_TOL", "1e-4"))    # XM.solve_R
 EDG_ONLY_INITIAL_POINTS = os.environ.get("EDG_ONLY_INITIAL_POINTS", "0") == "1"
 # ARAP/rest reference is a KEYFRAME that advances every EDG_KEYFRAME_INTERVAL frames: the
 # rest g is re-anchored to the EDG's solved state at each keyframe (frame-0 prior for the
-# first block). This bounds drift (re-anchor every N frames) while following the object,
-# instead of frame-0 (starves rotating scenes) or per-segment chaining (drifts every 10).
+# first block), so the rest follows the object (re-anchored every N frames).
 EDG_KEYFRAME_INTERVAL = int(os.environ.get("EDG_KEYFRAME_INTERVAL", "40"))
 PRIOR_FRAME_INDEX = 0
 PRIOR_EDG_SAMPLES = 100
@@ -127,7 +126,7 @@ def _load_da3_frame_scale(rt_data, frame_count):
 
 
 def _solve_Ronly_isolated(output_dir_arg, solver_rank, solver_tol, solver_mu, solver_max_iter):
-    """Run XM.solve_Ronly outside this process to isolate CUDA/CUSPARSE teardown bugs."""
+    """Run XM.solve_Ronly outside this process."""
     output_dir_path = Path(output_dir_arg).resolve()
     r_bin = output_dir_path / "R.bin"
     if r_bin.exists():
@@ -872,8 +871,8 @@ while True:
         break
     # Rest/ARAP reference is a KEYFRAME that advances every EDG_KEYFRAME_INTERVAL frames:
     # within a block, all segments reference the block's keyframe rest (frame-0 prior for the
-    # first block; the solved EDG state at the keyframe for later blocks). This bounds drift
-    # (re-anchor only every N frames) while following the object. Prepend the keyframe as t=1.
+    # first block; the solved EDG state at the keyframe for later blocks), re-anchored only
+    # every N frames while following the object. Prepend the keyframe as t=1.
     kf = int(min((current_frame // EDG_KEYFRAME_INTERVAL) * EDG_KEYFRAME_INTERVAL, T - 1))
     rest_frame = kf
     if kf in window.tolist():

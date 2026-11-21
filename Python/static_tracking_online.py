@@ -45,13 +45,11 @@ MASK_PATTERN = utils.definitions.mask_pattern
 
 GRID = 50
 
-# If blank-region resampling appears mirrored (e.g., top-right becomes bottom-left),
-# enable this to emit resample queries as (t, y, x) instead of (t, x, y).
+# Emit resample queries as (t, y, x), TAPNext's query order, instead of (t, x, y).
 RESAMPLE_SWAP_XY = True
 # 2D tracker (STATIC_TRACKER). TAPNext (default): a GRID x GRID grid at frame 0, then at every frame new points
 # wherever no visible point is within ONLINE_RESAMPLE_RADIUS (px @256), tracked online; the flow-consistency trim
-# (move-delete) below runs for TAPNext only. AllTracker can be confidently wrong on fast camera turns over repeating
-# texture (Syn4D casa3), which breaks the cameras, so it is not the default for the static scene.
+# (move-delete) below runs for TAPNext only.
 # AllTracker: points seeded off the (dilated) moving-object masks, a GRID x GRID grid at frame 0 and then
 # every ALLTRACKER_KEYFRAME frames (and at any frame where fewer than STATIC_ALLTRACKER_MIN_VISIBLE points are visible)
 # an ONLINE_RESAMPLE_GRID grid wherever no tracked point is visible within ONLINE_RESAMPLE_RADIUS (px @256); each
@@ -741,8 +739,7 @@ if DEBUG:
 
 move_delete_deleted_obs_mask = None
 
-# Delete points with abnormally large 2D motion vs nearby points, matching the
-# move-delete filtering in static_tracking_online_segmented.py. Applied after the
+# Delete points with abnormally large 2D motion vs nearby points. Applied after the
 # tracks_debug save (which stays unfiltered) and before the solver output below.
 if MOVE_DELETE_ENABLED:
     T_md = tracks_xy.shape[2]

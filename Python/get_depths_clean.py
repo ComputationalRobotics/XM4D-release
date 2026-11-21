@@ -668,8 +668,7 @@ def main() -> None:
         intrinsics[t, 1, 2] *= sy
 
     # Save the raw per-frame DA3 intrinsics (rescaled to original size, before any
-    # single-K collapse) so focal-rule experiments can rewrite intrinsics.npy without
-    # regenerating depth.
+    # single-K collapse), so intrinsics.npy can be rewritten without regenerating depth.
     np.save(output_dir / "intrinsics_raw.npy", intrinsics.astype(np.float32).copy())
 
     # GT mode: save the GT intrinsics (already at original resolution) instead of
@@ -680,10 +679,8 @@ def main() -> None:
               f"not DA3 predicted.")
     elif SINGLE_INTRINSIC:
         # DA3 mode: collapse the per-frame predictions into a single shared pinhole.
-        # Principal point fixed at the image center. For the focal, pick the axis
-        # aligned with the LONGER image dimension: the anisotropic 3:2 resize distorts
-        # the shorter-dimension focal more, so use fx when cx>cy (landscape) and fy
-        # otherwise (portrait), taking the median of that axis across frames.
+        # Principal point fixed at the image center; the focal is the median across
+        # frames of one axis (chosen below).
         # NOTE: `intrinsics` here is ALREADY rescaled to the original image size by the
         # sx/sy loop above, so the medians below are taken at original scale.
         fx_all = intrinsics[:, 0, 0].astype(np.float64)

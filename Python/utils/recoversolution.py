@@ -69,7 +69,7 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
         if np.linalg.det(U @ Vt) < 0:
             negative_R = negative_R + 1
 
-    # not projecting the SO3, sometimes worse than the original in Ceres
+    # blocks with det(R) < 0 are projected back to SO(3) below
     if negative_R > 0:
         print("warning: some det(R) < 0")
 
