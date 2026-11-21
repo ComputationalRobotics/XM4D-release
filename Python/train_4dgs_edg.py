@@ -1837,7 +1837,7 @@ def prepare_4dgs_dataset(
 
     # Keep the da3 slot (depth_anything_3/depth_maps.npy) = the depth variant selected in utils.definitions,
     # so BOTH the static lift below AND simple_trainer's depth loss (both read that slot) use the SAME depth
-    # as the dynamic tracks (optimize_dynamic_tracks reads definitions.active_depth_maps). Single source of
+    # as the dynamic tracks. Single source of
     # truth = definitions.depth_variant across the whole 4DGS stage.
     if str(depth_source).strip().lower() == "da3":
         import shutil

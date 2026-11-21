@@ -45,7 +45,7 @@ unidepth_output_root = Path(
 unidepth_depth_dir = Path(os.environ.get("XM_UNIDEPTH_DEPTH_DIR", str(unidepth_output_root / dataset_name)))
 
 # ---- ACTIVE depth variant (single source of truth for which depth everything lifts from) ----
-# One of the folders built by build_depth_variants.py under outputs/depths/<variant>/ :
+# One of the folders under outputs/depths/<variant>/ :
 #   raw_da3 | aligned_da3 | lidar | lidar_filled
 # Default: aligned_da3 (raw DepthAnything-3 per-frame scale+shift aligned to LiDAR). Override: XM_DEPTH_VARIANT.
 # Falls back to the da3 slot (depth_anything_3/) if the variant catalog hasn't been built for this scene yet.

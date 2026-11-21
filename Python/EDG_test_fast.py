@@ -30,8 +30,7 @@ LATE solves have huge dense systems. Instead, do MANY short RUNS:
   * NO local optimization / fill -- cells no run ever anchored stay HOLES (NaN).
 
 Outputs:
-  * edg_test/edg_global.npz          -- same schema as EDG_test (holey now, real fitted edg_rotation), for
-                                        visualize_edg_solution_open3d.py
+  * edg_test/edg_global.npz          -- same schema as EDG_test (holey now, real fitted edg_rotation)
   * edg_test/edg_table.npz           -- node x frame table + weights + filled mask + fitted rotation[.,.,3,3]
   * edg_test/edg_table_coverage.png  -- heatmap of the table: white = hole, color = accumulated weight
 
@@ -237,7 +236,7 @@ def main():
     ap.add_argument("--max-dyn", type=int, default=0, help="subsample dyn keypoints per segment (0 = all)")
     ap.add_argument("--merged", action="store_true", help="solve on the MERGED tracks (match build_edg.py --merged)")
     ap.add_argument("--smoothed", action=argparse.BooleanOptionalAction, default=True,
-                    help="use optimize_dynamic_tracks' output (holds the 3D; the raw merged file is 2D-only now). Default on.")
+                    help="use tracks_dynamic_merged_smoothed.npz (holds the 3D; the raw merged file is 2D-only). Default on.")
     args = ap.parse_args()
 
     merged_path = None
@@ -247,7 +246,7 @@ def main():
         if args.smoothed and not Path(merged_path).exists():          # not smoothed yet -> warn + fall back
             merged_path = str(Path(utils.definitions.output_dir) / "tracks_dynamic_merged.npz")
             print("[merged] WARNING: smoothed file missing -- the raw merged file is 2D-only (tracks_xyz all-NaN). "
-                  "Run optimize_dynamic_tracks.py first, or the solve will find no valid 3D.")
+                  "The solve will find no valid 3D.")
         print(f"[merged] solving on consolidated tracks: {merged_path}")
     D = ET.load_all(tracks_path=merged_path)
     T, Q = D["T"], D["Q"]

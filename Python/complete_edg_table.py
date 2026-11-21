@@ -39,8 +39,7 @@ Rotations live on SO(3) via the 6D continuous representation (Zhou et al.); hole
 with Adam + cosine LR decay.
 
 Input : outputs/edg_test/edg_table.npz + edg_global.npz (EDG_test_fast.py) + edg_topology.npz + tracks + XM.
-Output: outputs/edg_test/edg_completed.npz -- SAME schema as edg_global.npz, DENSE (holes filled), so
-        `visualize_edg_solution_open3d.py --npz .../edg_completed.npz --no-scale-search` shows it directly.
+Output: outputs/edg_test/edg_completed.npz -- SAME schema as edg_global.npz, DENSE (holes filled).
 
 Run (GPU torch lives in the `tapnet` env; no XM needed):
     XM_DATASET_NAME=<scene> conda run -n tapnet python complete_edg_table.py --merged [--iters 1000]
@@ -68,8 +67,7 @@ def load_inputs(merged, smoothed=True, edges_npz=None, table_path=None):
         tracks_path = out_dir / name                                  # smoothed holds the 3D (merge is 2D-only)
         if smoothed and not tracks_path.exists():
             tracks_path = out_dir / "tracks_dynamic_merged.npz"
-            print("[complete] WARNING: smoothed file missing -- raw merged is 2D-only (tracks_xyz all-NaN); "
-                  "run optimize_dynamic_tracks.py first.")
+            print("[complete] WARNING: smoothed file missing -- raw merged is 2D-only (tracks_xyz all-NaN).")
     else:
         tracks_path = Path(utils.definitions.dynamic_tracks_for_edg())
     data = np.load(str(tracks_path), allow_pickle=True)
@@ -837,7 +835,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--merged", action="store_true", help="use the merged tracks (match EDG_test_fast --merged)")
     ap.add_argument("--smoothed", action=argparse.BooleanOptionalAction, default=True,
-                    help="use optimize_dynamic_tracks' output (holds the 3D; raw merged is 2D-only now). Default on.")
+                    help="use tracks_dynamic_merged_smoothed.npz (holds the 3D; raw merged is 2D-only). Default on.")
     ap.add_argument("--edges-npz", default=None,
                     help="optionally override the EDG edges with a rebuilt set "
                          "(outputs/edg_edges_rebuilt.npz from rebuild_edg_edges.py); default = edg_topology.npz")
@@ -948,8 +946,8 @@ def main():
         import shutil
         from completed_to_results import convert
         ra = Path(args.results_all) if args.results_all else Path(utils.definitions.output_dir) / "results_all.npz"
-        if not ra.exists():                                          # no EDG_old.py run: the base is the camera solve's
-            rt = np.load(Path(utils.definitions.output_dir) / "result_XM.npz")   # static points (as EDG_old.py writes them)
+        if not ra.exists():                                          # no base results_all.npz yet: start from the camera solve's
+            rt = np.load(Path(utils.definitions.output_dir) / "result_XM.npz")   # static points
             np.savez_compressed(ra, static_landmarks=rt["p"].T.astype(np.float64) if "p" in rt else None)
             print(f"[results_all] created {ra.name} with the {rt['p'].shape[1] if 'p' in rt else 0} static points of result_XM.npz")
         if ra.exists():
@@ -968,8 +966,6 @@ def main():
                   f"static/prior pipeline first; or pass --no-results-all to silence this.")
     written.result(); pool.shutdown()
     print(f"\n[done] {out}  ({node_ids.size} nodes, DENSE, T={D['T']}, {dyn_ids.size} dyn tracks)")
-    print(f"       visualize: conda run -n XM python visualize_edg_solution_open3d.py "
-          f"--npz {out} --no-scale-search")
 
 
 if __name__ == "__main__":

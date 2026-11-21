@@ -4,7 +4,7 @@
 Pure numpy/cv2 + utils (NO open3d, NO torch). Provides the world -> camera -> pixel projection, the 2D
 reprojection context (initial 2D tracks + XM lift poses + per-frame intrinsics + frame images), the
 embedded-deformation skinning of the dynamic tracks, and the photometric render-colour scorer. Imported by
-complete_edg_table.py, train_4dgs_edg.py and visualize_tracks_2d.py so the exact
+complete_edg_table.py and train_4dgs_edg.py so the exact
 same projection / skinning / scoring is used everywhere. This module has NO __main__.
 """
 from __future__ import annotations
@@ -32,8 +32,7 @@ def project_to_frame(pts_world, ctx, f):
 
 # ------------------------------------------------- photometric render-colour outlier detection
 def _build_dyn_skin(dyn_ids, dr, node_ids, edg_pos, edg_rot):
-    """Embedded-deformation skinning for the dynamic tracks (same rule as visualize_edg_solution_open3d's
-    _build_dyn_skinning) but ALSO returning `pids` = the dyn global id of every skinned row, so the render-
+    """Embedded-deformation skinning for the dynamic tracks, ALSO returning `pids` = the dyn global id of every skinned row, so the render-
     colour outlier flag can be attributed per track. Bind frame = each track's first finite frame; neighbour
     EDG nodes come from edg_topology.npz's dyn_edg_edges; weights = normalized inverse distance at bind.
     Returns (sp, pids) or (None, None)."""
@@ -257,7 +256,7 @@ def _load_2d_context(merged: bool, n_tracks: int | None = None):
     import glob
     from utils.edg import scatter_solved_poses, scatter_solved_frame_vector
     out_dir = Path(utils.definitions.output_dir)
-    # merge is 2D-only now -> the 3D lives in the smoothed file (optimize_dynamic_tracks output). Prefer it.
+    # the merged file is 2D-only -> the 3D lives in the smoothed file. Prefer it.
     merged_sm = out_dir / "tracks_dynamic_merged_smoothed.npz"
     merged_p = merged_sm if merged_sm.exists() else (out_dir / "tracks_dynamic_merged.npz")
     raw_p = Path(utils.definitions.tracks_dynamics_path)

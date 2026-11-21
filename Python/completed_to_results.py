@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert the NEW-pipeline EDG result (outputs/edg_test/edg_completed.npz, from complete_edg_table.py)
-into the results_all.npz format consumed by train_4dgs_edg.py + deps/gsplat simple_trainer (the EDG_old
-contract): the dict-style `edg_reconstruct` / `edg_rotation` / `dynamics_points_reconstruct` are REPLACED
+into the results_all.npz format consumed by train_4dgs_edg.py + deps/gsplat simple_trainer:
+the dict-style `edg_reconstruct` / `edg_rotation` / `dynamics_points_reconstruct` are REPLACED
 from the completed solve; every other key (static_landmarks, prior_*, da3_frame_scale, ...) is carried
 over unchanged from a BASE results_all npz (the static/prior side of the pipeline is untouched).
 

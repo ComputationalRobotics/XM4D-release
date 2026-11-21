@@ -1315,7 +1315,7 @@ def main():
     ap.add_argument("--merged", action=argparse.BooleanOptionalAction, default=True,
                     help="use MERGED tracks (default on; --no-merged uses raw tracks_dynamic_only)")
     ap.add_argument("--smoothed", action=argparse.BooleanOptionalAction, default=True,
-                    help="use SMOOTHED tracks from optimize_dynamic_tracks.py (default on; --no-smoothed)")
+                    help="use the SMOOTHED tracks tracks_dynamic_<base>_smoothed.npz (default on; --no-smoothed)")
     ap.add_argument("--gt-depth", action="store_true",
                     help="EDG node-selection distance in 3D world (use with GT/LiDAR/completed depth); default 2D image (DA3)")
     args = ap.parse_args()
@@ -1328,9 +1328,8 @@ def main():
     _tp = str(Path(utils.definitions.output_dir) / name)
     if not Path(_tp).exists():
         raise FileNotFoundError(
-            f"{name} not found. Generate the smoothed tracks first:\n"
-            f"    python optimize_dynamic_tracks.py --input tracks_dynamic_{base}.npz\n"
-            f"  (or run  build_edg.py --no-smoothed  to use un-smoothed tracks_dynamic_{base}.npz)")
+            f"{name} not found (tracks_dynamic_only_smoothed.npz comes from smooth_dynamic_tracks.py;\n"
+            f"  build_edg.py --no-smoothed uses the un-smoothed tracks_dynamic_{base}.npz)")
     print(f"[tracks] EDG on {name}  |  node-selection distance: {'3D world (--gt-depth)' if args.gt_depth else '2D image'}")
     D = _load_all(tracks_path=_tp)
     D["dyn_mask"] = _dilate_dyn_mask(D, args.mask_dilate_px)  # grow dynamic reliability region by N px
