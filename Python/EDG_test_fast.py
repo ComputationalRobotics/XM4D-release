@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Fast multi-run EDG solve (approximation of EDG_test.py, much cheaper).
+"""Step 4c: the motion of the embedded deformation graph (EDG), by many short runs of chained XM segment solves.
 
-EDG_test.py chains 10-frame segments across the WHOLE video, so its node set grows to hundreds and the
-LATE solves have huge dense systems. Instead, do MANY short RUNS:
+Chaining 10-frame segments across the WHOLE video would grow the node set to hundreds and give the LATE
+solves huge dense systems. Instead, do MANY short RUNS:
   * each run picks a random gap g and a start s, giving ~n_seg*(seg_len-1)+1 STRIDED frames
-    s, s+g, s+2g, ...  (gap 1 -> ~50 real frames, gap 2 -> ~100, gap 3 -> ~150). The start is biased
-    toward windows that currently have MORE HOLES (--hole-bias): before each run we count, per frame, the
-    EDG cells that are observable but still unfilled, and sample s ~ (windowed hole count)^bias -> later
-    runs chase the gaps left by earlier ones instead of re-covering the same region (bias 0 = uniform);
-  * within a run it does EXACTLY EDG_test's chaining: up to `n_seg` (=5) segments of `seg_len` (=11)
+    s, s+g, s+2g, ...  (gap 1 -> ~50 real frames, gap 2 -> ~100). The start is biased
+    toward windows that currently have MORE HOLES: before each run we count, per frame, the
+    EDG cells that are observable but still unfilled, and sample s ~ (windowed hole count)^2 -> later
+    runs chase the gaps left by earlier ones instead of re-covering the same region;
+  * within a run it chains segments: up to `n_seg` (=5) segments of `seg_len` (=11)
     strided frames with a 1-frame overlap, CARRYING each solved EDG node into the next segment and
     composing the global rotation (via EDG_test.build_segment_inputs + solve_segment). Capping a run to
     5 segments bounds the per-solve node count -> each solve stays small and fast;
@@ -18,25 +18,22 @@ LATE solves have huge dense systems. Instead, do MANY short RUNS:
     from it -- weight = 1/(1+d), d = #frames from this frame to the node's NEAREST direct observation in the
     run (observed to 147, solved at 150 -> d=3 -> w=1/4). A node never observed in a run contributes nothing;
   * every (node/dyn, frame) is that weighted AVERAGE over all runs that touched it (all runs solve in the
-    same world frame -> directly averageable);
-  * OPTIONALLY (--seed-obs, default OFF) a node's OWN direct observations can additionally be seeded into
-    the table at weight 1 -- that fills EVERY observed cell across the whole video, so by default it is off
-    and the table stays a pure average of the independently solved sampled segments (NaN elsewhere);
+    same world frame -> directly averageable), so the table is a pure average of the independently solved
+    sampled segments (NaN elsewhere);
   * ROTATIONS: the solve only yields per-run-relative LOCAL rotations (each relative to that run's own rest),
     so they cannot be averaged across runs. Instead we fit a GLOBAL rotation per (node, frame) from the
     finished POSITION table -- the Kabsch rotation mapping the node's EDG-neighbourhood cloud from its rest
     frame to frame f (the ARAP local-rotation step), world-referenced because the positions are. R[node,rest]
-    = I; NaN where the cell is a hole or < --rot-min-nbr neighbours are shared;
+    = I; NaN where the cell is a hole or < 4 neighbours are shared;
   * NO local optimization / fill -- cells no run ever anchored stay HOLES (NaN).
 
 Outputs:
-  * edg_test/edg_global.npz          -- same schema as EDG_test (holey now, real fitted edg_rotation)
+  * edg_test/edg_global.npz          -- node + dyn-point positions (holey) and the fitted edg_rotation
   * edg_test/edg_table.npz           -- node x frame table + weights + filled mask + fitted rotation[.,.,3,3]
   * edg_test/edg_table_coverage.png  -- heatmap of the table: white = hole, color = accumulated weight
 
-Run:  XM_DATASET_NAME=<scene> conda run -n XM python EDG_test_fast.py [--merged] [--n-runs 30]
+Run:  python EDG_test_fast.py
 """
-import argparse
 import os
 import sys
 from pathlib import Path
@@ -45,6 +42,16 @@ import numpy as np
 
 import utils.definitions
 import EDG_test as ET          # reuse load_all / build_segment_inputs / solve_segment (imports XM once)
+
+SEG_LEN = 11                   # frames per segment (1-frame overlap)
+N_SEG = 5                      # chained segments per run (5 x 10 = ~50 frames)
+N_RUNS = 10                    # random-strided runs to average
+GAPS = [1, 2]                  # candidate strides per run
+HOLE_BIAS = 2.0                # bias of the run starts toward windows with more current holes
+ROT_MIN_NBR = 4                # min EDG neighbours (incl self) filled at both rest and a frame to fit that frame's rotation
+SEED = 0
+W_ARAP = 0.2
+W_SMOOTH = 0.2
 
 
 def _dist_to_obs(obs, frames):
@@ -81,8 +88,8 @@ def save_table_heatmap(node_pos, node_w, node_ids, path):
     fig.tight_layout(); fig.savefig(path); plt.close(fig)
 
 
-def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn, rng, run_id, n_runs, gap):
-    """One run = EDG_test chaining over the ordered strided `run_frames`: up to n_seg segments of seg_len
+def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, run_id, n_runs, gap):
+    """One run = chained segments over the ordered strided `run_frames`: up to n_seg segments of seg_len
     frames (1-frame overlap), carrying each EDG node forward + composing global rotation. Returns
     node_pos dict gid -> [T,3], finite only at the run's frames; the dynamic points as (gids [n], positions
     [n, run_frames.size, 3], NaN where not solved); and #segments solved."""
@@ -105,7 +112,7 @@ def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn,
         if seg_frames.size < 2:
             break
         a, b = int(seg_frames[0]), int(seg_frames[-1])
-        inp = ET.build_segment_inputs(D, seg_frames, edg_pos, max_dyn=max_dyn, rng=rng)
+        inp = ET.build_segment_inputs(D, seg_frames, edg_pos)
         if inp is None:
             print(f"  --> sample {run_id}/{n_runs} (gap {gap}) | iter {seg_i}/{n_seg}: "
                   f"segment frames {a}-{b}: <2 EDG nodes, skipped", flush=True)
@@ -120,7 +127,7 @@ def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn,
                       f"({type(e).__name__}); ending this sample early", flush=True)
                 break
             present, frames, rest = inp["present"], inp["frames"], inp["rest"]
-            for j, gid in enumerate(present.tolist()):                  # carry + compose (like EDG_test)
+            for j, gid in enumerate(present.tolist()):                  # carry + compose
                 rot_arr = ens_rot(gid)
                 rest_global = rot_arr[rest] if np.isfinite(rot_arr[rest]).all() else np.eye(3)
                 Rg = rest_global[None, :, :] @ R_edg[j]
@@ -142,11 +149,9 @@ def solve_run(D, run_frames, seg_len, n_seg, w_arap, w_smooth, out_dir, max_dyn,
 def _sample_start(rng, hole, g, span_frames, T, bias):
     """Pick a run START s biased toward windows that currently have many HOLES. A run at start s touches the
     strided frames s, s+g, ..., s+g*(span_frames-1); score(s) = sum of `hole` (per-frame hole count) over
-    those frames. Sample s ~ (score+eps)^bias over the valid starts [0, T-span). bias<=0 -> uniform (old)."""
+    those frames. Sample s ~ (score+eps)^bias over the valid starts [0, T-span)."""
     span = g * (span_frames - 1)
     hi = max(1, T - span)
-    if bias <= 0:
-        return int(rng.integers(0, hi))
     score = np.zeros(T, dtype=np.float64)
     for k in range(span_frames):
         gk = g * k                                                   # add hole[s+gk] into score[s]
@@ -218,37 +223,7 @@ def _fit_global_rotations(table, node_ids, edg_edges, rest_frame, min_nbr=4):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--seg-len", type=int, default=11, help="frames per segment (EDG_test: 11, 1-frame overlap)")
-    ap.add_argument("--n-seg", type=int, default=5, help="chained segments per run (5 x 10 = ~50 frames)")
-    ap.add_argument("--n-runs", type=int, default=10, help="number of random-strided runs to average")
-    ap.add_argument("--gaps", type=int, nargs="+", default=[1, 2], help="candidate strides per run")
-    ap.add_argument("--seed-obs", action="store_true",
-                    help="also seed each node's direct observations into the table at weight 1 (fills ALL "
-                         "observed cells, not just sampled segments); default OFF = pure sampled average")
-    ap.add_argument("--hole-bias", type=float, default=2.0,
-                    help="bias run starts toward windows with more current holes (0 = uniform, higher = greedier)")
-    ap.add_argument("--rot-min-nbr", type=int, default=4,
-                    help="min EDG neighbours (incl self) filled at both rest and a frame to fit that frame's rotation")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--w-arap", type=float, default=0.2)
-    ap.add_argument("--w-smooth", type=float, default=0.2)
-    ap.add_argument("--max-dyn", type=int, default=0, help="subsample dyn keypoints per segment (0 = all)")
-    ap.add_argument("--merged", action="store_true", help="solve on the MERGED tracks (match build_edg.py --merged)")
-    ap.add_argument("--smoothed", action=argparse.BooleanOptionalAction, default=True,
-                    help="use tracks_dynamic_merged_smoothed.npz (holds the 3D; the raw merged file is 2D-only). Default on.")
-    args = ap.parse_args()
-
-    merged_path = None
-    if args.merged:
-        name = "tracks_dynamic_merged_smoothed.npz" if args.smoothed else "tracks_dynamic_merged.npz"
-        merged_path = str(Path(utils.definitions.output_dir) / name)
-        if args.smoothed and not Path(merged_path).exists():          # not smoothed yet -> warn + fall back
-            merged_path = str(Path(utils.definitions.output_dir) / "tracks_dynamic_merged.npz")
-            print("[merged] WARNING: smoothed file missing -- the raw merged file is 2D-only (tracks_xyz all-NaN). "
-                  "The solve will find no valid 3D.")
-        print(f"[merged] solving on consolidated tracks: {merged_path}")
-    D = ET.load_all(tracks_path=merged_path)
+    D = ET.load_all()
     T, Q = D["T"], D["Q"]
     edg_nodes, edg_edges, valid = D["edg_nodes"], D["edg_edges"], D["valid"]
     out_dir = Path(utils.definitions.output_dir) / "edg_test"
@@ -256,47 +231,36 @@ def main():
 
     pos_sum = np.zeros((Q, T, 3), dtype=np.float64)
     pos_w = np.zeros((Q, T), dtype=np.float64)
-    rng = np.random.default_rng(args.seed)
-    span_frames = args.n_seg * (args.seg_len - 1) + 1                 # strided frames per run (~51)
+    rng = np.random.default_rng(SEED)
+    span_frames = N_SEG * (SEG_LEN - 1) + 1                 # strided frames per run (~51)
     vn = valid[edg_nodes].astype(bool)                               # [Ne,T] which node-cells are observable
 
     n_ok = 0
-    for run in range(args.n_runs):
-        g = int(rng.choice(args.gaps))
+    for run in range(N_RUNS):
+        g = int(rng.choice(GAPS))
         hole = (vn & (pos_w[edg_nodes] <= 0)).sum(0).astype(np.float64)  # [T] observable-but-unfilled cells now
-        s = _sample_start(rng, hole, g, span_frames, T, args.hole_bias)
+        s = _sample_start(rng, hole, g, span_frames, T, HOLE_BIAS)
         run_frames = np.unique(s + g * np.arange(span_frames))
         run_frames = run_frames[run_frames < T]
         if run_frames.size < 2:
             continue
-        print(f"\n===== SAMPLE {run+1}/{args.n_runs}: gap={g}, {run_frames.size} strided frames "
-              f"{run_frames[0]}..{run_frames[-1]}, up to {args.n_seg} iterations of {args.seg_len}-frame "
+        print(f"\n===== SAMPLE {run+1}/{N_RUNS}: gap={g}, {run_frames.size} strided frames "
+              f"{run_frames[0]}..{run_frames[-1]}, up to {N_SEG} iterations of {SEG_LEN}-frame "
               f"segments (targeting {int(hole[run_frames].sum())} unfilled observable cells) =====", flush=True)
-        node_pos, (dyn_gids, dyn_pos), nseg = solve_run(D, run_frames, args.seg_len, args.n_seg, args.w_arap,
-                                                        args.w_smooth, out_dir, (args.max_dyn or None), rng,
-                                                        run + 1, args.n_runs, g)
+        node_pos, (dyn_gids, dyn_pos), nseg = solve_run(D, run_frames, SEG_LEN, N_SEG, W_ARAP, W_SMOOTH, out_dir,
+                                                        run + 1, N_RUNS, g)
         node_gids = np.fromiter(node_pos.keys(), dtype=np.int64)
         P = np.stack([node_pos[gid][run_frames] for gid in node_gids.tolist()]) if node_gids.size else None
         _accumulate(pos_sum, pos_w, node_gids, P, valid, run_frames)
         _accumulate(pos_sum, pos_w, dyn_gids, dyn_pos, valid, run_frames)
         n_ok += 1
-        print(f"[sample {run+1}/{args.n_runs} done] {nseg} segments solved; "
+        print(f"[sample {run+1}/{N_RUNS} done] {nseg} segments solved; "
               f"{len(node_pos)} nodes + {dyn_gids.size} dyn points touched")
 
     glob = D["glob"]                                                  # [Q,T,3] world-lifted observations
     en = edg_nodes
     obs_mask = valid[en] & np.isfinite(glob[en]).all(-1)             # a node's OWN direct observations
-    if args.seed_obs:
-        # optional: also write each node's raw observations into the table at weight 1. This fills EVERY
-        # observed cell across the whole video (not just the sampled segments), so the table is no longer
-        # "sampled-segment average, NaN elsewhere" -- off by default.
-        pos_sum[en] += np.where(obs_mask[..., None], glob[en], 0.0)
-        pos_w[en] += obs_mask.astype(np.float64)
-        print(f"[obs] seeded {int(obs_mask.sum())} direct EDG observations at weight 1 "
-              f"({int((obs_mask & (pos_w[en] <= 1)).sum())} of them fill cells no run had solved)")
-    else:
-        print("[obs] observation seeding OFF: table = average of independently solved sampled segments, "
-              "NaN everywhere else (pass --seed-obs to also fill all directly-observed cells)")
+    print("[obs] table = average of independently solved sampled segments, NaN everywhere else")
 
     m = pos_w > 0
 
@@ -309,7 +273,7 @@ def main():
     node_pos = _mean(edg_nodes)                                       # the node x frame table (NaN = hole)
     node_w = pos_w[edg_nodes].copy()                                  # accumulated reliability per cell
     filled = np.isfinite(node_pos).all(-1)
-    print(f"[table] {n_ok}/{args.n_runs} runs; node-frame table {100 * filled.mean():.1f}% filled "
+    print(f"[table] {n_ok}/{N_RUNS} runs; node-frame table {100 * filled.mean():.1f}% filled "
           f"({int((~filled).sum())} of {filled.size} cells are HOLES; no local fill)")
 
     node_mask = np.zeros(Q, dtype=bool); node_mask[edg_nodes] = True
@@ -324,15 +288,15 @@ def main():
     # global per-node rotation, fitted from the position table (the runs only give per-run-relative rotations)
     rest_frame = np.where(obs_mask.any(1), obs_mask.argmax(1),         # each node's reference = its 1st direct
                           np.where(filled.any(1), filled.argmax(1), -1))  # obs (fallback: 1st filled frame)
-    edg_rotation = _fit_global_rotations(node_pos, node_ids, edg_edges_global, rest_frame, args.rot_min_nbr)
+    edg_rotation = _fit_global_rotations(node_pos, node_ids, edg_edges_global, rest_frame, ROT_MIN_NBR)
     rot_filled = np.isfinite(edg_rotation).all(axis=(-1, -2))          # [Ne,T] where a rotation was fit
     print(f"[rot] fitted global rotations for {100 * rot_filled.mean():.1f}% of node-frames "
-          f"({int((filled & ~rot_filled).sum())} filled cells lacked >= {args.rot_min_nbr} shared neighbours)")
+          f"({int((filled & ~rot_filled).sum())} filled cells lacked >= {ROT_MIN_NBR} shared neighbours)")
 
     out = out_dir / "edg_global.npz"
     np.savez_compressed(out, node_ids=node_ids, edg_reconstruct=node_pos, edg_rotation=edg_rotation,
                         edg_edges=edg_edges_global, dyn_ids=dyn_ids, dyn_reconstruct=dyn_reconstruct,
-                        n_tracks=int(Q))                              # track-id space stamp (merged vs raw)
+                        n_tracks=int(Q))                              # track-id space stamp
 
     tbl = out_dir / "edg_table.npz"                                   # the explicit table with holes
     np.savez_compressed(tbl, node_ids=node_ids, frames=np.arange(T), table=node_pos,

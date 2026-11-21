@@ -18,10 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULES = {
     "sam3": ["numpy", "PIL", "cv2", "matplotlib", "torch", "ipykernel", "ipympl", "sam3.model_builder"],
     "gmos": ["numpy", "PIL", "torch", "safetensors", "hydra", "mediapy", "inference_gmos"],
-    "da3": ["numpy", "scipy", "PIL", "cv2", "pandas", "open3d", "torch", "depth_anything_3.api"],
+    "da3": ["numpy", "scipy", "PIL", "cv2", "pandas", "torch", "depth_anything_3.api"],
     "tapnet": ["numpy", "PIL", "cv2", "pandas", "tqdm", "torch", "einops", "tapnet.tapnext.tapnext_torch"],
-    "XM": ["numpy", "scipy", "cv2", "pandas", "matplotlib", "networkx", "open3d", "pyceres", "pycolmap",
-           "teaserpp_python", "XM"],
+    "XM": ["numpy", "scipy", "cv2", "matplotlib", "pyceres", "pycolmap", "XM"],
     "gs": ["numpy", "scipy", "cv2", "PIL", "imageio", "yaml", "tqdm", "matplotlib", "sklearn", "piexif", "tyro", "viser",
            "nerfview", "torchmetrics", "torch", "fused_ssim", "gsplat"],
 }

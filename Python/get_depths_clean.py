@@ -1,5 +1,4 @@
 import glob
-import os
 import sys
 from pathlib import Path
 
@@ -8,9 +7,7 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation
-from scipy.stats import trim_mean
 
-import open3d as o3d
 from check_masks import require_masks
 from utils import dataset_config
 
@@ -21,47 +18,34 @@ require_masks()  # step 0: the scene's moving-object masks must exist (make_mask
 # resized back afterwards, and because the resize is per-axis linear the intrinsic rescaling
 # (sx=W_orig/W_pred, sy=H_orig/H_pred) still maps DA3's predicted K back correctly.
 #
-# These depth-stage knobs are config values (config.json at the repo root); env vars still override.
-# Defaults are DA3's originals -- no aspect cap, process_res 504, per-frame intrinsics.
+# These depth-stage knobs are config values (config.json at the repo root).
 #   DA3_ASPECT_CAP        <= 1.0 disables; e.g. 2.0 caps the long side to 2:1
-#   DA3_PROCESS_RES       DA3 internal inference resolution (default 504)
-#   DA3_PROCESS_RES_METHOD "upper_bound_resize" (default) or "upper_bound_crop"
 #   DA3_SINGLE_INTRINSIC  collapse per-frame DA3 K to one shared pinhole (median focal)
-ASPECT_CAP = dataset_config.get_float("DA3_ASPECT_CAP", 0.0, env="DA3_ASPECT_CAP")
-PROCESS_RES = dataset_config.get_int("DA3_PROCESS_RES", 504, env="DA3_PROCESS_RES")
-PROCESS_RES_METHOD = str(
-    dataset_config._resolve("DA3_PROCESS_RES_METHOD", "upper_bound_resize", "DA3_PROCESS_RES_METHOD")
-)
-SINGLE_INTRINSIC = dataset_config.get_bool("DA3_SINGLE_INTRINSIC", False, env="DA3_SINGLE_INTRINSIC")
+# DA3 runs at its internal inference resolution 504 ("upper_bound_resize").
+ASPECT_CAP = dataset_config.get_float("DA3_ASPECT_CAP", 0.0)
+PROCESS_RES = 504
+PROCESS_RES_METHOD = "upper_bound_resize"
+SINGLE_INTRINSIC = dataset_config.get_bool("DA3_SINGLE_INTRINSIC", False)
 
 
-def _resize_to_aspect_cap(img_path, cap=ASPECT_CAP, intrinsic=None):
+def _resize_to_aspect_cap(img_path, cap=ASPECT_CAP):
     """Load an RGB image and, if its aspect (long/short side) exceeds `cap`,
     anisotropically resize it to exactly `cap` by shrinking the long side.
-    Returns (PIL.Image, intrinsic scaled to the new size or None).
+    Returns the PIL.Image.
     cap <= 1.0 disables capping (returns the original image).
     """
     img = Image.open(img_path).convert("RGB")
     W, H = img.size
     ratio = W / float(H)
     if cap <= 1.0:
-        return img, (None if intrinsic is None else np.asarray(intrinsic, dtype=np.float32))
+        return img
     if ratio > cap:
         new_W, new_H = int(round(cap * H)), H
     elif ratio < 1.0 / cap:
         new_W, new_H = W, int(round(cap * W))
     else:
-        return img, (None if intrinsic is None else np.asarray(intrinsic, dtype=np.float32))
-    img_r = img.resize((new_W, new_H), Image.BILINEAR)
-    if intrinsic is None:
-        return img_r, None
-    K = np.asarray(intrinsic, dtype=np.float32).copy()
-    ax, ay = new_W / float(W), new_H / float(H)
-    K[0, 0] *= ax
-    K[0, 2] *= ax
-    K[1, 1] *= ay
-    K[1, 2] *= ay
-    return img_r, K
+        return img
+    return img.resize((new_W, new_H), Image.BILINEAR)
 
 from depth_anything_3.api import DepthAnything3
 
@@ -72,17 +56,6 @@ from utils.script_logger import install_script_logger
 # Ensure Depth-Anything-3 module is importable when running from Python/
 REPO_ROOT = utils.definitions.rootpath.parents[1]
 sys.path.append(str(REPO_ROOT / "deps" / "Depth-Anything-3" / "src"))
-
-from utils.readgt_sintel import load_sintel_gt
-from utils.readgt_TUM import load_tum_gt
-from utils.readgt_replica import load_replica_gt
-from utils.readgt_colmap import load_colmap_gt
-from utils.readgt_dycheck import load_dycheck_gt
-
-try:
-    import teaserpp_python
-except ImportError:
-    teaserpp_python = None
 
 
 def _as_homogeneous(extrinsic: np.ndarray) -> np.ndarray:
@@ -162,50 +135,11 @@ def _write_depthanything_colmap_sparse(
     _write_points3d_txt(sparse_dir / "points3D.txt")
 
 
-def _compute_overlap_depth_scale(
-    prev_depth: np.ndarray,
-    curr_depth: np.ndarray,
-    prev_conf: np.ndarray | None = None,
-    curr_conf: np.ndarray | None = None,
-) -> float:
-    prev_depth = np.asarray(prev_depth, dtype=np.float64)
-    curr_depth = np.asarray(curr_depth, dtype=np.float64)
-    valid = (
-        np.isfinite(prev_depth)
-        & np.isfinite(curr_depth)
-        & (prev_depth > 1e-8)
-        & (curr_depth > 1e-8)
-    )
-    if prev_conf is not None:
-        valid &= np.isfinite(prev_conf) & (np.asarray(prev_conf, dtype=np.float64) > 0)
-    if curr_conf is not None:
-        valid &= np.isfinite(curr_conf) & (np.asarray(curr_conf, dtype=np.float64) > 0)
-
-    if not np.any(valid):
-        return 1.0
-
-    ratio = prev_depth[valid] / curr_depth[valid]
-    ratio = ratio[np.isfinite(ratio) & (ratio > 1e-8)]
-    if ratio.size == 0:
-        return 1.0
-
-    if ratio.size >= 16:
-        lo = np.percentile(ratio, 5.0)
-        hi = np.percentile(ratio, 95.0)
-        ratio = ratio[(ratio >= lo) & (ratio <= hi)]
-        if ratio.size == 0:
-            return 1.0
-
-    scale = float(np.median(ratio))
-    if not np.isfinite(scale) or scale <= 1e-8:
-        return 1.0
-    return scale
-
 def _build_overlap_depth_histogram_matcher(
     prev_depth_list,
     curr_depth_list,
-    prev_conf_list=None,
-    curr_conf_list=None,
+    prev_conf_list,
+    curr_conf_list,
     min_valid: int = 1024,
     num_quantiles: int = 256,
     trim_percentile: float = 2.0,
@@ -221,11 +155,6 @@ def _build_overlap_depth_histogram_matcher(
     """
     prev_values = []
     curr_values = []
-
-    if prev_conf_list is None:
-        prev_conf_list = [None] * len(prev_depth_list)
-    if curr_conf_list is None:
-        curr_conf_list = [None] * len(curr_depth_list)
 
     for prev_depth, curr_depth, prev_conf, curr_conf in zip(
         prev_depth_list,
@@ -249,13 +178,11 @@ def _build_overlap_depth_histogram_matcher(
             & (curr_depth > 1e-8)
         )
 
-        if prev_conf is not None:
-            prev_conf = np.asarray(prev_conf, dtype=np.float64)
-            valid &= np.isfinite(prev_conf) & (prev_conf > 0)
+        prev_conf = np.asarray(prev_conf, dtype=np.float64)
+        valid &= np.isfinite(prev_conf) & (prev_conf > 0)
 
-        if curr_conf is not None:
-            curr_conf = np.asarray(curr_conf, dtype=np.float64)
-            valid &= np.isfinite(curr_conf) & (curr_conf > 0)
+        curr_conf = np.asarray(curr_conf, dtype=np.float64)
+        valid &= np.isfinite(curr_conf) & (curr_conf > 0)
 
         if np.any(valid):
             prev_values.append(prev_depth[valid])
@@ -341,7 +268,6 @@ def _build_overlap_depth_histogram_matcher(
     return {
         "curr_knots": curr_unique.astype(np.float32),
         "prev_knots": prev_unique.astype(np.float32),
-        "median_scale": float(median_scale),
     }
 
 
@@ -352,9 +278,6 @@ def _apply_depth_histogram_match(depth: np.ndarray, matcher: dict) -> np.ndarray
     Interior values use interpolation.
     Tails use endpoint scale extrapolation to avoid hard clamping.
     """
-    if matcher is None:
-        return depth
-
     depth = np.asarray(depth, dtype=np.float32)
     out = depth.copy()
 
@@ -385,52 +308,15 @@ def _apply_depth_histogram_match(depth: np.ndarray, matcher: dict) -> np.ndarray
     return out
 
 
-def _apply_depth_histogram_match_to_prediction(
-    pred,
-    matcher: dict | None,
-    scale_extrinsics_with_median: bool = False,
-):
+def _apply_depth_histogram_match_to_prediction(pred, matcher: dict | None):
     """
-    Apply nonlinear histogram depth alignment to pred.depth.
-
-    If scale_extrinsics_with_median=True, camera translation is scaled by the
-    matcher's median scale. This is only an approximation, because nonlinear
-    depth remapping has no exact corresponding SE(3) scale.
+    Apply nonlinear histogram depth alignment to pred.depth (the camera poses are left as they are).
     """
     if matcher is None:
         return pred
 
     pred.depth = _apply_depth_histogram_match(pred.depth, matcher)
 
-    if scale_extrinsics_with_median:
-        median_scale = float(matcher.get("median_scale", 1.0))
-
-        if hasattr(pred, "extrinsics") and pred.extrinsics is not None:
-            extr = np.asarray(pred.extrinsics)
-
-            if extr.ndim == 3 and extr.shape[1:] == (4, 4):
-                pred.extrinsics = extr.astype(np.float32, copy=True)
-                pred.extrinsics[:, :3, 3] *= np.float32(median_scale)
-
-            elif extr.ndim == 3 and extr.shape[1:] == (3, 4):
-                pred.extrinsics = extr.astype(np.float32, copy=True)
-                pred.extrinsics[:, :3, 3] *= np.float32(median_scale)
-
-    return pred
-
-def _apply_depth_scale_to_prediction(pred, scale: float):
-    if abs(float(scale) - 1.0) <= 1e-8:
-        return pred
-
-    pred.depth = np.asarray(pred.depth, dtype=np.float32) * np.float32(scale)
-    if hasattr(pred, "extrinsics") and pred.extrinsics is not None:
-        extr = np.asarray(pred.extrinsics)
-        if extr.ndim == 3 and extr.shape[1:] == (4, 4):
-            pred.extrinsics = extr.astype(np.float32, copy=True)
-            pred.extrinsics[:, :3, 3] *= np.float32(scale)
-        elif extr.ndim == 3 and extr.shape[1:] == (3, 4):
-            pred.extrinsics = extr.astype(np.float32, copy=True)
-            pred.extrinsics[:, :3, 3] *= np.float32(scale)
     return pred
 
 
@@ -465,23 +351,10 @@ def main() -> None:
     # --------------------------------------------------------------
     # CONFIG (no argparse) — follow utils.definitions
     # --------------------------------------------------------------
-    dataset_cat = utils.definitions.dataset_cat
     dataset_name = utils.definitions.dataset_name
     input_dir = utils.definitions.video_dir
     output_dir = utils.definitions.da3_depth_dir
     image_pattern = utils.definitions.image_pattern
-
-    # Single intrinsics switch, shared across the whole pipeline (per-dataset config).
-    #   USE_DA3_INTRINSICS=False -> use GT intrinsics: load GT, pass to DA3, and
-    #                               SAVE GT as the output intrinsic (depth stays GT-based).
-    #   USE_DA3_INTRINSICS=True  -> use DA3's own predicted intrinsics: don't pass GT,
-    #                               and save DA3's predicted intrinsic.
-    USE_DA3_INTRINSICS = dataset_config.get_bool(
-        "USE_DA3_INTRINSICS", False, env="XM_USE_DA3_INTRINSICS"
-    )
-    USE_INTRINSICS_GT = not USE_DA3_INTRINSICS
-    print(f"[intrinsics] USE_DA3_INTRINSICS={USE_DA3_INTRINSICS} -> "
-          f"{'DA3 predicted' if USE_DA3_INTRINSICS else 'GT (loaded, passed, and saved)'}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     install_script_logger("depth_estimate", utils.definitions.output_dir)
@@ -492,50 +365,7 @@ def main() -> None:
 
     print(f"Found {len(images)} frames in {input_dir}")
 
-    # ------------------------------------------------------------------
-    # Load intrinsics from Sintel GT cameras (optional)
-    # ------------------------------------------------------------------
     dataset_root = Path(input_dir).parent
-    if dataset_cat == "Sintel":
-        gt = load_sintel_gt(str(dataset_root)) if USE_INTRINSICS_GT else None
-    elif dataset_cat == "TUM":
-        gt = load_tum_gt(str(dataset_root)) if USE_INTRINSICS_GT else None
-    elif dataset_cat == "Replica":
-        gt = load_replica_gt(str(dataset_root)) if USE_INTRINSICS_GT else None
-    elif dataset_cat == "Syn4D":
-        gt = load_colmap_gt(str(dataset_root / "colmap")) if USE_INTRINSICS_GT else None
-    elif dataset_cat == "Dycheck":
-        gt = load_dycheck_gt(str(dataset_root)) if USE_INTRINSICS_GT else None
-    else:
-        gt = None
-        USE_INTRINSICS_GT = False
-
-    if gt is not None:
-        def _can_parse_float(path: str) -> bool:
-            try:
-                float(Path(path).stem)
-                return True
-            except ValueError:
-                return False
-
-        if not all(_can_parse_float(p) for p in images):
-            ordered_names = [name for name in gt.keys() if (Path(input_dir) / name).exists()]
-            if ordered_names:
-                images = [str(Path(input_dir) / name) for name in ordered_names]
-                print("Using GT frame order from groundtruth keys (non-numeric filenames).")
-
-        intrinsics_list = []
-        for img_path in images:
-            img_name = os.path.basename(img_path)
-            if img_name not in gt:
-                raise RuntimeError(
-                    f"Missing GT intrinsics for {img_name} in {dataset_root}/cameras"
-                )
-            intrinsics_list.append(gt[img_name]["K"].astype(np.float32))
-
-        intrinsics_array = np.stack(intrinsics_list, axis=0)
-    else:
-        intrinsics_array = None
 
     # ------------------------------------------------------------------
     # Load DepthAnything3 model
@@ -550,25 +380,12 @@ def main() -> None:
     CHUNK_SIZE = 120
     CHUNK_OVERLAP = 2
 
-    def _run_chunk(img_chunk, intr_chunk):
+    def _run_chunk(img_chunk):
         # Cap the input aspect at 3:2 before inference (see ASPECT_CAP note above).
         imgs = []
-        ks = [] if intr_chunk is not None else None
-        for idx, p in enumerate(img_chunk):
-            k_in = intr_chunk[idx] if intr_chunk is not None else None
-            img_r, k_r = _resize_to_aspect_cap(p, ASPECT_CAP, k_in)
+        for p in img_chunk:
+            img_r = _resize_to_aspect_cap(p, ASPECT_CAP)
             imgs.append(img_r)
-            if ks is not None:
-                ks.append(k_r)
-        if intr_chunk is not None:
-            return model.inference(
-                imgs,
-                use_ray_pose=True,
-                ref_view_strategy="middle",
-                process_res=PROCESS_RES, # if GPU memory allows
-                process_res_method=PROCESS_RES_METHOD,
-                intrinsics=np.stack(ks, axis=0),
-            )
         return model.inference(imgs, use_ray_pose=True, process_res=PROCESS_RES, process_res_method=PROCESS_RES_METHOD,ref_view_strategy="middle")
 
     stitched_depth = []
@@ -583,9 +400,8 @@ def main() -> None:
         chunk_start = max(0, start - CHUNK_OVERLAP) if start > 0 else start
         end = min(start + CHUNK_SIZE, len(images))
         img_chunk = images[chunk_start:end]
-        intr_chunk = intrinsics_array[chunk_start:end] if intrinsics_array is not None else None
         print(f"Running DepthAnything3 on chunk {chunk_id}: frames {chunk_start}:{end}...")
-        pred_chunk = _run_chunk(img_chunk, intr_chunk)
+        pred_chunk = _run_chunk(img_chunk)
 
         overlap = int(start - chunk_start)
         if chunk_id > 0 and overlap > 0 and stitched_depth:
@@ -598,12 +414,8 @@ def main() -> None:
                 prev_overlap_depth = stitched_depth[-1][-overlap + j]
                 curr_overlap_depth = np.asarray(pred_chunk.depth[j], dtype=np.float32)
 
-                prev_overlap_conf = stitched_conf[-1][-overlap + j] if stitched_conf else None
-                curr_overlap_conf = (
-                    np.asarray(pred_chunk.conf[j], dtype=np.float32)
-                    if hasattr(pred_chunk, "conf") and pred_chunk.conf is not None
-                    else None
-                )
+                prev_overlap_conf = stitched_conf[-1][-overlap + j]
+                curr_overlap_conf = np.asarray(pred_chunk.conf[j], dtype=np.float32)
 
                 prev_overlap_depths.append(prev_overlap_depth)
                 curr_overlap_depths.append(curr_overlap_depth)
@@ -628,7 +440,6 @@ def main() -> None:
             pred_chunk = _apply_depth_histogram_match_to_prediction(
                 pred_chunk,
                 matcher,
-                scale_extrinsics_with_median=False,
             )
 
         keep_from = overlap
@@ -698,13 +509,7 @@ def main() -> None:
     # single-K collapse), so intrinsics.npy can be rewritten without regenerating depth.
     np.save(output_dir / "intrinsics_raw.npy", intrinsics.astype(np.float32).copy())
 
-    # GT mode: save the GT intrinsics (already at original resolution) instead of
-    # DA3's predicted intrinsics, so the whole pipeline stays on one intrinsic.
-    if USE_INTRINSICS_GT and intrinsics_array is not None:
-        intrinsics = intrinsics_array[: intrinsics.shape[0]].astype(np.float32).copy()
-        print(f"[intrinsics] GT mode: saving GT intrinsics (fx0={intrinsics[0, 0, 0]:.3f}), "
-              f"not DA3 predicted.")
-    elif SINGLE_INTRINSIC:
+    if SINGLE_INTRINSIC:
         # DA3 mode: collapse the per-frame predictions into a single shared pinhole.
         # Principal point fixed at the image center; the focal is the median across
         # frames of one axis (chosen below).

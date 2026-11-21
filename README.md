@@ -85,8 +85,7 @@ bash install/XM.sh
 ```
 
 Installs the environment for the XM solver, which ships compiled in `XM/build` (Python 3.10, CUDA 12.4). Its CUDA
-libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and COLMAP bindings, and
-[TEASER++](https://github.com/MIT-SPARK/TEASER-plusplus) (`deps/TEASER-plusplus`, built from source).
+libraries come from pip, so no CUDA toolkit is needed. Also installs Ceres and COLMAP bindings.
 
 ### 5. `gs`: 4D Gaussian training (step 6)
 
@@ -248,7 +247,7 @@ steps one by one. On DyCheck teddy (472 frames), steps 1–4 took 3.9 min with t
 steps one by one took 10.9 min with an earlier release (15.3 min without `NUMPY_MADVISE_HUGEPAGE=0`). Steps 1–5 took
 4.3 and 5.8 min (12.9 before).
 
-Set `EDG_NO_VIZ=1` to skip the Open3D windows. Step 2 writes its visualisation videos (`outputs/viz_*.mp4`) and the
+Step 2 writes its visualisation videos (`outputs/viz_*.mp4`) and the
 unfiltered static tracks (`outputs/tracks_debug.npz`), step 3 its lifted tracks (`tracks_debug_3d_solver.npz`) and
 XM matrices (`Abar.bin`, `Q.mat`), and step 5 its depth-check and density images and videos (`dyn_depth_reject*`,
 `dyn_density_2d*`), only with `"DEBUG": true` in `config.json`. Step 6 reads its training settings
@@ -262,8 +261,8 @@ point at the image centre (`DA3_SINGLE_INTRINSIC`). Frames wider than 2:1 are sq
 sensor depth, `<scene>/depth/*.png` (one 16-bit PNG per frame, in mm, 0 where there is none), and Depth Anything 3's
 depth, fitted to it by a scale and a shift per frame, fills its holes.
 
-Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving objects with AllTracker
-(`DYNAMIC_TRACKER`). A static point is hidden while it is on a moving object, a moving point while it is off its object.
+Step 2 tracks the static scene with TAPNext++ (`STATIC_TRACKER`) and the moving objects with AllTracker. A static point
+is hidden while it is on a moving object, a moving point while it is off its object.
 
 - Static scene: TAPNext++ starts from a 50 × 50 grid of points off the moving objects and tracks them frame by frame.
   At every frame it draws `ONLINE_RESAMPLE_GRID`² random points (30², on the frame resized to 256 × 256) and adds
@@ -318,20 +317,18 @@ of it, fitted over that track's frames; `"nearest"` takes the 6 nearest nodes. T
 `GS_MAX_POINTS` points (500000), about `GS_DYN_MIN_POINTS` (50000) of them on the moving objects. With
 `GS_DATA_FACTOR` > 1 (1), step 5 also writes the frames downscaled by it and the step-6 command it prints trains on them.
 
-### Optional: swap the trackers
+### Optional: AllTracker for the static scene
 
-Either part of step 2 can use either tracker, set in `config.json`:
+The static scene can be tracked with AllTracker instead of TAPNext++, set in `config.json`:
 
 ```json
-"STATIC_TRACKER": "alltracker",
-"DYNAMIC_TRACKER": "tapnext"
+"STATIC_TRACKER": "alltracker"
 ```
 
 AllTracker tracks the static scene at `STATIC_ALLTRACKER_RES` px (1024), for at most `STATIC_ALLTRACKER_MAX_LEN`
 frames (100) from its keyframe, visible while visibility × confidence is at least `STATIC_ALLTRACKER_VIS_THRESHOLD`
 (0.99), with an extra keyframe at any frame where fewer than `STATIC_ALLTRACKER_MIN_VISIBLE` points (200) are visible.
-At 1024 px it needs about 24 GB of GPU memory for a 1024 × 768 video. TAPNext on the moving objects keeps its own filters: it cuts a track at a large 2D move against its
-neighbours and at a point lost off its object.
+At 1024 px it needs about 24 GB of GPU memory for a 1024 × 768 video.
 
 ## License
 

@@ -87,17 +87,17 @@ def install_script_logger(stage: str, output_dir: str | Path) -> Path:
     return log_path
 
 
-def pause_script_logger(reason: str = "") -> None:
+def pause_script_logger(reason: str) -> None:
     if _ACTIVE_LOGGER is None:
         return
     state = _ACTIVE_LOGGER["state"]
     if state["finished"] or state["paused_at"] is not None:
         return
     state["paused_at"] = time.perf_counter()
-    print(f"[logger] pause runtime timer{': ' + reason if reason else ''}")
+    print(f"[logger] pause runtime timer: {reason}")
 
 
-def resume_script_logger(reason: str = "") -> None:
+def resume_script_logger() -> None:
     if _ACTIVE_LOGGER is None:
         return
     state = _ACTIVE_LOGGER["state"]
@@ -106,7 +106,7 @@ def resume_script_logger(reason: str = "") -> None:
     paused = time.perf_counter() - float(state["paused_at"])
     state["paused_seconds"] += paused
     state["paused_at"] = None
-    print(f"[logger] resume runtime timer after {paused:.3f}s{': ' + reason if reason else ''}")
+    print(f"[logger] resume runtime timer after {paused:.3f}s")
 
 
 def finish_script_logger() -> None:

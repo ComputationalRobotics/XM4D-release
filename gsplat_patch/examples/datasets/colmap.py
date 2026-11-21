@@ -8,10 +8,9 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-try:
-    from pycolmap import SceneManager  # type: ignore
-except Exception:
-    SceneManager = None
+
+# Max depth pixels per frame for the depth loss (sampled evenly over image tiles).
+DEPTH_SAMPLE_COUNT = 65536
 
 
 def _qvec_to_rot(qvec: List[float]) -> np.ndarray:
@@ -30,88 +29,20 @@ def _qvec_to_rot(qvec: List[float]) -> np.ndarray:
 
 
 class _TextCamera:
-    def __init__(self, cam_id: int, model: str, width: int, height: int, params: List[float]):
-        self.id = cam_id
+    def __init__(self, model: str, width: int, height: int, params: List[float]):
         self.camera_type = model
         self.width = int(width)
         self.height = int(height)
-        # default intrinsics
-        self.fx = 0.0
-        self.fy = 0.0
-        self.cx = 0.0
-        self.cy = 0.0
-        # distortion placeholders
-        self.k1 = 0.0
-        self.k2 = 0.0
-        self.p1 = 0.0
-        self.p2 = 0.0
-        self.k3 = 0.0
-        self.k4 = 0.0
-
-        # fill according to COLMAP camera model param ordering
-        if model == "SIMPLE_PINHOLE":
-            # f, cx, cy
-            f, cx, cy = params[:3]
-            self.fx = self.fy = float(f)
-            self.cx = float(cx)
-            self.cy = float(cy)
-        elif model == "PINHOLE":
-            # fx, fy, cx, cy
-            fx, fy, cx, cy = params[:4]
-            self.fx = float(fx)
-            self.fy = float(fy)
-            self.cx = float(cx)
-            self.cy = float(cy)
-        elif model == "SIMPLE_RADIAL":
-            # f, cx, cy, k1
-            f, cx, cy, k1 = params[:4]
-            self.fx = self.fy = float(f)
-            self.cx = float(cx)
-            self.cy = float(cy)
-            self.k1 = float(k1)
-        elif model == "RADIAL":
-            # f, cx, cy, k1, k2
-            f, cx, cy, k1, k2 = params[:5]
-            self.fx = self.fy = float(f)
-            self.cx = float(cx)
-            self.cy = float(cy)
-            self.k1 = float(k1)
-            self.k2 = float(k2)
-        elif model == "OPENCV":
-            # fx, fy, cx, cy, k1, k2, p1, p2
-            fx, fy, cx, cy, k1, k2, p1, p2 = params[:8]
-            self.fx = float(fx)
-            self.fy = float(fy)
-            self.cx = float(cx)
-            self.cy = float(cy)
-            self.k1 = float(k1)
-            self.k2 = float(k2)
-            self.p1 = float(p1)
-            self.p2 = float(p2)
-        elif model == "OPENCV_FISHEYE":
-            # fx, fy, cx, cy, k1, k2, k3, k4
-            fx, fy, cx, cy, k1, k2, k3, k4 = params[:8]
-            self.fx = float(fx)
-            self.fy = float(fy)
-            self.cx = float(cx)
-            self.cy = float(cy)
-            self.k1 = float(k1)
-            self.k2 = float(k2)
-            self.k3 = float(k3)
-            self.k4 = float(k4)
-        else:
-            # Best-effort: assume first four are fx, fy, cx, cy
-            if len(params) >= 4:
-                fx, fy, cx, cy = params[:4]
-                self.fx = float(fx)
-                self.fy = float(fy)
-                self.cx = float(cx)
-                self.cy = float(cy)
+        # PINHOLE (the model step 5 writes): fx, fy, cx, cy
+        fx, fy, cx, cy = params[:4]
+        self.fx = float(fx)
+        self.fy = float(fy)
+        self.cx = float(cx)
+        self.cy = float(cy)
 
 
 class _TextImage:
-    def __init__(self, image_id: int, qvec: List[float], tvec: List[float], camera_id: int, name: str):
-        self.id = int(image_id)
+    def __init__(self, qvec: List[float], tvec: List[float], camera_id: int, name: str):
         self.qvec = [float(x) for x in qvec]
         self.tvec = np.array([float(x) for x in tvec], dtype=np.float64)
         self.camera_id = int(camera_id)
@@ -124,8 +55,8 @@ class _TextImage:
 class COLMAPTextSceneManager:
     """Minimal COLMAP text-format scene manager (reads cameras.txt, images.txt, points3D.txt).
 
-    Provides the small subset of attributes used by the Parser in this file so
-    the rest of the code can remain unchanged.
+    Reads the text dataset step 5 writes (PINHOLE cameras, points without tracks) and provides
+    the small subset of attributes used by the Parser in this file.
     """
 
     def __init__(self, path: str):
@@ -134,7 +65,7 @@ class COLMAPTextSceneManager:
         self.images: Dict[int, _TextImage] = {}
         self.name_to_image_id: Dict[str, int] = {}
 
-        # point3D arrays and mappings
+        # point3D arrays; the points carry no tracks, so the track mappings stay empty
         self.points3D = np.zeros((0, 3), dtype=np.float32)
         self.point3D_colors = np.zeros((0, 3), dtype=np.uint8)
         self.point3D_errors = np.zeros((0,), dtype=np.float32)
@@ -143,8 +74,6 @@ class COLMAPTextSceneManager:
 
     def load_cameras(self) -> None:
         path = os.path.join(self.path, "cameras.txt")
-        if not os.path.exists(path):
-            return
         with open(path, "r") as f:
             for line in f:
                 line = line.strip()
@@ -156,70 +85,42 @@ class COLMAPTextSceneManager:
                 width = int(parts[2])
                 height = int(parts[3])
                 params = [float(x) for x in parts[4:]]
-                self.cameras[cam_id] = _TextCamera(cam_id, model, width, height, params)
+                self.cameras[cam_id] = _TextCamera(model, width, height, params)
 
     def load_images(self) -> None:
         path = os.path.join(self.path, "images.txt")
-        if not os.path.exists(path):
-            return
         with open(path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
                 parts = line.split()
-                # typical line: IMAGE_ID, QW QX QY QZ, TX TY TZ, CAMERA_ID, IMAGE_NAME
-                if len(parts) < 9:
-                    continue
+                # line: IMAGE_ID, QW QX QY QZ, TX TY TZ, CAMERA_ID, IMAGE_NAME (the POINTS2D lines are empty)
                 image_id = int(parts[0])
                 qvec = parts[1:5]
                 tvec = parts[5:8]
                 camera_id = int(parts[8])
                 # image name may contain spaces, join the rest
                 name = " ".join(parts[9:])
-                img = _TextImage(image_id, qvec, tvec, camera_id, name)
+                img = _TextImage(qvec, tvec, camera_id, name)
                 self.images[image_id] = img
                 self.name_to_image_id[name] = image_id
 
     def load_points3D(self) -> None:
         path = os.path.join(self.path, "points3D.txt")
-        if not os.path.exists(path):
-            # keep zero arrays
-            return
         pts = []
         cols = []
         errs = []
-        id_to_idx = {}
-        id_to_images = {}
         with open(path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
                 parts = line.split()
-                # Format: point3D_id X Y Z R G B error track...
-                pid = int(parts[0])
+                # Format: point3D_id X Y Z R G B error (no track)
                 x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                 r, g, b = int(parts[4]), int(parts[5]), int(parts[6])
                 err = float(parts[7])
-                track_tokens = parts[8:]
-                track = []
-                if len(track_tokens) > 0:
-                    if ':' in track_tokens[0]:
-                        # colon-separated pairs image_id:point2D_idx
-                        for tok in track_tokens:
-                            if ':' not in tok:
-                                continue
-                            imid_s, idx_s = tok.split(':')
-                            track.append((int(imid_s), int(idx_s)))
-                    else:
-                        # assume alternating image_id point2D_idx
-                        for i in range(0, len(track_tokens) - 1, 2):
-                            imid_s = track_tokens[i]
-                            idx_s = track_tokens[i + 1]
-                            track.append((int(imid_s), int(idx_s)))
-                id_to_images[pid] = track
-                id_to_idx[pid] = len(pts)
                 pts.append([x, y, z])
                 cols.append([r, g, b])
                 errs.append(err)
@@ -228,8 +129,6 @@ class COLMAPTextSceneManager:
             self.points3D = np.array(pts, dtype=np.float32)
             self.point3D_colors = np.array(cols, dtype=np.uint8)
             self.point3D_errors = np.array(errs, dtype=np.float32)
-            self.point3D_id_to_images = id_to_images
-            self.point3D_id_to_point3D_idx = id_to_idx
 
 from tqdm import tqdm
 from typing_extensions import assert_never
@@ -301,22 +200,7 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
-        # Try to use pycolmap.SceneManager when available; otherwise use
-        # the lightweight text-based loader defined above.
-        # if SceneManager is not None:
-        #     try:
-        #         manager = SceneManager(colmap_dir)
-        #         manager.load_cameras()
-        #         manager.load_images()
-        #         manager.load_points3D()
-        #     except Exception:
-        #         # Fall back to text parser if pycolmap fails (e.g. not installed
-        #         # or incompatible formats)
-        #         manager = COLMAPTextSceneManager(colmap_dir)
-        #         manager.load_cameras()
-        #         manager.load_images()
-        #         manager.load_points3D()
-        # else:
+        # The lightweight text-based loader defined above (instead of pycolmap's SceneManager).
         manager = COLMAPTextSceneManager(colmap_dir)
         manager.load_cameras()
         manager.load_images()
@@ -393,13 +277,6 @@ class Parser:
         # Image names from COLMAP. No need for permuting the poses according to
         # image names anymore.
         image_names = [imdata[k].name for k in imdata]
-
-        # # Previous Nerf results were generated with images sorted by filename,
-        # # ensure metrics are reported on the same test set.
-        # inds = np.argsort(image_names)
-        # image_names = [image_names[i] for i in inds]
-        # camtoworlds = camtoworlds[inds]
-        # camera_ids = [camera_ids[i] for i in inds]
 
         # Load extended metadata. Used by Bilarf dataset.
         self.extconf = {
@@ -632,31 +509,18 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        depth_sample_count: int = 65536,
-        depth_max: float = 0.0,
-        depth_grad_threshold: float = 0.0,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
-        self.depth_sample_count = int(depth_sample_count)
-        self.depth_max = float(depth_max)
-        self.depth_grad_threshold = float(depth_grad_threshold)
         self.da3_depth_maps = None
         # Depth samples are deterministic per frame (rng seeded by frame index),
         # so cache them to avoid recomputing the mask/sampling every __getitem__.
         self._depth_sample_cache: Dict[int, Any] = {}
-        # EDG_DEPTH_MAPS_FILE lets the depth-loss target be swapped (e.g. a LiDAR+DA3 hybrid already
-        # in solver units) instead of the raw DA3 depth_maps.npy. Default keeps DA3 behavior.
-        _depth_fname = os.environ.get("EDG_DEPTH_MAPS_FILE", "depth_maps.npy")
-        depth_path = Path(parser.data_dir).parent / "depth_anything_3" / _depth_fname   # XM4D outputs/ (step 1)
-        if not depth_path.exists():
-            depth_path = Path(parser.data_dir).parent / "depth" / _depth_fname
-        if self.load_depths and depth_path.exists():
+        if self.load_depths:
+            depth_path = Path(parser.data_dir).parent / "depth_anything_3" / "depth_maps.npy"   # XM4D outputs/ (step 1)
             self.da3_depth_maps = np.load(depth_path).astype(np.float32)
-            if self.da3_depth_maps.ndim != 3:
-                raise ValueError(f"Expected depth maps shape (T,H,W), got {self.da3_depth_maps.shape}")
             print(f"[Depth] Loaded depth maps from {depth_path}: {self.da3_depth_maps.shape}")
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
@@ -679,7 +543,7 @@ class Dataset:
         crop_xy: Tuple[int, int] = (0, 0),
         rng_seed: int = 0,
     ):
-        if self.da3_depth_maps is None or frame_index >= self.da3_depth_maps.shape[0]:
+        if frame_index >= self.da3_depth_maps.shape[0]:
             return None
 
         # Cache is valid only without random cropping (crop_xy fixed at (0,0)).
@@ -696,22 +560,15 @@ class Dataset:
 
         depth_f = depth.astype(np.float64)
         finite_positive = np.isfinite(depth_f) & (depth_f > 0.0)
-        if self.depth_max > 0.0:
-            finite_positive &= depth_f <= self.depth_max
-        if self.depth_grad_threshold > 0.0:
-            grad_x = cv2.Sobel(depth_f, cv2.CV_64F, 2, 0, ksize=3)
-            grad_y = cv2.Sobel(depth_f, cv2.CV_64F, 0, 2, ksize=3)
-            grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y)
-            finite_positive &= grad_mag <= self.depth_grad_threshold
 
         ys_d, xs_d = np.where(finite_positive)
         result = None
         if xs_d.size > 0:
-            if self.depth_sample_count > 0 and xs_d.size > self.depth_sample_count:
+            if xs_d.size > DEPTH_SAMPLE_COUNT:
                 sel = self._balanced_depth_sample_indices(
                     ys_d,
                     xs_d,
-                    max_samples=self.depth_sample_count,
+                    max_samples=DEPTH_SAMPLE_COUNT,
                     depth_hw=(depth_h, depth_w),
                     rng_seed=rng_seed,
                 )
@@ -744,17 +601,12 @@ class Dataset:
         max_samples: int,
         depth_hw: Tuple[int, int],
         rng_seed: int,
-        grid_size: int = 32,
     ) -> np.ndarray:
-        n = int(xs.shape[0])
-        max_samples = int(max_samples)
-        if max_samples <= 0 or n <= max_samples:
-            return np.arange(n, dtype=np.int64)
-
+        """Up to max_samples of the (ys, xs) pixels, spread evenly over a 32x32 grid of image tiles."""
         rng = np.random.default_rng(int(rng_seed))
         H, W = int(depth_hw[0]), int(depth_hw[1])
-        gh = max(1, min(int(grid_size), H))
-        gw = max(1, min(int(grid_size), W))
+        gh = max(1, min(32, H))
+        gw = max(1, min(32, W))
         tile_y = np.clip((ys.astype(np.int64) * gh) // max(H, 1), 0, gh - 1)
         tile_x = np.clip((xs.astype(np.int64) * gw) // max(W, 1), 0, gw - 1)
         tile_id = tile_y * gw + tile_x

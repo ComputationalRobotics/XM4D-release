@@ -26,7 +26,8 @@ def load_dynamic_masks(
     """Load dynamic masks as bool array [T, H, W].
 
     If target_size is provided, masks are resized to that (width, height) using NEAREST.
-    mask_mode has the same semantics as load_dynamic_masks_256.
+    mask_mode: "dynamic_positive" (>0 means dynamic) or "auto" (as dynamic_positive, but inverted when >0 covers more
+    than half of all pixels, i.e. static stored as white).
     """
     paths = glob.glob(os.path.join(mask_dir, pattern))
     if not paths:
@@ -50,8 +51,6 @@ def load_dynamic_masks(
 
     if mask_mode == "dynamic_positive":
         return masks_pos
-    if mask_mode == "dynamic_zero":
-        return ~masks_pos
     if mask_mode != "auto":
         raise ValueError(f"Unknown --mask_mode: {mask_mode}")
 

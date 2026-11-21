@@ -47,7 +47,7 @@ def save_object(name, category, frames, masks):
     "rigid" (moves as one rigid body), "human" (a person, hands included) or "other" (anything else that moves).
     Saving the same name again replaces its masks and keeps its place in the adding order."""
     if category == "hand":
-        raise NotImplementedError("hand masks are not supported yet (coming soon): save hands as part of 'human'")
+        raise NotImplementedError("hand masks are not supported: save hands as part of 'human'")
     if category not in CATEGORIES:
         raise ValueError(f"category {category!r}: use 'rigid', 'human' or 'other'")
     other = [f"{c}_{name}" for c in CATEGORIES if c != category and (D.mask_dir / f"{c}_{name}").is_dir()]

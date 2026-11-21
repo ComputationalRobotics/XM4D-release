@@ -10,14 +10,13 @@ Without it the lifted points jitter frame to frame with the per-frame depth and 
 
 Writes outputs/tracks_dynamic_only_smoothed.npz: the input keys with tracks_xyz replaced by the smoothed points in each frame's
 camera (x_cam = R^T (X - t) / s, NaN where the input is invalid), plus tracks_world_smoothed (Q, T, 3).
-config.json: SMOOTH_SIGMA_DEPTH (0.1), SMOOTH_CAUCHY_DEPTH (2), SMOOTH_SIGMA_ACC (30 px/frame^2), SMOOTH_CAUCHY_PX (2 px),
-SMOOTH_DEPTH_REPAIR (0 = off): before the solve, an observation whose log-depth is more than this from its track's own
-smoothed log-depth (depth spike) is moved along its ray onto that smoothed depth.
+config.json: SMOOTH_SIGMA_DEPTH (0.1), SMOOTH_SIGMA_ACC (30 px/frame^2), SMOOTH_DEPTH_REPAIR (0 = off): before the solve, an
+observation whose log-depth is more than this from its track's own smoothed log-depth (depth spike) is moved along its ray
+onto that smoothed depth. Cauchy scales: 2 px (reprojection), 2 sigma-depth (depth).
 usage: python smooth_dynamic_tracks.py
 """
 import json
 import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool
@@ -32,9 +31,9 @@ from utils.edg import scatter_solved_frame_vector, scatter_solved_poses
 
 args = SimpleNamespace(
     sigma_depth=dataset_config.get_float("SMOOTH_SIGMA_DEPTH", 0.1),   # relative depth noise (log); larger = weaker depth term
-    cauchy_depth=dataset_config.get_float("SMOOTH_CAUCHY_DEPTH", 2.0), # Cauchy scale of the depth term, in sigma-depth units
+    cauchy_depth=2.0,                                                  # Cauchy scale of the depth term, in sigma-depth units
     sigma_acc=dataset_config.get_float("SMOOTH_SIGMA_ACC", 30.0),      # acceleration, px-equivalent per frame^2
-    cauchy_px=dataset_config.get_float("SMOOTH_CAUCHY_PX", 2.0),       # Cauchy scale of the reprojection term, px
+    cauchy_px=2.0,                                                     # Cauchy scale of the reprojection term, px
     depth_repair=dataset_config.get_float("SMOOTH_DEPTH_REPAIR", 0.0), # log-depth distance from the track's smoothed depth
                                                                        # above which an observation is repaired (0 = off)
     sigma_logz=0.02,                                      # repair reference: log-depth 2nd difference per frame^2
@@ -221,15 +220,15 @@ if __name__ == "__main__":
     solved = np.isfinite(XS).all(-1).any(1)
     print(f"{utils.definitions.dataset_name}: solved {solved.sum()} of {len(ids)} tracks in {t_solve:.1f} s on {args.workers} workers "
           f"(sigma_depth {args.sigma_depth}, sigma_acc {args.sigma_acc} px/frame^2, Cauchy {args.cauchy_px} px)")
-    if args.out:                                          # written in the background while the statistics run (speed)
-        xcam = rotate(np.transpose(R, (0, 2, 1)) / s[:, None, None], XS - C[None])
-        xcam[~V] = np.nan
-        out = dict(d)
-        out["tracks_xyz"] = xcam[None]
-        out["tracks_world_smoothed"] = XS.astype(np.float32)
-        writer = ThreadPoolExecutor(1)                    # uncompressed: 1.3 GB (0.4 GB compressed) on teddy, but ~20 s
+    # written in the background while the statistics run (speed)
+    xcam = rotate(np.transpose(R, (0, 2, 1)) / s[:, None, None], XS - C[None])
+    xcam[~V] = np.nan
+    out = dict(d)
+    out["tracks_xyz"] = xcam[None]
+    out["tracks_world_smoothed"] = XS.astype(np.float32)
+    writer = ThreadPoolExecutor(1)                        # uncompressed: 1.3 GB (0.4 GB compressed) on teddy, but ~20 s
                                                           # faster to write and ~1 s faster to read for each later step
-        written = writer.submit(np.savez, f"{O}/{args.out}", **out)
+    written = writer.submit(np.savez, f"{O}/{args.out}", **out)
 
     # ---- statistics over the observations of the solved tracks (evaluated at those observations only) ----
     m = V & solved[:, None]
@@ -257,7 +256,6 @@ if __name__ == "__main__":
                  reproj_med=float(np.median(rep)), reproj_p90=float(np.percentile(rep, 90)), reproj_gt5=float((rep > 5).mean()),
                  dz_med=float(np.median(dz)), acc_raw=float(np.median(a0)), acc_smooth=float(np.median(a1)),
                  solve_seconds=t_solve, workers=args.workers, tracks=int(solved.sum()), obs=int(m.sum()))
-    if args.out:
-        written.result(); writer.shutdown()
-        json.dump(stats, open(f"{O}/{os.path.splitext(args.out)[0]}.json", "w"), indent=1)
-        print(f"  wrote {O}/{args.out}")
+    written.result(); writer.shutdown()
+    json.dump(stats, open(f"{O}/{os.path.splitext(args.out)[0]}.json", "w"), indent=1)
+    print(f"  wrote {O}/{args.out}")

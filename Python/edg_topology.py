@@ -24,11 +24,7 @@ import build_edg as B
 import utils.dataset_config as dataset_config
 import utils.definitions
 
-try:
-    _nq = B._nanquantile_fast
-except AttributeError:
-    def _nq(a, q, axis):
-        return np.nanquantile(a, q, axis=axis)
+_nq = B._nanquantile_fast
 
 
 # ------------------------------------------------------------------ node selection (motion-radius rule)
@@ -167,7 +163,7 @@ def select_nodes(P, Vs, Ocount, R, thr, prm, trees, close2d, overlap_frac=0.5, m
 
 
 def fps_budget(P, Vs, Ocount, nodes, max_nodes, quantile=0.80):
-    """build_edg's node budget: length-biased farthest-point sampling on the persistent distance, keeping max_nodes."""
+    """Node budget: length-biased farthest-point sampling on the persistent distance, keeping max_nodes."""
     if nodes.size <= max_nodes:
         return nodes
     N = nodes.size
@@ -256,14 +252,14 @@ def main():
     D = B._load_all(tracks_path=str(tracks))
     D["dyn_mask"] = B._dilate_dyn_mask(D, 5)
     T = D["T"]; Q = D["tracks_xyz"].shape[1]
-    s = B._frame_scale(D["rt"], T, False)
+    s = B._frame_scale(D["rt"], T)
     Ps, Vs = B._stack_sampled(D, s, np.arange(T, dtype=int))
     Ocount = Vs.sum(axis=0); thr = B._auto_edge_threshold(Ps, Vs)
     P = np.transpose(Ps, (1, 0, 2))
     R, R_raw, c_sh, rc_sh, on_sh = compensated_radius(P, Vs, thr)
-    prm = dict(a=dataset_config.get_float("EDG_FAST_REACH", 0.4), b=0.2, r0=dataset_config.get_float("EDG_FAST_RADIUS", 2.0),
+    prm = dict(a=0.4, b=0.2, r0=2.0,
                cap=2.0, e=1.2, k=10, rho=0.1, overlap=0.3, alpha=0.3, ball=0.8, strong=0.25, const_f=1.5, vel_max=0.28)
-    min_frames = dataset_config.get_int("EDG_NODE_MIN_FRAMES", min(20, max(2, int(round(0.4 * T)))))
+    min_frames = min(20, max(2, int(round(0.4 * T))))
     near_px = B._dyn_region_near_px(D, 0.16)
     picked = select_nodes(P, Vs, Ocount, R, thr, prm, B._frame_trees_2d(P, Vs, T), (D["tracks_xy"][0].astype(np.float64), near_px, 0.90),
                           min_node_frames=min_frames)
@@ -271,8 +267,8 @@ def main():
     ext = object_extent(P, Vs)
     e_loc = select_edges(nodes, P, Vs, Ocount, R, thr, ext, c_sh, on_sh, prm)
     edges = nodes[e_loc] if len(e_loc) else np.zeros((0, 2), np.int64)
-    dyn = B.build_dyn_to_edg_edges(np.zeros((0, 2), np.int64), Q, nodes, Ps, Vs, Ocount, thr, hop_lt=3, min_conn=2, max_factor=2.5,
-                                   max_dist_factor=3.0, min_max_ratio=0.5, cand_near=16, verbose=False)
+    dyn = B.build_dyn_to_edg_edges(Q, nodes, Ps, Vs, Ocount, thr, min_conn=2, max_factor=2.5,
+                                   max_dist_factor=3.0, min_max_ratio=0.5, cand_near=16)
     out = utils.definitions.output_dir / "edg_topology.npz"
     np.savez_compressed(out, edg_nodes=nodes.astype(np.int64), edg_edges=edges.astype(np.int64), dyn_edg_edges=dyn.astype(np.int64),
                         n_tracks=np.array(Q), thr=np.array(thr), node_fast=R[nodes] > prm["r0"] * thr, tracks_file=np.array(str(tracks)))

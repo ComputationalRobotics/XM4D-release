@@ -10,20 +10,11 @@ def delete_thereshold(min_threshold, M, data):
     frame_index = np.zeros(M, dtype=int)
     frame_index[valid_indices] = np.arange(num_valid_frames)
     frame_index[wrong_indices] = -1
-    max_frame = np.argmax(valid_frames)
-    return max_frame, num_valid_frames, frame_index
+    return num_valid_frames, frame_index
 
-def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
-                   frame_min_points=10):
+def checklandmarks(edges, landmarks, weights, N, M, frame_min_points=10):
     # delete and reindex the frames whose number of observations is <= frame_min_points.
-    # Raise frame_min_points to drop weakly-observed frames (e.g. IMC gate).
-    max_frame, N, indices_frame = delete_thereshold(frame_min_points, N, edges[:,0]-1)
-
-    # exchange the first frame
-    if use_max_frame:
-        if indices_frame[max_frame] != 0:
-            indices_frame[indices_frame == 0] = indices_frame[max_frame]
-            indices_frame[max_frame] = 0
+    N, indices_frame = delete_thereshold(frame_min_points, N, edges[:,0]-1)
 
     indices_all = indices_frame.copy()  
     edges[:,0] = indices_frame[edges[:,0]-1].copy() + 1
@@ -32,11 +23,9 @@ def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
     edges = edges[~indices]
     weights = weights[~indices]
     landmarks = landmarks[~indices]
-    rgbs = rgbs[~indices]
 
     # delete and reindex the landmarks that contains one frame
-    # Note: raise the threshold to also drop landmarks seen in few frames, e.g. IMC gate
-    _, M, indices_landmarks = delete_thereshold(0, M, edges[:,1]-1)
+    M, indices_landmarks = delete_thereshold(0, M, edges[:,1]-1)
     edges[:,1] = indices_landmarks[edges[:,1]-1].copy() + 1
     
     # delete the row that edges contain -1
@@ -44,10 +33,9 @@ def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
     print("delete:", np.sum(indices), "edges")
     edges = edges[~indices]
     weights = weights[~indices]
-    rgbs = rgbs[~indices]
     landmarks = landmarks[~indices]
     
-    max_frame, N, indices_frame = delete_thereshold(0, N, edges[:,0]-1)
+    N, indices_frame = delete_thereshold(0, N, edges[:,0]-1)
     edges[:,0] = indices_frame[edges[:,0]-1].copy() + 1
 
     N_old = np.where(indices_all > -1)[0].shape[0]
@@ -59,7 +47,6 @@ def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
     edges = edges[~indices]
     weights = weights[~indices]
     landmarks = landmarks[~indices]
-    rgbs = rgbs[~indices]
 
     # Components of the frame-landmark graph (nodes u and v + N). Same choice as the networkx version: the largest
     # component by node count, ties going to the component met first in edge order; an edge's two nodes always share
@@ -82,9 +69,8 @@ def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
         print("Not connected, Choose Largest Component")
         edges = edges[filtered_indices]
         weights = weights[filtered_indices]
-        rgbs = rgbs[filtered_indices]
         landmarks = landmarks[filtered_indices]
-        _, N, indices_frame = delete_thereshold(0, N, edges[:,0]-1)
+        N, indices_frame = delete_thereshold(0, N, edges[:,0]-1)
         edges[:,0] = indices_frame[edges[:,0]-1].copy() + 1
 
         N_old = np.where(indices_all > -1)[0].shape[0]
@@ -92,8 +78,8 @@ def checklandmarks(edges, landmarks, weights, rgbs, N, M, use_max_frame=True,
         for i in range(N_old):
             indices_all[np.where(indices_all_copy == i)[0]] = indices_frame[i]
         
-        _, M, indices_landmarks = delete_thereshold(0, M, edges[:,1]-1)
+        M, indices_landmarks = delete_thereshold(0, M, edges[:,1]-1)
         edges[:,1] = indices_landmarks[edges[:,1]-1].copy() + 1
         # here do not need to delete edges because we already know the graph is connected
         
-    return edges, landmarks, weights, rgbs, indices_all
+    return edges, landmarks, weights, indices_all

@@ -2,8 +2,7 @@
 """Run 2D tracking of the static scene for XM datasets. Tracker (config STATIC_TRACKER): "tapnext" (default; the
 online TAPNext++ tracker) or "alltracker" (AllTracker from keyframes, utils/track_alltracker.py).
 
-Paths and dataset settings come from utils.definitions / XM_* environment
-variables.
+Paths come from utils.definitions, the parameters from config.json.
 """
 
 from pathlib import Path
@@ -18,7 +17,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deps" / "tapnet"))
 
 from tapnet.tapnext.tapnext_torch import TAPNext
-from tapnet.tapnext.tapnext_torch_utils import restore_model_from_jax_checkpoint, tracker_certainty
+from tapnet.tapnext.tapnext_torch_utils import tracker_certainty
 
 from utils.track_tapnet import (
     apply_dynamic_mask_filter,
@@ -34,10 +33,8 @@ import utils.dataset_config as dataset_config
 from utils.script_logger import install_script_logger
 
 ### S0: CONFIG
-DEPTH_SOURCE = utils.definitions.depth_source  # "gt", "da3", "vggt", "spatracker", or "unidepth"
-
 IMAGE_DIR = utils.definitions.video_dir
-MASK_DIR = utils.definitions.mask_dir  # set to None or non-existent path if no masks
+MASK_DIR = utils.definitions.mask_dir  # a non-existent path if no masks
 OUT_DIR = utils.definitions.output_dir
 
 IMAGE_PATTERN = utils.definitions.image_pattern
@@ -45,8 +42,6 @@ MASK_PATTERN = utils.definitions.mask_pattern
 
 GRID = 50
 
-# Emit resample queries as (t, y, x), TAPNext's query order, instead of (t, x, y).
-RESAMPLE_SWAP_XY = True
 # 2D tracker (STATIC_TRACKER). TAPNext (default): a GRID x GRID grid at frame 0, then at every frame new points
 # wherever no visible point is within ONLINE_RESAMPLE_RADIUS (px @256), tracked online; the flow-consistency trim
 # (move-delete) below runs for TAPNext only.
@@ -56,24 +51,24 @@ RESAMPLE_SWAP_XY = True
 # keyframe's points are tracked at most STATIC_ALLTRACKER_MAX_LEN frames; visible where AllTracker's visibility x
 # confidence >= STATIC_ALLTRACKER_VIS_THRESHOLD and the point is off the moving objects. At STATIC_ALLTRACKER_RES = 1024
 # (AllTracker's own default) a 1024 x 768 video needs ~24 GB of GPU memory; 512 makes the static tracks less accurate.
-TRACKER = dataset_config.get_str("STATIC_TRACKER", "tapnext", env="STATIC_TRACKER").lower()
+TRACKER = dataset_config.get_str("STATIC_TRACKER", "tapnext").lower()
 if TRACKER not in {"alltracker", "tapnext"}:
     raise ValueError(f"STATIC_TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
-AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10, env="ALLTRACKER_KEYFRAME")
-AT_RES = dataset_config.get_int("STATIC_ALLTRACKER_RES", 1024, env="STATIC_ALLTRACKER_RES")
-AT_VIS_THRESHOLD = dataset_config.get_float("STATIC_ALLTRACKER_VIS_THRESHOLD", 0.99, env="STATIC_ALLTRACKER_VIS_THRESHOLD")
-AT_MAX_LEN = dataset_config.get_int("STATIC_ALLTRACKER_MAX_LEN", 100, env="STATIC_ALLTRACKER_MAX_LEN")
-AT_MIN_VISIBLE = dataset_config.get_int("STATIC_ALLTRACKER_MIN_VISIBLE", 200, env="STATIC_ALLTRACKER_MIN_VISIBLE")
+AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10)
+AT_RES = dataset_config.get_int("STATIC_ALLTRACKER_RES", 1024)
+AT_VIS_THRESHOLD = dataset_config.get_float("STATIC_ALLTRACKER_VIS_THRESHOLD", 0.99)
+AT_MAX_LEN = dataset_config.get_int("STATIC_ALLTRACKER_MAX_LEN", 100)
+AT_MIN_VISIBLE = dataset_config.get_int("STATIC_ALLTRACKER_MIN_VISIBLE", 200)
 
 MOVE_DELETE_ENABLED = TRACKER == "tapnext"
 MOVE_WINDOW_SIZE = 10.0
 MOVE_DELETE_FLOW_ERROR_THRESHOLD = dataset_config.get_float(
-    "MOVE_DELETE_FLOW_ERROR_THRESHOLD", 10.0, env="MOVE_DELETE_FLOW_ERROR_THRESHOLD"
+    "MOVE_DELETE_FLOW_ERROR_THRESHOLD", 10.0
 )  # Pixel threshold for local flow-vector deviation.
 # Dilation (native-resolution px) applied to dynamic masks for BOTH the query
 # exclusion (before track_online_tapnext) and the final track filter, so a
 # conservative margin around moving objects is used consistently.
-MASK_DILATE_PX = dataset_config.get_int("MASK_DILATE_PX", 10, env="MASK_DILATE_PX")
+MASK_DILATE_PX = 10
 
 CHECKPOINT = (
     Path(__file__).resolve().parents[1]
@@ -83,27 +78,21 @@ CHECKPOINT = (
     / "tapnextpp_ckpt.pt"
 )
 
-# Online tracking hyperparameters
-ONLINE_ADD_POINTS = True
-ONLINE_ADD_EVERY = 1  # add new points every N frames
-
+# Online tracking hyperparameters (new points are added at every frame)
 ONLINE_RESAMPLE_GRID = dataset_config.get_int(
-    "ONLINE_RESAMPLE_GRID", 60, env="ONLINE_RESAMPLE_GRID"
+    "ONLINE_RESAMPLE_GRID", 60
 )  # random candidate density; candidates ~= grid^2
 ONLINE_RESAMPLE_MARGIN = 1
 ONLINE_RESAMPLE_RADIUS = dataset_config.get_float(
-    "ONLINE_RESAMPLE_RADIUS", 4.0, env="ONLINE_RESAMPLE_RADIUS"
+    "ONLINE_RESAMPLE_RADIUS", 4.0
 )
-ONLINE_USE_CERTAINTY = True
 ONLINE_CERTAINTY_RADIUS = 8
 ONLINE_CERTAINTY_THRESHOLD = dataset_config.get_float(
-    "ONLINE_CERTAINTY_THRESHOLD", 0.8, env="ONLINE_CERTAINTY_THRESHOLD"
+    "ONLINE_CERTAINTY_THRESHOLD", 0.8
 )
-ONLINE_QUERY_DOWNSAMPLE_THRESHOLD = None
 ONLINE_MAX_POINTS = 20000
-ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO = 0.5
-ONLINE_FP16 = dataset_config.get_bool("ONLINE_FP16", True, env="ONLINE_FP16")  # TAPNext under fp16 autocast
-DEBUG = dataset_config.get_bool("DEBUG", False, env="DEBUG")  # also write tracks_debug.npz and the viz videos
+ONLINE_FP16 = dataset_config.get_bool("ONLINE_FP16", True)  # TAPNext under fp16 autocast
+DEBUG = dataset_config.get_bool("DEBUG", False)  # also write tracks_debug.npz and the viz videos
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 install_script_logger("static_tracking", OUT_DIR)
@@ -151,12 +140,11 @@ def _make_uncovered_query_points_at_frame(
     margin=8,
     radius=10.0,
     prev_added_xy: np.ndarray | None = None,
-    swap_xy_for_query=False,
 ):
     """Create random query points in regions not covered at a single frame.
 
     `grid` is used as a density knob: number of random candidates is grid^2.
-        Returns [1, Q, 3] with (t, x, y) or (t, y, x).
+        Returns [1, Q, 3] with (t, y, x), TAPNext's query order.
 
         A candidate is selected if it is farther than `radius` from:
             1) visible tracked points at the current frame, and
@@ -196,9 +184,7 @@ def _make_uncovered_query_points_at_frame(
     t_arr = np.full(np.sum(mask_uncovered), float(t), dtype=np.float64)
     x = cand[mask_uncovered, 0]
     y = cand[mask_uncovered, 1]
-    if swap_xy_for_query:
-        return np.stack([t_arr, y, x], axis=1)[None, ...]
-    return np.stack([t_arr, x, y], axis=1)[None, ...]
+    return np.stack([t_arr, y, x], axis=1)[None, ...]
 
 
 def _compute_flow_error_by_transition(
@@ -345,55 +331,6 @@ def _expand_state_for_new_queries(state, n_add: int):
     return state
 
 
-def _subset_state_for_queries(state, keep_idx: np.ndarray, prefix_tokens: int = 0):
-    """Keep only the selected query tokens in the TAPNext recurrent state.
-
-    TAPNext caches include both image tokens and query tokens along dim-0.
-    The first `prefix_tokens` entries correspond to image tokens and must be preserved.
-    """
-    if state is None:
-        return state
-
-    keep_idx = np.asarray(keep_idx, dtype=np.int64).reshape(-1)
-    prefix_tokens = int(max(0, prefix_tokens))
-    keep_idx_t = torch.as_tensor(keep_idx, dtype=torch.long)
-
-    if getattr(state, "query_points", None) is not None:
-        state.query_points = state.query_points[:, keep_idx_t.to(state.query_points.device), :]
-
-    if getattr(state, "hidden_state", None) is None:
-        return state
-
-    reduced = []
-    for cache in state.hidden_state:
-        if cache is None:
-            reduced.append(cache)
-            continue
-
-        rg_device_idx = keep_idx_t.to(cache.rg_lru_state.device)
-        cv_device_idx = keep_idx_t.to(cache.conv1d_state.device)
-
-        if prefix_tokens > 0:
-            rg_prefix = cache.rg_lru_state[:prefix_tokens]
-            cv_prefix = cache.conv1d_state[:prefix_tokens]
-            rg_queries = cache.rg_lru_state[prefix_tokens:].index_select(0, rg_device_idx)
-            cv_queries = cache.conv1d_state[prefix_tokens:].index_select(0, cv_device_idx)
-            rg = torch.cat([rg_prefix, rg_queries], dim=0)
-            cv = torch.cat([cv_prefix, cv_queries], dim=0)
-        else:
-            rg = cache.rg_lru_state.index_select(0, rg_device_idx)
-            cv = cache.conv1d_state.index_select(0, cv_device_idx)
-
-        if hasattr(cache, "_replace"):
-            cache_new = cache._replace(rg_lru_state=rg, conv1d_state=cv)
-        else:
-            cache_new = type(cache)(rg_lru_state=rg, conv1d_state=cv)
-        reduced.append(cache_new)
-
-    state.hidden_state = reduced
-    return state
-
-
 @torch.no_grad()
 def track_online_tapnext(
     video_256: torch.Tensor,
@@ -401,36 +338,20 @@ def track_online_tapnext(
     device: torch.device,
     checkpoint: str,
     *,
-    add_points: bool = True,
-    add_every: int = 1,
     resample_grid: int = 20,
     resample_margin: int = 8,
     resample_radius: float = 10.0,
-    swap_xy_for_query: bool = False,
-    use_certainty: bool = True,
     certainty_radius: int = 8,
     certainty_threshold: float = 0.5,
     exclude_masks_256: np.ndarray | None = None,
     max_points: int = 6000,
-    downsample_threshold: int | None = None,
-    downsample_target_ratio: float = 0.5,
     fp16: bool = False,
 ):
-    """Online tracking with per-frame query augmentation."""
-    if checkpoint.endswith(".npz"):
-        model = TAPNext(image_size=(256, 256)).to(device).eval()
-        model = restore_model_from_jax_checkpoint(model, checkpoint)
-    else:
-        model = TAPNext(image_size=(256, 256))
-        ckpt = torch.load(checkpoint, map_location='cpu')
-        model.load_state_dict({k.replace('tapnext.', ''): v for k, v in ckpt['state_dict'].items()})
-        model.cuda()
-
-    num_video_tokens = (
-        (model.image_size[0] // model.patch_size[0])
-        * (model.image_size[1] // model.patch_size[1])
-        * int(video_256.shape[0])
-    )
+    """Online tracking with per-frame query augmentation (new queries in TAPNext's (t, y, x) order)."""
+    model = TAPNext(image_size=(256, 256))
+    ckpt = torch.load(checkpoint, map_location='cpu')
+    model.load_state_dict({k.replace('tapnext.', ''): v for k, v in ckpt['state_dict'].items()})
+    model.cuda()
 
     T = int(video_256.shape[1])
     all_query_points_abs = query_points_np.astype(np.float64, copy=True)
@@ -449,46 +370,13 @@ def track_online_tapnext(
     last_tracks_xy = None
     last_occ_np = None
     last_active_query_indices = None
-
-    if downsample_threshold is not None and downsample_threshold <= 0:
-        downsample_threshold = None
+    add_points = True   # until max_points is reached
 
     for t in tqdm(range(T), desc="Online tracking"):
         query_grew = False
         n_add_effective = 0
 
-        if downsample_threshold is not None:
-            q_active = int(active_query_indices.shape[0])
-            if q_active > downsample_threshold:
-                q_keep = max(1, int(np.floor(downsample_target_ratio * downsample_threshold)))
-                q_keep = min(q_keep, q_active)
-                keep_local = np.sort(np.random.choice(q_active, size=q_keep, replace=False))
-                keep_local_t = torch.as_tensor(keep_local, dtype=torch.long, device=query_points_t.device)
-                active_query_indices = active_query_indices[keep_local]
-                query_points_t = query_points_t.index_select(1, keep_local_t)
-                state = _subset_state_for_queries(
-                    state,
-                    keep_local,
-                    prefix_tokens=num_video_tokens,
-                )
-                if last_tracks_xy is not None:
-                    last_tracks_xy = last_tracks_xy[keep_local]
-                if last_occ_np is not None:
-                    last_occ_np = last_occ_np[keep_local]
-                if last_active_query_indices is not None:
-                    last_active_query_indices = active_query_indices.copy()
-                prev_added_xy_history.clear()
-                print(
-                    f"[online] timestep {t}: downsampled active queries "
-                    f"from {q_active} to {q_keep}"
-                )
-
-        if (
-            add_points
-            and (t + 1 < T)
-            and (add_every > 0)
-            and (t % add_every == 0)
-        ):
+        if add_points and (t + 1 < T):
             prev_added_xy = None
             if len(prev_added_xy_history) > 0:
                 prev_added_xy = np.concatenate(list(prev_added_xy_history), axis=0)
@@ -515,7 +403,6 @@ def track_online_tapnext(
                 margin=resample_margin,
                 radius=resample_radius,
                 prev_added_xy=prev_added_xy,
-                swap_xy_for_query=swap_xy_for_query,
             )
             if new_q is not None:
                 new_q[:, :, 0] = float(t + 1)
@@ -523,7 +410,7 @@ def track_online_tapnext(
                     new_q = _exclude_queries_in_dynamic_masks(
                         new_q,
                         exclude_masks_256,
-                        swap_xy_for_query=swap_xy_for_query,
+                        swap_xy_for_query=True,
                     )
                 if new_q is not None and new_q.shape[1] > 0:
                     q_total = int(all_query_points_abs.shape[1])
@@ -545,8 +432,7 @@ def track_online_tapnext(
 
                         # Update rolling history with actually added points in XY convention.
                         add_xy = add_np[0, :, 1:3]
-                        if swap_xy_for_query:
-                            add_xy = add_xy[:, [1, 0]]
+                        add_xy = add_xy[:, [1, 0]]
                         prev_added_xy_history.append(add_xy.astype(np.float64, copy=False))
 
                         query_grew = n_add > 0
@@ -574,13 +460,9 @@ def track_online_tapnext(
         tracks_yx = pred_tracks.detach().cpu()
         tracks_xy = torch.flip(tracks_yx, dims=[-1]).numpy()[0, 0]  # [Q,2]
 
-        if use_certainty:
-            certainty = tracker_certainty(tracks_yx, track_logits.detach().cpu(), certainty_radius)
-            pred_visible = (torch.sigmoid(visible_logits.detach().cpu()) * certainty) > certainty_threshold
-            occluded = ~(pred_visible.squeeze(0).squeeze(0))
-        else:
-            pred_visible = (visible_logits.detach().cpu() > 0)
-            occluded = ~(pred_visible.squeeze(0).squeeze(0))
+        certainty = tracker_certainty(tracks_yx, track_logits.detach().cpu(), certainty_radius)
+        pred_visible = (torch.sigmoid(visible_logits.detach().cpu()) * certainty) > certainty_threshold
+        occluded = ~(pred_visible.squeeze(0).squeeze(0))
 
         occluded_np = occluded.detach().cpu().numpy().astype(bool).reshape(-1)
 
@@ -612,7 +494,7 @@ H, W = video_np.shape[2], video_np.shape[3]
 
 if TRACKER == "tapnext":
     query_exclude_masks_256 = None
-    if MASK_DIR is not None and Path(MASK_DIR).exists():
+    if Path(MASK_DIR).exists():
         try:
             _masks_256 = load_dynamic_masks(
                 str(MASK_DIR),
@@ -622,26 +504,20 @@ if TRACKER == "tapnext":
                 target_size=(256, 256),
             )
             _masks_256 = np.asarray(_masks_256)
-            if _masks_256.ndim == 4 and _masks_256.shape[-1] == 1:
-                _masks_256 = _masks_256[..., 0]
-            if _masks_256.ndim == 4 and _masks_256.shape[0] == 1:
-                _masks_256 = _masks_256[0]
-            if _masks_256.ndim == 3:
-                query_exclude_masks_256 = _masks_256
-                # Dilate the query-exclusion masks (in 256-grid space) to match the
-                # margin used by the final track filter (MASK_DILATE_PX is defined at
-                # native resolution, so scale it to the 256 grid).
-                if MASK_DILATE_PX > 0:
-                    dilate_px_256 = max(1, int(round(MASK_DILATE_PX * 256.0 / float(max(H, W)))))
-                    query_exclude_masks_256 = dilate_dynamic_masks(query_exclude_masks_256, dilate_px_256)
-                    print(
-                        f"Dilated query-exclusion masks by {dilate_px_256}px @256 "
-                        f"(= {MASK_DILATE_PX}px @native {W}x{H})"
-                    )
+            query_exclude_masks_256 = _masks_256
+            # Dilate the query-exclusion masks (in 256-grid space) to match the
+            # margin used by the final track filter (MASK_DILATE_PX is defined at
+            # native resolution, so scale it to the 256 grid).
+            dilate_px_256 = max(1, int(round(MASK_DILATE_PX * 256.0 / float(max(H, W)))))
+            query_exclude_masks_256 = dilate_dynamic_masks(query_exclude_masks_256, dilate_px_256)
+            print(
+                f"Dilated query-exclusion masks by {dilate_px_256}px @256 "
+                f"(= {MASK_DILATE_PX}px @native {W}x{H})"
+            )
         except Exception as e:
             print(f"Failed to load 256 dynamic masks for query exclusion: {e}")
 
-    query_np = make_grid_query_points(GRID, t_max=0, step=1)
+    query_np = make_grid_query_points(GRID)
     if query_exclude_masks_256 is not None:
         query_np = _exclude_queries_in_dynamic_masks(
             query_np,
@@ -656,19 +532,13 @@ if TRACKER == "tapnext":
         query_np,
         device=device,
         checkpoint=str(CHECKPOINT),
-        add_points=ONLINE_ADD_POINTS,
-        add_every=ONLINE_ADD_EVERY,
         resample_grid=ONLINE_RESAMPLE_GRID,
         resample_margin=ONLINE_RESAMPLE_MARGIN,
         resample_radius=ONLINE_RESAMPLE_RADIUS,
-        swap_xy_for_query=RESAMPLE_SWAP_XY,
-        use_certainty=ONLINE_USE_CERTAINTY,
         certainty_radius=ONLINE_CERTAINTY_RADIUS,
         certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
         exclude_masks_256=query_exclude_masks_256,
         max_points=ONLINE_MAX_POINTS,
-        downsample_threshold=ONLINE_QUERY_DOWNSAMPLE_THRESHOLD,
-        downsample_target_ratio=ONLINE_QUERY_DOWNSAMPLE_TARGET_RATIO,
         fp16=ONLINE_FP16,
     )
 
@@ -681,12 +551,10 @@ else:
     from utils.track_alltracker import grid_seeds, track_keyframes
 
     exclude = np.zeros((video_np.shape[1], H, W), bool)                 # moving objects, dilated as below
-    if MASK_DIR is not None and Path(MASK_DIR).exists():
+    if Path(MASK_DIR).exists():
         exclude = np.asarray(dilate_dynamic_masks(load_dynamic_masks(
             str(MASK_DIR), MASK_PATTERN, t_expected=video_np.shape[1], mask_mode="dynamic_positive", target_size=(W, H),
         ), MASK_DILATE_PX))
-        if exclude.ndim == 4:
-            exclude = exclude[..., 0]
     side = float(max(H, W))
     radius = ONLINE_RESAMPLE_RADIUS * side / 256.0
     print(f"AllTracker: {GRID}x{GRID} seeds at frame 0, re-seeding every {AT_KEYFRAME} frames (and below {AT_MIN_VISIBLE} "
@@ -704,7 +572,7 @@ else:
 
 # Optional dynamic masks
 dynamic_masks = None
-if MASK_DIR is not None and Path(MASK_DIR).exists():
+if Path(MASK_DIR).exists():
     try:
         # Load masks at the original image size so we can apply them directly on tracks_xy
         dynamic_masks = load_dynamic_masks(
@@ -718,7 +586,7 @@ if MASK_DIR is not None and Path(MASK_DIR).exists():
         occluded_before = occluded.copy()
 
         # tracks_xy is in original image coordinates (W,H).
-        occluded = apply_dynamic_mask_filter(tracks_xy, occluded, dynamic_masks, static_only=True)
+        occluded = apply_dynamic_mask_filter(tracks_xy, occluded, dynamic_masks)
         print(
             f"Applied masks from {MASK_DIR}. Newly hidden: "
             f"{int(np.sum(occluded) - np.sum(occluded_before))}"
@@ -734,7 +602,7 @@ if DEBUG:
         occluded=occluded,
         video_dir=str(IMAGE_DIR),
         grid=int(GRID),
-        mask_dir=str(MASK_DIR) if MASK_DIR is not None else "",
+        mask_dir=str(MASK_DIR),
     )
 
 move_delete_deleted_obs_mask = None
@@ -791,15 +659,14 @@ if MOVE_DELETE_ENABLED:
 
 occluded_viz = occluded.copy()
 
-depth_source = DEPTH_SOURCE.strip().lower()
-output_tapnet_src_path = OUT_DIR / f"output_tapnet_{depth_source}.npz"
+output_tapnet_src_path = OUT_DIR / "output_tapnet_da3.npz"
 np.savez_compressed(
     output_tapnet_src_path,
     tracks_xy=tracks_xy.astype(np.float32),
     occluded=occluded.astype(bool),
     video_dir=str(IMAGE_DIR),
-    mask_dir=str(MASK_DIR) if MASK_DIR is not None else "",
-    depth_source=np.array(depth_source),
+    mask_dir=str(MASK_DIR),
+    depth_source=np.array("da3"),
     grid=np.array(int(GRID), dtype=np.int64),
 )
 print(f"Wrote 2D tracking output for solver: {output_tapnet_src_path}")
@@ -811,8 +678,6 @@ if DEBUG:
         occluded_viz,
         str(OUT_DIR / "viz_debug.mp4"),
         fps=10,
-        tail_length=12,
-        tail_thickness=1,
         dynamic_masks=dynamic_masks,
         highlight_radius=5,
         highlight_obs_mask_3=move_delete_deleted_obs_mask,

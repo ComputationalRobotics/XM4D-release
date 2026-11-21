@@ -3,23 +3,15 @@ import numpy as np
 import time
 
 from concurrent.futures import ThreadPoolExecutor
-from scipy.linalg import solve_triangular,ldl,solve
-from scipy.sparse import coo_matrix, csr_matrix, dia_matrix, lil_matrix, bmat, hstack, vstack, diags, kron
+from scipy.linalg import solve
+from scipy.sparse import coo_matrix, csr_matrix, bmat, hstack, diags
 
 from utils.io import save_matrix_to_bin
-
-# optional GPU (cupy) backend, disabled (USE_GPU = 0)
-# import cupy
-# import cupyx
 
 from scipy.io import savemat
 
 
 def process_observation(i, ind_l, landmark, weight):
-        # # Get indices for observation i
-        # ind_l = ind.indices
-        # ind = ind.data - 1  # Adjust for zero-based indexing
-
         # Compute weighted landmarks
         v = landmark * weight[:, None]
 
@@ -53,61 +45,20 @@ def _sparse_times_dense(S, D, transpose_result=False):
     return out
 
 
-def process_observation_old(i, observation_index, landmarks, weight):
-        # Get indices for observation i
-        ind = observation_index.getrow(i)
-        ind_l = ind.indices
-        ind = ind.data - 1  # Adjust for zero-based indexing
-
-        # Compute weighted landmarks
-        v = landmarks[ind, :] * weight[ind][:, None]
-
-        # Calculate blocks to update the sparse matrices
-        Q1_block = v.T @ landmarks[ind, :]
-        V1_block = v.sum(axis=0)[:, None]
-        V2_block = v.T
-
-        # Return the computed blocks with their indices
-        return i, Q1_block, V1_block, V2_block, ind_l
-
 # create matrix function; returns Abar (written to Abar.bin, and Q.mat, only with debug)
-def create_matrix(weight, edges, landmarks, output_path, penalty_t = 0.0, debug = False):
-    DEFINE_DENSE = 1
-    USE_GPU = 0
-
-    if USE_GPU:
-        print("TODO: add cupy and deal with CUDA OUT OF MEMORY")
-        # mempool = cupy.get_default_memory_pool()
-        # pinned_mempool = cupy.get_default_pinned_memory_pool()
-
+def create_matrix(weight, edges, landmarks, output_path, debug = False):
     weight = np.asarray(weight, dtype=np.float64)
     landmarks = np.asarray(landmarks, dtype=np.float64)
 
     M = int(edges[:,1].max())
     N = int(edges[:,0].max())
     print(f"M: {M}, N: {N}")
-    n_observation = edges.shape[0]
     V3 = coo_matrix((weight, (edges[:, 0]-1, edges[:, 1]-1)), shape=(N, M)).tocsr()
 
     observation_index = coo_matrix((np.arange(1, len(edges) + 1), (edges[:, 0]-1, edges[:, 1]-1)), shape=(N, M)).tocsr()
 
     Q2 = diags(V3.sum(axis=1).A1, format='csr')
     Q3 = diags(V3.sum(axis=0).A1, format='csr')  
-
-    # regularize the distance between camera translation
-    diag = np.full(N, 2.0)
-    diag[0] = 1.0
-    diag[-1] = 1.0
-    off = np.full(N - 1, -1.0)
-
-    L = diags([off, diag, off], offsets=[-1, 0, 1], format="csr")
-    reg_t = penalty_t * L
-    Q2 += reg_t
-
-    # Initialize sparse matrices
-    Q1 = np.zeros((3 * N, 3 * N), dtype=np.float64)
-    V1 = np.zeros((3 * N, N), dtype=np.float64)
-    V2 = np.zeros((3 * N, M), dtype=np.float64)
 
     # Prepare lists to collect the indices and data for assembly
     Q1_data = []
@@ -202,12 +153,7 @@ def create_matrix(weight, edges, landmarks, output_path, penalty_t = 0.0, debug 
     print("Finished constructing VT matrices")
     
     # if SLAM this is sparse matrix
-    if(DEFINE_DENSE == 1):
-        VT = VT.todense()
-        # R = np.linalg.cholesky(A, upper = True)
-        # RT = R.T
-    else:
-        print("Todo")
+    VT = VT.todense()
 
     # sparse-sparse
     RHS_left = Qtpbar.transpose() @ Vtp.transpose()
@@ -217,133 +163,63 @@ def create_matrix(weight, edges, landmarks, output_path, penalty_t = 0.0, debug 
     RHS_A = RHS[:N-1, :]  # Rows 0 to N-2
     RHS_B = RHS[N-1:, :]
 
-    if(DEFINE_DENSE == 1):
-        RHS_A = RHS_A.todense()
-        RHS_B = RHS_B.todense()
-    else:
-        print("Todo")
+    RHS_A = RHS_A.todense()
+    RHS_B = RHS_B.todense()
 
     start_time_mul = time.perf_counter()
     
-    if USE_GPU:
-        print("TODO: add cupy and deal with CUDA OUT OF MEMORY")
-        # RHS_B = cupy.array(RHS_B)
-        # RHS_A = cupy.array(RHS_A)
+    # Convert inputs to NumPy and SciPy objects
+    RHS_B = np.array(RHS_B, dtype=np.float64)
+    RHS_A = np.array(RHS_A, dtype=np.float64)
+    VT = np.array(VT, dtype=np.float64)
+    V3_bar_F = V3_bar_F.toarray().astype(np.float64)
+    inv_sqrt_Q3_diag_T = np.array(inv_sqrt_Q3_diag_T, dtype=np.float64)
+    a0 = csr_matrix(a0, dtype=np.float64)
+    
+    # Main computation loop
+    for i in range(2):
+        print(f"iteration {i}")
+        RHS_B = np.multiply(RHS_B, inv_sqrt_Q3_diag_T)
+        RHS_A = solve(VT, RHS_A + V3_bar_F @ RHS_B)
+        RHS_B += np.dot(V3_bar_F.T,RHS_A)
+        RHS_B = np.multiply(RHS_B, inv_sqrt_Q3_diag_T)
 
-        # VT = cupy.array(VT)
-        # V3_bar_F = cupyx.scipy.sparse.csr_matrix(V3_bar_F)
-        # inv_sqrt_Q3_diag_T = cupy.array(inv_sqrt_Q3_diag_T)
-        # a0 = cupyx.scipy.sparse.csr_matrix(a0)
+    # Initialize matrix A
+    A = np.zeros((N + M, 3 * N), dtype=np.float64)
 
-        # for i in range(2):
+    # Update A
+    np.negative(RHS_A[:, :-1], out=A[1:N, :])
+    np.negative(RHS_B[:, :-1], out=A[N:, :])
 
-        #     RHS_B = cupy.multiply(RHS_B, inv_sqrt_Q3_diag_T)
-        #     RHS_A = cupy.linalg.solve(VT, RHS_A + V3_bar_F @ RHS_B)
-        #     RHS_B += V3_bar_F.T @ RHS_A
-        #     RHS_B = cupy.multiply(RHS_B, inv_sqrt_Q3_diag_T)
-        # # DEBUG use
-        # # print(f"Used active GPU memory: {mempool.used_bytes()/ 1024**3:.2f} GB")            
-        # # free_mem, total_mem = cupy.cuda.Device(0).mem_info
+    v2 = np.hstack([RHS_A[:, -1], RHS_B[:, -1]])
 
-        # # print(f"Free GPU memory: {free_mem / 1024**3:.2f} GB")
-        # # print(f"Allocated GPU memory: {(total_mem - free_mem) / 1024**3:.2f} GB")
+    del RHS_A, RHS_B, VT
 
-        # A = cupy.zeros((N + M, 3 * N))
+    # Compute S
+    S = 1 + a0.T @ v2
+    
+    print("updating A")
 
-        # cupy._default_memory_pool.free_all_blocks()
+    if S == 0:
+        raise ValueError("S is 0")
 
-        # # DEBUG use
-        # # print(f"Used active GPU memory: {mempool.used_bytes()/ 1024**3:.2f} GB")             
-        # # free_mem, total_mem = cupy.cuda.Device(0).mem_info
+    # all columns at once: A[1:, col] -= v2 * (a0.T @ A[1:, col]) / S (same per-entry arithmetic)
+    A[1:, :] -= v2[:, None] * (a0.T @ A[1:, :]) / S
 
-        # # print(f"Free GPU memory: {free_mem / 1024**3:.2f} GB")
-        # # print(f"Allocated GPU memory: {(total_mem - free_mem) / 1024**3:.2f} GB")
+    # Convert A to dense NumPy array
+    Abar = A[1:, :]
 
-        # cupy.negative(RHS_A[:, :-1], out=A[1:N, :])
-        # cupy.negative(RHS_B[:, :-1], out=A[N:, :])
+    # Save Abar to a binary file
+    if debug:
+        save_matrix_to_bin(output_path + "/Abar.bin", Abar)
+    Abar = np.asfortranarray(Abar)    # the layout Abar.bin was read back with
 
-        # v2 = cupy.hstack([RHS_A[:, -1], RHS_B[:, -1]])
+    middle = _sparse_times_dense(Qtp, A, transpose_result=True)    # A.T @ Qtp
 
-        # del RHS_A, RHS_B, VT
-        # cupy.get_default_memory_pool().free_all_blocks()
-        # cupy.get_default_pinned_memory_pool().free_all_blocks()
+    # Compute matrix C
+    C = np.dot(middle , A)
 
-
-        # S = 1 + a0.T @ v2
-        
-
-        # for col in range(3 * N):
-        #     A[1:, col] -= v2 * (a0.T @ A[1:, col]) / S 
-
-        # Abar = A.get()
-        # Abar = np.array(Abar)
-        # Abar = Abar[1:, :]
-        # save_matrix_to_bin(output_path + "/Abar.bin", Abar)
-        # rtoybar = np.kron(Abar, np.eye(3))
-
-        # Qtp = cupyx.scipy.sparse.csr_matrix(Qtp)
-        
-        # cupy.get_default_memory_pool().free_all_blocks()
-        # cupy.get_default_pinned_memory_pool().free_all_blocks()
-        
-        # C = A.T @ Qtp @ A 
-        # del Qtp
-        
-        # C = C.get()
-        # A = A.get()
-    else:
-        # Convert inputs to NumPy and SciPy objects
-        RHS_B = np.array(RHS_B, dtype=np.float64)
-        RHS_A = np.array(RHS_A, dtype=np.float64)
-        VT = np.array(VT, dtype=np.float64)
-        V3_bar_F = V3_bar_F.toarray().astype(np.float64)
-        inv_sqrt_Q3_diag_T = np.array(inv_sqrt_Q3_diag_T, dtype=np.float64)
-        a0 = csr_matrix(a0, dtype=np.float64)
-        
-        # Main computation loop
-        for i in range(2):
-            print(f"iteration {i}")
-            RHS_B = np.multiply(RHS_B, inv_sqrt_Q3_diag_T)
-            RHS_A = solve(VT, RHS_A + V3_bar_F @ RHS_B)
-            RHS_B += np.dot(V3_bar_F.T,RHS_A)
-            RHS_B = np.multiply(RHS_B, inv_sqrt_Q3_diag_T)
-
-        # Initialize matrix A
-        A = np.zeros((N + M, 3 * N), dtype=np.float64)
-
-        # Update A
-        np.negative(RHS_A[:, :-1], out=A[1:N, :])
-        np.negative(RHS_B[:, :-1], out=A[N:, :])
-
-        v2 = np.hstack([RHS_A[:, -1], RHS_B[:, -1]])
-
-        del RHS_A, RHS_B, VT
-
-        # Compute S
-        S = 1 + a0.T @ v2
-        
-        print("updating A")
-
-        if S == 0:
-            raise ValueError("S is 0")
-
-        # all columns at once: A[1:, col] -= v2 * (a0.T @ A[1:, col]) / S (same per-entry arithmetic)
-        A[1:, :] -= v2[:, None] * (a0.T @ A[1:, :]) / S
-
-        # Convert A to dense NumPy array
-        Abar = A[1:, :]
-
-        # Save Abar to a binary file
-        if debug:
-            save_matrix_to_bin(output_path + "/Abar.bin", Abar)
-        Abar = np.asfortranarray(Abar)    # the layout Abar.bin was read back with
-
-        middle = _sparse_times_dense(Qtp, A, transpose_result=True)    # A.T @ Qtp
-
-        # Compute matrix C
-        C = np.dot(middle , A)
-
-        del Qtp
+    del Qtp
 
     T = _sparse_times_dense(Vtp, A)    # Vtp @ A
     C += T + T.T
@@ -379,10 +255,5 @@ def create_matrix(weight, edges, landmarks, output_path, penalty_t = 0.0, debug 
             print(f"[WARN] Failed to save Q.mat: {exc}")
 
     del C, Vtp, Q1, A, V3, Q2, Q3, V3_bar, V3_bar_F, Q2_bar, a0, inv_sqrt_Q3_diag_T, sqrt_Q3_diag, sqrt_Q3, RHS, RHS_left, V1, V2, Qtpbar
-
-    if USE_GPU:
-        print("TODO: add cupy and deal with CUDA OUT OF MEMORY")
-        # cupy.get_default_memory_pool().free_all_blocks()
-        # cupy.get_default_pinned_memory_pool().free_all_blocks()
 
     return Abar

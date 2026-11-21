@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""Convert the NEW-pipeline EDG result (outputs/edg_test/edg_completed.npz, from complete_edg_table.py)
+"""Convert the EDG result of complete_edg_table.py (the arrays of outputs/edg_test/edg_completed.npz)
 into the results_all.npz format consumed by train_4dgs_edg.py + deps/gsplat simple_trainer:
 the dict-style `edg_reconstruct` / `edg_rotation` / `dynamics_points_reconstruct` are REPLACED
-from the completed solve; every other key (static_landmarks, prior_*, da3_frame_scale, ...) is carried
-over unchanged from a BASE results_all npz (the static/prior side of the pipeline is untouched).
-
-Run:  XM_DATASET_NAME=<scene> conda run -n XM python completed_to_results.py \
-          --completed <outputs>/edg_test/edg_completed.npz --base <outputs>/results_all.npz \
-          --out <outputs>/results_all_completed.npz
+from the completed solve; every other key (static_landmarks) is carried
+over unchanged from the BASE results_all npz.
 """
-import argparse
 from pathlib import Path
 
 import numpy as np
 
-import utils.definitions
 from utils.io import savez_compressed_fast
 
 
@@ -37,12 +31,11 @@ def hold_fill(arr):
     return out, True
 
 
-def convert(completed_path, base_path, out_path, comp=None):
-    """Write `out_path` = the completed EDG (from edg_completed.npz `completed_path`) in the results_all.npz
-    contract, carrying every non-EDG key over from `base_path` unchanged. Safe when out_path == base_path
-    (the base is fully materialised into memory before writing). `comp`: the completed arrays when the caller
-    still holds them (skips re-reading the file). Returns (n_edg_nodes, n_dyn_tracks)."""
-    comp = np.load(str(completed_path)) if comp is None else comp
+def convert(comp, base_path, out_path):
+    """Write `out_path` = the completed EDG `comp` (the arrays complete_edg_table.py writes to edg_completed.npz) in
+    the results_all.npz contract, carrying every non-EDG key over from `base_path` unchanged. Safe when
+    out_path == base_path (the base is fully materialised into memory before writing).
+    Returns (n_edg_nodes, n_dyn_tracks)."""
     node_ids = np.asarray(comp["node_ids"], dtype=int)
     er = np.asarray(comp["edg_reconstruct"], dtype=np.float64)        # [M,T,3]
     ero = np.asarray(comp["edg_rotation"], dtype=np.float64)          # [M,T,3,3]
@@ -73,8 +66,7 @@ def convert(completed_path, base_path, out_path, comp=None):
     out["edg_reconstruct"] = np.array(edg_tracks, dtype=object)
     out["edg_rotation"] = np.array(edg_rots, dtype=object)
     out["dynamics_points_reconstruct"] = np.array(dyn_tracks, dtype=object)
-    if "edg_edges" in comp:                                           # topology edges among the new nodes
-        out["edg_edges_union"] = np.asarray(comp["edg_edges"], dtype=np.int64).reshape(-1, 2)
+    out["edg_edges_union"] = np.asarray(comp["edg_edges"], dtype=np.int64).reshape(-1, 2)   # topology edges among the new nodes
 
     savez_compressed_fast(str(out_path), **out)
     T = er.shape[1]
@@ -83,17 +75,3 @@ def convert(completed_path, base_path, out_path, comp=None):
           f"{n_base_keys - 3} (from {Path(base_path).name})")
     return len(edg_tracks), len(dyn_tracks)
 
-
-def main():
-    out_dir = Path(utils.definitions.output_dir)
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--completed", default=str(out_dir / "edg_test" / "edg_completed.npz"))
-    ap.add_argument("--base", default=str(out_dir / "results_all.npz"),
-                    help="base results_all npz supplying the non-EDG keys (static/prior/da3)")
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
-    convert(args.completed, args.base, args.out)
-
-
-if __name__ == "__main__":
-    main()

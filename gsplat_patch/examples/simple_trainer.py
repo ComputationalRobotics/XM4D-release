@@ -7,7 +7,6 @@ import time
 import atexit
 import datetime as _dt
 from collections import defaultdict
-import imageio.v2 as imageio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -123,6 +122,20 @@ def _finish_simple_trainer_logger() -> None:
         _SIMPLE_TRAINER_LOGGER_FINISH()
 
 
+# Fixed settings of the 4D (EDG) additions.
+EDG_ARAP_GAPS = (1, 2, 4)     # ARAP temporal gaps: rigidity between all (t, t+gap) pairs
+EDG_ARAP_ETA_LEN = 0.1        # weight of the edge-length residual inside the ARAP loss
+EDG_WARMUP_STEPS = 2000       # EDG parameters frozen while Gaussian geometry/color stabilizes
+EDG_GRAD_CLIP = 0.1           # gradient-norm clip of the EDG parameters after the warm-up
+MAX_PRUNE_FRACTION = 0.02     # max fraction of Gaussians removed by one densification prune
+MAX_SCALE3D = 0.1             # cap on every Gaussian's max 3D scale (fraction of scene_scale), every step
+SCALE_RATIO_MAX = 100.0       # cap on the per-Gaussian anisotropy max(scale)/min(scale)
+MAX_GAUSSIANS = 1_000_000     # Gaussian budget: densification stops there, the init is trimmed to it
+SEG_START_ITER = 1000         # the dynamic/static mask losses start at this step ...
+SEG_EVERY = 4                 # ... and run every this many steps
+DEBUG_SAVE_EVERY = 800        # training GT|render (and depth) images to renders/ every this many steps
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -134,15 +147,9 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # EDG warp inputs (optional)
+    # EDG warp inputs: results_all.npz (step 5 prints its path) and the target frame
     edg_results: Optional[str] = None
     edg_target_frame: int = 0
-    # Rotate dynamic Gaussian orientations by the skinned EDG rotation each frame (keeps ellipsoids aligned
-    # with the rotating surface -> less rotation blur). Uses rotation the EDG already computes; near-free.
-    edg_warp_quats: bool = False
-    edg_knn: int = 6
-    edg_chunk: int = 4096
-    edg_apply_rgb: bool = True
     # Learning rates for trainable EDG parameters (0 = frozen)
     edg_tracks_lr: float = 1e-4
     edg_rots_lr: float = 1e-4
@@ -160,79 +167,23 @@ class Config:
     # NOTE: the ARAP/smooth losses are COUNT-NORMALIZED (means, not sums), so these lambdas are
     # stable across scene size.
     edg_arap_lambda: float = 5e-3
-    # ARAP temporal gaps (complete_edg_table L_arap form: rigidity between ALL (t, t+delta) pairs
-    # for delta in this list; rest-frame-free).
-    edg_arap_gaps: List[int] = field(default_factory=lambda: [1, 2, 4])
-    # Weight of the edge-LENGTH residual inside the ARAP loss (complete_edg_table eta_len).
-    edg_arap_eta_len: float = 0.1
     # EDG temporal smoothness weight (0 = disabled).
     # Penalises large changes in node positions / rotations between consecutive frames.
     edg_smooth_lambda: float = 1e-1
     # Keep optimized skinning attachments close to EDG-precomputed values.
     edg_skinning_reg_lambda: float = 1e-2
-    # OBSERVATION ANCHORS (training-time analogues of complete_edg_table's L_init / L_obs):
-    #   edg_obs_lambda -- EDG observation loss: keep the LEARNED node tables (edg_tracks/edg_rots) near
-    #                     their solved-table init (which complete_edg_table fit to the 3D track
-    #                     observations), so photometric finetuning cannot drift the skeleton to overfit
-    #                     training views. Positions whitened by the node-cloud scale, rotations by 0.1rad.
-    #   dyn_obs_lambda -- 3D observation loss: keep the WARPED dynamic-Gaussian positions (per frame)
-    #                     near their init-warp positions (init EDG + init skinning + init offsets --
-    #                     transitively anchored to the 3D observations). Random subsample per step.
-    edg_obs_lambda: float = 0.0
-    dyn_obs_lambda: float = 0.0
-    dyn_obs_samples: int = 16384
-    # Delay EDG parameter updates while Gaussian geometry/color stabilizes.
-    edg_warmup_steps: int = 2000
-    # Clip EDG gradients and skinning offset drift for stability.
-    edg_grad_clip: float = 0.1
+    # Clip skinning offset drift for stability.
     edg_rel_delta_max: float = 0.1
-    # Let the DYNAMIC (EDG-warped) Gaussians grow as densely as possible:
-    #   edg_dyn_no_prune  -- never prune dynamic Gaussians (opacity/too-big prune skips them), so once
-    #                        created they persist and the dynamic cloud accumulates.
-    #   edg_dyn_force_grow -- force every small dynamic Gaussian to duplicate (and large ones to split)
-    #                        at EACH refine step regardless of its 2D gradient, so the dynamic cloud
-    #                        densifies to the max_gaussians budget quickly. (Aggressive: can bloat count.)
-    edg_dyn_no_prune: bool = False
-    edg_dyn_force_grow: bool = False
-    # Depth-error pruning: remove Gaussians whose rendered depth disagrees with the DA3
-    # monocular depth (x da3_frame_scale) beyond a robust threshold. Cleans wrong-depth
-    # floaters that corrupt novel views. Uses DA3 depth (NOT GT) -> no train leakage.
-    depth_error_prune: bool = False
-    depth_error_prune_start_iter: int = 2000
-    depth_error_prune_every: int = 500
-    # Single bound on the max fraction of Gaussians removed in ONE prune call. Applies to
-    # BOTH the densification prune (opacity + too-big/prune-all-big, largest-scale-first)
-    # AND this depth-error prune. Lower it to prune less aggressively.
-    depth_error_prune_max_fraction: float = 0.02
-    depth_error_prune_std_ratio: float = 3.0
-    depth_error_prune_min_error: float = 0.5
-    depth_error_prune_min_candidates: int = 100
-    depth_error_prune_static_only: bool = False
-    eval_depth_min_depth: float = 1e-6
-    # Hard cap on every Gaussian's max 3D scale (as a fraction of scene_scale), enforced
-    # by clamping EVERY step for the whole run -- not just during the prune phase. Without
-    # this, large Gaussians accumulate after refine_stop_iter and corrupt novel-view depth.
-    # <=0 disables the cap.
-    max_scale3d: float = 0.1
-    # Custom eval: render all frames from first camera pose
-    custom_eval_first_frame: bool = False
-    # Lightweight evaluation: report only PSNR (+ depth L1) and skip the
+    # Lightweight evaluation: report only PSNR and skip the
     # expensive SSIM/LPIPS metrics and per-frame depth-map PNG dumps.
     eval_lite: bool = True
-    # Render an interpolated trajectory video at eval steps.
-    eval_render_traj: bool = False
 
     # Dynamic segmentation loss (optional, requires EDG dynamic points).
     # Within the per-frame dynamic mask, penalize color contributed by *static*
     # Gaussians so that dynamic pixels are rendered from dynamic Gaussians only.
+    # Runs from step SEG_START_ITER every SEG_EVERY steps; the per-frame binary dynamic masks
+    # (white=dynamic) are the "masks" folder found by searching upwards from data_dir.
     seg_dyn_lambda: float = 0.1
-    # Delay the loss so Gaussian geometry/color can stabilize first.
-    seg_dyn_start_iter: int = 1000
-    # Apply the loss every N steps to amortize its extra render pass (1 = every step).
-    seg_dyn_every: int = 4
-    # Directory of per-frame binary dynamic masks (frame<idx>.png, white=dynamic).
-    # Auto-found by searching upwards from data_dir for a "masks" folder if None.
-    seg_dyn_mask_dir: Optional[str] = None
 
     # --- Dynamic-appearance & mask options ---
     # Render dynamic Gaussians as a single view-independent color: bypass the appearance
@@ -240,14 +191,11 @@ class Config:
     dyn_flat_color: bool = True
     # Penalize dynamic-Gaussian color contribution OUTSIDE the per-frame dynamic mask
     # (complement of seg_dyn_lambda, which penalizes static contribution inside the mask).
-    # Reuses seg_dyn_start_iter / seg_dyn_every / the dynamic mask dir.
+    # Same schedule and masks as seg_dyn_lambda.
     dyn_outside_lambda: float = 0.1  
     # Supervise the static region (outside the dynamic mask) with a STATIC-ONLY render
     # (dynamic Gaussians excluded) against GT, so static Gaussians alone explain the background.
     static_only_region_lambda: float = 0.1
-
-    debug_save_images = True
-    debug_save_every = 800
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -282,30 +230,17 @@ class Config:
     eval_steps: List[int] = field(default_factory=lambda: [3_000, 7_000, 15_000, 30_000, 50_000, 70_000, 100_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [3_000, 7_000, 15_000, 30_000, 50_000, 70_000, 100_000])
-    # Also write the last training checkpoint to stable final file names.
-    save_final_gaussians: bool = True
-    final_gaussians_name: str = "final_gaussians.pt"
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [3_000, 7_000, 15_000, 30_000, 50_000, 70_000, 100_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = True
-    # Cap expensive evaluation/preview renders. <=0 means render all available frames.
-    eval_max_frames: int = 0
-    custom_eval_max_frames: int = 0
-    traj_max_frames: int = 0
-    # Render validation/custom/trajectory previews at this image scale. 1.0 keeps full resolution.
-    render_scale: float = 1.0
 
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
-    # Density-based downsample of the SFM init point cloud: keep ~one averaged point per
-    # voxel of size (init_voxel_size * scene_scale), so already-dense regions are thinned
-    # while sparse regions are preserved. <=0 disables (keep all points). Ignored for random init.
-    init_voxel_size: float = 0.0
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
@@ -357,19 +292,6 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
-    # Hard constraints for per-Gaussian anisotropy ratio max(scale)/min(scale).
-    scale_ratio_min: float = 0.0
-    scale_ratio_max: float = 100.0
-    # One-time cleanup for isolated static initialization points before training.
-    static_outlier_prune: bool = False
-    static_outlier_k: int = 64
-    static_outlier_std_ratio: float = 1.8
-    static_outlier_min_points: int = 64
-    static_outlier_max_fraction: float = 0.5
-    # Gaussian budget (0 = no cap). Densification never grows past this, and if
-    # the SfM init exceeds it, the excess is trimmed once at startup by dropping
-    # the lowest-opacity *static* Gaussians (all dynamic Gaussians are kept).
-    max_gaussians: int = 1000_000
 
     # Enable camera optimization. (Default ON: helps novel-view registration on DyCheck.)
     pose_opt: bool = True
@@ -460,33 +382,6 @@ def _find_upwards(start: Path, rel_paths: List[str], max_depth: int = 4) -> Opti
     return None
 
 
-def _quat_to_rotmat_batch(q: torch.Tensor) -> torch.Tensor:
-    """(N,4) wxyz quaternions -> (N,3,3) rotation matrices (normalizes q)."""
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    N = q.shape[0]
-    R = torch.empty((N, 3, 3), device=q.device, dtype=q.dtype)
-    R[:, 0, 0] = 1 - 2 * (y * y + z * z); R[:, 0, 1] = 2 * (x * y - w * z); R[:, 0, 2] = 2 * (x * z + w * y)
-    R[:, 1, 0] = 2 * (x * y + w * z); R[:, 1, 1] = 1 - 2 * (x * x + z * z); R[:, 1, 2] = 2 * (y * z - w * x)
-    R[:, 2, 0] = 2 * (x * z - w * y); R[:, 2, 1] = 2 * (y * z + w * x); R[:, 2, 2] = 1 - 2 * (x * x + y * y)
-    return R
-
-
-def _rotmat_to_quat_batch(R: torch.Tensor) -> torch.Tensor:
-    """(N,3,3) rotation matrices -> (N,4) wxyz quaternions (batched, trace-stable)."""
-    m00, m11, m22 = R[:, 0, 0], R[:, 1, 1], R[:, 2, 2]
-    tr = m00 + m11 + m22
-    w = torch.sqrt(torch.clamp(1.0 + tr, min=1e-8)) * 0.5
-    x = torch.sqrt(torch.clamp(1.0 + m00 - m11 - m22, min=1e-8)) * 0.5
-    y = torch.sqrt(torch.clamp(1.0 - m00 + m11 - m22, min=1e-8)) * 0.5
-    z = torch.sqrt(torch.clamp(1.0 - m00 - m11 + m22, min=1e-8)) * 0.5
-    x = torch.copysign(x, R[:, 2, 1] - R[:, 1, 2])
-    y = torch.copysign(y, R[:, 0, 2] - R[:, 2, 0])
-    z = torch.copysign(z, R[:, 1, 0] - R[:, 0, 1])
-    q = torch.stack([w, x, y, z], dim=-1)
-    return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-
-
 class EDGWarp:
     def __init__(
         self,
@@ -494,35 +389,23 @@ class EDGWarp:
         data_dir: Path,
         results_npz: Path,
         target_frame: int,
-        knn: int,
-        chunk: int,
         device: torch.device,
     ) -> None:
         self.device = device
-        self.knn = int(knn)
-        self.chunk = int(chunk)
 
         results = np.load(str(results_npz), allow_pickle=True)
         edg_tracks_dict = results["edg_reconstruct"].item()
-        edg_rot_dict = results.get("edg_rotation", None)
+        edg_rot_dict = results["edg_rotation"]
         if not edg_tracks_dict:
             raise RuntimeError("EDG results are empty; cannot run 4D warp training.")
-        if edg_rot_dict is None:
-            raise RuntimeError("Missing edg_rotation in results_all.npz; regenerate EDG rotations.")
 
         edg_tracks, edg_gids = self._as_track_array(edg_tracks_dict)
         self.edg_gids = edg_gids
         self.T = edg_tracks.shape[1]
 
-        # Store edge pairs as index pairs into edg_gids (N_edges, 2). edg_edges_union may be saved either
-        # as a 0-d object array wrapping a set/list of (ga,gb) pairs (older EDG) or as a plain (N,2) int
-        # array (newer EDG); support both -- .item() on the latter raises "size 1 to a Python scalar".
+        # Store edge pairs as index pairs into edg_gids (N_edges, 2); edg_edges_union is an (N,2) int array.
         gid_to_idx = {int(g): i for i, g in enumerate(edg_gids.tolist())}
-        if "edg_edges_union" in results:
-            _eu = results["edg_edges_union"]
-            edges_union = _eu.item() if (_eu.dtype == object or _eu.ndim == 0) else _eu
-        else:
-            edges_union = set()
+        edges_union = results["edg_edges_union"]
         self.edge_pairs = np.array(
             [[gid_to_idx[int(ga)], gid_to_idx[int(gb)]] for ga, gb in edges_union
              if int(ga) in gid_to_idx and int(gb) in gid_to_idx],
@@ -532,10 +415,7 @@ class EDGWarp:
             raise ValueError(f"target_frame {target_frame} out of range [0, {self.T-1}]")
         self.target_frame = int(target_frame)
 
-        rt_path = self._find_xm_results(data_dir)
-        if rt_path is None:
-            raise FileNotFoundError(f"Missing result_XM.npz near {data_dir}")
-        rt = np.load(str(rt_path))
+        rt = np.load(str(self._find_xm_results(data_dir)))
         # The static solver may drop frames (checklandmarks / XM^2), so R/t are stored in
         # solved order (N<=self.T). Scatter them onto the full timeline via indices_all,
         # then fill any dropped frame from its nearest solved neighbor so the target-frame
@@ -545,17 +425,12 @@ class EDGWarp:
         _t_all = np.asarray(rt["t"], dtype=np.float64)
         R_raw = np.tile(np.eye(3), (self.T, 1, 1)).astype(np.float64)
         t_raw = np.full((self.T, 3), np.nan, dtype=np.float64)
-        if "indices_all" in rt.files:
-            _idx = np.asarray(rt["indices_all"]).astype(np.int64)
-            for _oi in range(min(self.T, _idx.shape[0])):
-                _j = int(_idx[_oi])
-                if 0 <= _j < _N:
-                    R_raw[_oi] = _R_all[:, 3 * _j : 3 * (_j + 1)]
-                    t_raw[_oi] = _t_all[:, _j]
-        else:
-            for _oi in range(min(self.T, _N)):
-                R_raw[_oi] = _R_all[:, 3 * _oi : 3 * (_oi + 1)]
-                t_raw[_oi] = _t_all[:, _oi]
+        _idx = np.asarray(rt["indices_all"]).astype(np.int64)
+        for _oi in range(min(self.T, _idx.shape[0])):
+            _j = int(_idx[_oi])
+            if 0 <= _j < _N:
+                R_raw[_oi] = _R_all[:, 3 * _j : 3 * (_j + 1)]
+                t_raw[_oi] = _t_all[:, _j]
         _finite = np.isfinite(t_raw).all(axis=1)
         if not _finite.all():
             _kept = np.where(_finite)[0]
@@ -572,9 +447,7 @@ class EDGWarp:
         w2t[:3, :3] = R.T
         w2t[:3, 3] = -R.T @ t
 
-        edg_rots, edg_rot_gids = self._as_rotation_array(edg_rot_dict.item())
-        if not np.array_equal(edg_gids, edg_rot_gids):
-            raise RuntimeError("Mismatch between edg_reconstruct and edg_rotation node ordering.")
+        edg_rots, _ = self._as_rotation_array(edg_rot_dict.item())   # same node ids as edg_reconstruct
 
         edg_tracks_target = self._apply_transform(edg_tracks.reshape(-1, 3), w2t)
         edg_tracks_target = edg_tracks_target.reshape(edg_tracks.shape)
@@ -588,7 +461,6 @@ class EDGWarp:
         # Frozen reference copies to measure how much the parameters have moved
         self.edg_tracks_init = torch.from_numpy(edg_tracks_target).to(device=device, dtype=torch.float32)
         self.edg_rots_init   = torch.from_numpy(edg_rots_target).to(device=device, dtype=torch.float32)
-        self.edg_target = self.edg_tracks[:, self.target_frame, :]
 
         self.dyn_indices = None
         self.dyn_knn_idx = None
@@ -667,10 +539,6 @@ class EDGWarp:
     def _find_xm_results(data_dir: Path) -> Optional[Path]:
         return _find_upwards(data_dir, ["result_XM.npz", "outputs/result_XM.npz"], max_depth=4)
 
-    @staticmethod
-    def find_results_npz(data_dir: Path) -> Optional[Path]:
-        return _find_upwards(data_dir, ["results_all.npz", "outputs/results_all.npz"], max_depth=4)
-
     def _filter_dynamic(self, n_pts: int):
         if self.dyn_indices is None or self.dyn_indices.numel() == 0:
             return None
@@ -725,28 +593,6 @@ class EDGWarp:
         xyz_out[dyn_indices] = dyn_xyz
         return xyz_out
 
-    def warp_quats(self, quats_target: torch.Tensor, frame_idx: int) -> torch.Tensor:
-        """Rotate each dynamic Gaussian's orientation by the EDG rotation its surface underwent from the
-        target frame to `frame_idx` (argmax-weight node's relative rotation R_m(t) R_m(target)^T applied to
-        the base quat). The position warp already moves the centers; this keeps the ellipsoid aligned with
-        the rotating surface so it need not inflate to cover all orientations (reduces rotation blur)."""
-        if frame_idx < 0 or frame_idx >= self.T:
-            return quats_target
-        filtered = self._filter_dynamic(int(quats_target.shape[0]))
-        if filtered is None:
-            return quats_target
-        dyn_indices, dyn_knn_idx, dyn_knn_w, _, _ = filtered
-        amax = torch.argmax(dyn_knn_w, dim=1)                                # (Nd,) dominant node col
-        node = dyn_knn_idx[torch.arange(dyn_knn_idx.shape[0], device=dyn_knn_idx.device), amax]
-        R_t = self.edg_rots[node, frame_idx]                                 # (Nd,3,3)
-        R_tg = self.edg_rots[node, self.target_frame]                        # (Nd,3,3)
-        R_rel = torch.matmul(R_t, R_tg.transpose(1, 2))                      # target -> t surface rotation
-        base_R = _quat_to_rotmat_batch(quats_target[dyn_indices])           # (Nd,3,3)
-        new_q = _rotmat_to_quat_batch(torch.matmul(R_rel, base_R))          # (Nd,4) wxyz
-        q_out = quats_target.clone()
-        q_out[dyn_indices] = new_q.to(q_out.dtype)
-        return q_out
-
     def edg_scene_arrays(self, frame_idx: int):
         """Return (node_points, line_points) as float32 numpy arrays for viser.
 
@@ -766,19 +612,17 @@ class EDGWarp:
         self,
         arap_lambda: float = 1e-3,
         smooth_lambda: float = 1e-3,
-        arap_gaps: Tuple[int, ...] = (1, 2, 4),
-        arap_eta_len: float = 0.1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute ARAP and temporal-smoothness losses over all frames.
 
         ARAP (rest-frame-free, MULTI time-step pairs -- ALIGNED with complete_edg_table.py's L_arap):
-            For each graph edge (i, j) and each temporal gap delta in `arap_gaps`, compare the edge
+            For each graph edge (i, j) and each temporal gap delta in EDG_ARAP_GAPS, compare the edge
             between frames t and t+delta in node i's LOCAL frame, plus the edge LENGTH:
 
                 d(t)  = g[j,t] - g[i,t]
                 rc(t) = R[i,t]^T d(t) - R[i,t+delta]^T d(t+delta)      (local-coordinates residual)
                 rl(t) = ||d(t)|| - ||d(t+delta)||                       (length residual)
-                L_arap = arap_lambda * mean( ||rc||^2 + arap_eta_len * rl^2 )
+                L_arap = arap_lambda * mean( ||rc||^2 + EDG_ARAP_ETA_LEN * rl^2 )
 
             No fixed rest frame: rigidity is enforced between ALL (t, t+delta) pairs, so it does not
             pin the graph to any single frame. (complete_edg_table additionally sigma-whitens +
@@ -810,16 +654,15 @@ class EDGWarp:
 
             total = zero
             n_terms = 0
-            for gap in arap_gaps:
-                g_ = int(gap)
-                if g_ <= 0 or self.T <= g_:
+            for g_ in EDG_ARAP_GAPS:
+                if self.T <= g_:
                     continue
                 dt, dtd = d[:, : self.T - g_], d[:, g_:]           # [E, T-g, 3]
                 Rt, Rtd = R_i[:, : self.T - g_], R_i[:, g_:]       # [E, T-g, 3, 3]
                 rc = torch.einsum("etji,etj->eti", Rt, dt) \
                     - torch.einsum("etji,etj->eti", Rtd, dtd)      # R^T d difference (local coords)
                 rl = dt.norm(dim=-1) - dtd.norm(dim=-1)            # edge-length difference
-                total = total + (rc ** 2).sum() + float(arap_eta_len) * (rl ** 2).sum()
+                total = total + (rc ** 2).sum() + EDG_ARAP_ETA_LEN * (rl ** 2).sum()
                 n_terms += rc.numel() + rl.numel()
             arap_loss = arap_lambda * total / max(n_terms, 1)
         else:
@@ -841,58 +684,12 @@ class EDGWarp:
 
         return arap_loss, smooth_loss
 
-    def observation_anchor_loss(self, frame_idx: int, edg_obs_lambda: float,
-                                dyn_obs_lambda: float, n_sample: int = 16384):
-        """Training-time analogues of complete_edg_table's L_init / L_obs (both 0 when disabled).
-
-        edg_obs: whitened L2 pulling the LEARNED edg_tracks/edg_rots toward their solved-table init
-                 (positions / node-cloud scale, rotations Frobenius / 0.1).
-        dyn_obs: on a random subsample of dynamic Gaussians, the CURRENT warp at `frame_idx` (current
-                 EDG + current skinning weights/offsets) must stay near the INIT warp (init EDG + init
-                 skinning) -- the init warp is what complete_edg_table fit to the 3D observations."""
-        device = self.edg_tracks.device
-        zero = torch.zeros([], device=device)
-        edg_obs = dyn_obs = zero
-        if not hasattr(self, "_obs_scale"):
-            with torch.no_grad():
-                pts = self.edg_tracks_init.reshape(-1, 3)
-                med = pts.median(dim=0).values
-                self._obs_scale = float((pts - med).norm(dim=-1).median().clamp_min(1e-6))
-        if edg_obs_lambda > 0.0:
-            dp = (self.edg_tracks - self.edg_tracks_init).pow(2).sum(-1) / (self._obs_scale ** 2)
-            dr = (self.edg_rots - self.edg_rots_init).pow(2).sum((-1, -2)) / (0.1 ** 2)
-            edg_obs = edg_obs_lambda * (dp.mean() + dr.mean())
-        if (dyn_obs_lambda > 0.0 and self.dyn_knn_idx is not None
-                and 0 <= frame_idx < self.T and self.dyn_knn_idx.numel() > 0):
-            Nd = self.dyn_knn_idx.shape[0]
-            idx = torch.randint(0, Nd, (min(int(n_sample), Nd),), device=device)
-            knn = self.dyn_knn_idx[idx]                                       # (S,K)
-            if self.optimize_skinning_weights and self.dyn_knn_logits is not None:
-                w = torch.softmax(self.dyn_knn_logits[idx], dim=1)
-            else:
-                w = self.dyn_knn_w[idx]
-            rel = self.dyn_rel[idx]
-            cur = ((self.edg_tracks[:, frame_idx][knn]
-                    + torch.matmul(self.edg_rots[:, frame_idx][knn], rel.unsqueeze(-1)).squeeze(-1))
-                   * w.unsqueeze(-1)).sum(1)                                  # (S,3)
-            with torch.no_grad():
-                w0 = torch.softmax(self.dyn_knn_logits_init[idx], dim=1) \
-                    if self.dyn_knn_logits_init is not None else w
-                rel0 = self.dyn_rel_init[idx] if self.dyn_rel_init is not None else rel
-                ref = ((self.edg_tracks_init[:, frame_idx][knn]
-                        + torch.matmul(self.edg_rots_init[:, frame_idx][knn],
-                                       rel0.unsqueeze(-1)).squeeze(-1))
-                       * w0.unsqueeze(-1)).sum(1)
-            dyn_obs = dyn_obs_lambda * ((cur - ref).pow(2).sum(-1) / (self._obs_scale ** 2)).mean()
-        return edg_obs, dyn_obs
-
     def create_optimizer(
         self,
         tracks_lr: float,
         rots_lr: float,
         weights_lr: float,
         rel_lr: float,
-        batch_size: int = 1,
     ) -> Optional[torch.optim.Optimizer]:
         """Return an Adam optimizer for trainable EDG deformation and skinning tensors."""
         param_groups = []
@@ -1213,36 +1010,10 @@ class EDGWarp:
         self._rewrap_skinning_params_after_topology_change()
 
 
-def _voxel_downsample_points(points: np.ndarray, rgbs: np.ndarray, voxel_size: float):
-    """Density-based downsample: keep one averaged point per occupied voxel.
-
-    Already-dense regions collapse to a single representative point per voxel while
-    sparse regions are preserved (each occupied voxel contributes exactly one point).
-    Returns (points, rgbs) with the same dtypes. voxel_size<=0 or empty input is a no-op.
-    """
-    points = np.asarray(points)
-    rgbs = np.asarray(rgbs)
-    if voxel_size is None or voxel_size <= 0.0 or points.shape[0] == 0:
-        return points, rgbs
-    keys = np.floor(points / float(voxel_size)).astype(np.int64)
-    _, inverse = np.unique(keys, axis=0, return_inverse=True)
-    inverse = inverse.reshape(-1)
-    n_vox = int(inverse.max()) + 1
-    counts = np.bincount(inverse, minlength=n_vox).astype(np.float64)
-    pts = np.zeros((n_vox, 3), dtype=np.float64)
-    rgb = np.zeros((n_vox, 3), dtype=np.float64)
-    np.add.at(pts, inverse, points.astype(np.float64))
-    np.add.at(rgb, inverse, rgbs.astype(np.float64))
-    pts /= counts[:, None]
-    rgb /= counts[:, None]
-    return pts.astype(points.dtype), rgb.astype(rgbs.dtype)
-
-
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
-    init_voxel_size: float = 0.0,
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
@@ -1265,12 +1036,6 @@ def create_splats_with_optimizers(
     if init_type == "sfm":
         pts_np = np.asarray(parser.points, dtype=np.float32)
         rgb_np = np.asarray(parser.points_rgb, dtype=np.float32) / 255.0
-        if init_voxel_size and init_voxel_size > 0.0:
-            v = float(init_voxel_size) * float(scene_scale)
-            n0 = pts_np.shape[0]
-            pts_np, rgb_np = _voxel_downsample_points(pts_np, rgb_np, v)
-            print(f"[init] density voxel-downsample sfm points: {n0} -> {pts_np.shape[0]} "
-                  f"(voxel={v:.5g} = {init_voxel_size}*scene_scale={scene_scale:.4g})")
         points = torch.from_numpy(np.ascontiguousarray(pts_np)).float()
         rgbs = torch.from_numpy(np.ascontiguousarray(rgb_np)).float()
     elif init_type == "random":
@@ -1357,30 +1122,11 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
     def __init__(
         self,
         edg_warp: Optional["EDGWarp"] = None,
-        max_prune_fraction: Optional[float] = None,
-        max_gaussians: int = 0,
-        edg_dyn_no_prune: bool = False,
-        edg_dyn_force_grow: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         # Set by Runner after EDGWarp is constructed; may be None.
         self.edg_warp: Optional["EDGWarp"] = edg_warp
-        self.max_prune_fraction = max_prune_fraction
-        self.max_gaussians = int(max_gaussians)
-        self.edg_dyn_no_prune = bool(edg_dyn_no_prune)
-        self.edg_dyn_force_grow = bool(edg_dyn_force_grow)
-
-    def _dyn_index_mask(self, n_total, device):
-        """Bool [n_total] mask, True where a Gaussian is a dynamic (EDG-warped) point."""
-        m = torch.zeros(n_total, dtype=torch.bool, device=device)
-        if (self.edg_warp is not None and self.edg_warp.dyn_indices is not None
-                and self.edg_warp.dyn_indices.numel() > 0):
-            di = self.edg_warp.dyn_indices
-            di = di[(di >= 0) & (di < n_total)]
-            if di.numel():
-                m[di] = True
-        return m
 
     @torch.no_grad()
     def _grow_gs(self, params, optimizers, state, step):
@@ -1388,17 +1134,9 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
         # Capture N before grow
         orig_N = int(params["means"].shape[0])
 
-        # Hard cap: stop densifying once the count reaches max_gaussians.
-        if self.max_gaussians > 0 and orig_N >= self.max_gaussians:
+        # Hard cap: stop densifying once the count reaches MAX_GAUSSIANS.
+        if orig_N >= MAX_GAUSSIANS:
             return 0, 0
-
-        # Force dynamic Gaussians to densify every refine step: boost their accumulated grad2d above the
-        # grow threshold in the SAME state the parent reads, so both our re-derived masks (for edg
-        # bookkeeping) and the parent's actual grow see the identical decision -> stays in sync.
-        if self.edg_dyn_force_grow:
-            dm = self._dyn_index_mask(orig_N, state["grad2d"].device)
-            if bool(dm.any()):
-                state["grad2d"][dm] = state["count"][dm].clamp_min(1) * (self.grow_grad2d * 2.0 + 1e-12)
 
         # --- replicate the duplicate decision logic from DefaultStrategy ---
         count  = state["count"]
@@ -1469,19 +1207,13 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
             else:
                 too_big_2d = None
             # Prune ALL too-big Gaussians (big Gaussians corrupt novel-view depth). The
-            # depth_error_prune_max_fraction cap + largest-3D-scale tie-break below bound
+            # MAX_PRUNE_FRACTION cap + largest-3D-scale tie-break below bound
             # how many are removed per step.
             is_prune = is_prune | is_too_big
         else:
             scales_max = torch.exp(params["scales"]).max(dim=-1).values
             too_big_3d = torch.zeros_like(is_prune)
             too_big_2d = None
-
-        # Never prune dynamic Gaussians -> the dynamic cloud accumulates as densely as possible.
-        if self.edg_dyn_no_prune:
-            dm = self._dyn_index_mask(is_prune.shape[0], is_prune.device)
-            if bool(dm.any()):
-                is_prune = is_prune & (~dm)
 
         n_prune_requested = int(is_prune.sum().item())
         if self.verbose:
@@ -1507,12 +1239,9 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
                     float(self.prune_scale2d),
                 )
             )
-        if self.max_prune_fraction is not None and self.max_prune_fraction >= 0.0:
-            n_total = int(params["means"].shape[0])
-            max_prune = int(np.floor(n_total * float(self.max_prune_fraction)))
-            max_prune = max(1, min(max_prune, n_total))
-        else:
-            max_prune = n_prune_requested
+        n_total = int(params["means"].shape[0])
+        max_prune = int(np.floor(n_total * MAX_PRUNE_FRACTION))
+        max_prune = max(1, min(max_prune, n_total))
 
         if n_prune_requested > max_prune:
             prune_idx = torch.where(is_prune)[0]
@@ -1525,7 +1254,7 @@ class EDGAwareDefaultStrategy(DefaultStrategy):
             if self.verbose:
                 print(
                     f"Step {step}: prune guard capped {n_prune_requested} requested "
-                    f"prunes to {max_prune} ({100.0 * float(self.max_prune_fraction):.1f}%)."
+                    f"prunes to {max_prune} ({100.0 * MAX_PRUNE_FRACTION:.1f}%)."
                 )
             is_prune = capped_mask
 
@@ -1545,7 +1274,7 @@ class Runner:
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
-        set_random_seed(int(os.environ.get("GSPLAT_SEED", "42")) + local_rank)
+        set_random_seed(42 + local_rank)
 
         self.cfg = cfg
         self.world_rank = world_rank
@@ -1586,49 +1315,21 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         # Per-frame metric scale from the XM solver; aligns monocular training
         # depths to metric scale (replaces per-image median scale fitting).
-        self.da3_frame_scale = None
         xm_path = _find_upwards(
             Path(cfg.data_dir), ["result_XM.npz", "outputs/result_XM.npz"], max_depth=4
         )
-        if xm_path is not None:
-            try:
-                _rt_scale = np.load(str(xm_path))
-                _raw_scale = np.asarray(_rt_scale["da3_frame_scale"], dtype=np.float64).reshape(-1)
-                # The solver may drop frames (N<=T); da3_frame_scale is per-solved-frame but
-                # indexed here by image_id (0..T-1). Scatter it onto the full timeline via
-                # indices_all (dropped frames -> 1.0) so indexing stays aligned/in-bounds.
-                if "indices_all" in _rt_scale.files:
-                    _idx_map = np.asarray(_rt_scale["indices_all"]).astype(np.int64)
-                    scale_arr = np.ones((_idx_map.shape[0],), dtype=np.float64)
-                    for _oi in range(_idx_map.shape[0]):
-                        _j = int(_idx_map[_oi])
-                        if 0 <= _j < _raw_scale.shape[0]:
-                            scale_arr[_oi] = _raw_scale[_j]
-                else:
-                    scale_arr = _raw_scale
-                self.da3_frame_scale = torch.from_numpy(scale_arr).to(device=self.device)
-            except Exception as exc:
-                print(f"[depth] Could not load da3_frame_scale from {xm_path}: {exc}")
-        else:
-            print(f"[depth] result_XM.npz not found near {cfg.data_dir}; depth loss uses scale=1.0")
-
-        # Full DA3 monocular depth maps [T,H,W] for depth-error pruning (kept on CPU,
-        # moved per-frame). This is the SAME monocular depth used for the depth loss /
-        # lift -> pruning against it is legitimate (no GT leakage).
-        self.da3_depth_maps = None
-        dm_path = _find_upwards(
-            Path(cfg.data_dir),
-            ["depth_anything_3/depth_maps.npy", "outputs/depth_anything_3/depth_maps.npy",
-             "depth/depth_maps.npy", "outputs/depth/depth_maps.npy"],
-            max_depth=4,
-        )
-        if dm_path is not None:
-            try:
-                dm = np.load(str(dm_path)).astype(np.float32)
-                self.da3_depth_maps = torch.from_numpy(dm)  # CPU [T,H,W]
-                print(f"[depth] Loaded DA3 depth maps {tuple(dm.shape)} for depth-error prune from {dm_path}")
-            except Exception as exc:
-                print(f"[depth] Could not load DA3 depth maps: {exc}")
+        _rt_scale = np.load(str(xm_path))
+        _raw_scale = np.asarray(_rt_scale["da3_frame_scale"], dtype=np.float64).reshape(-1)
+        # The solver may drop frames (N<=T); da3_frame_scale is per-solved-frame but
+        # indexed here by image_id (0..T-1). Scatter it onto the full timeline via
+        # indices_all (dropped frames -> 1.0) so indexing stays aligned/in-bounds.
+        _idx_map = np.asarray(_rt_scale["indices_all"]).astype(np.int64)
+        scale_arr = np.ones((_idx_map.shape[0],), dtype=np.float64)
+        for _oi in range(_idx_map.shape[0]):
+            _j = int(_idx_map[_oi])
+            if 0 <= _j < _raw_scale.shape[0]:
+                scale_arr[_oi] = _raw_scale[_j]
+        self.da3_frame_scale = torch.from_numpy(scale_arr).to(device=self.device)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -1657,7 +1358,6 @@ class Runner:
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
-            init_voxel_size=cfg.init_voxel_size,
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
@@ -1679,24 +1379,21 @@ class Runner:
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
-        # EDG warp (optional)
+        # EDG warp
         self.edg_warp = None
         self._edg_warned_multi_frame = False
-        results_npz = Path(cfg.edg_results) if cfg.edg_results else EDGWarp.find_results_npz(Path(cfg.data_dir))
-        if results_npz is not None:
-            try:
-                self.edg_warp = EDGWarp(
-                    data_dir=Path(cfg.data_dir),
-                    results_npz=results_npz,
-                    target_frame=cfg.edg_target_frame,
-                    knn=cfg.edg_knn,
-                    chunk=cfg.edg_chunk,
-                    device=torch.device(self.device),
-                )
-                print(f"[EDG] Warp enabled from {results_npz}")
-            except Exception as exc:
-                print(f"[EDG] Failed to initialize warp: {exc}")
-                self.edg_warp = None
+        results_npz = Path(cfg.edg_results)
+        try:
+            self.edg_warp = EDGWarp(
+                data_dir=Path(cfg.data_dir),
+                results_npz=results_npz,
+                target_frame=cfg.edg_target_frame,
+                device=torch.device(self.device),
+            )
+            print(f"[EDG] Warp enabled from {results_npz}")
+        except Exception as exc:
+            print(f"[EDG] Failed to initialize warp: {exc}")
+            self.edg_warp = None
 
         # Dynamic segmentation loss: resolve per-frame dynamic mask directory.
         self.seg_mask_dir: Optional[Path] = None
@@ -1707,11 +1404,7 @@ class Runner:
             and self.edg_warp.dyn_indices is not None
             and self.edg_warp.dyn_indices.numel() > 0
         ):
-            md = (
-                Path(cfg.seg_dyn_mask_dir)
-                if cfg.seg_dyn_mask_dir
-                else _find_upwards(Path(cfg.data_dir), ["masks"], max_depth=4)
-            )
+            md = _find_upwards(Path(cfg.data_dir), ["masks"], max_depth=4)
             if md is not None and md.is_dir():
                 self.seg_mask_dir = md
                 # Sorted-by-index fallback list (same convention as utils/track_tapnet.py's
@@ -1736,7 +1429,6 @@ class Runner:
                 rots_lr=cfg.edg_rots_lr,
                 weights_lr=cfg.edg_weights_lr,
                 rel_lr=cfg.edg_rel_lr,
-                batch_size=cfg.batch_size,
             )
             if edg_opt is not None:
                 self.edg_optimizers = [edg_opt]
@@ -1750,7 +1442,7 @@ class Runner:
             else:
                 print("[EDG] Both EDG LRs are 0; edg_tracks/edg_rots frozen.")
 
-        if self.edg_warp is not None and cfg.edg_apply_rgb:
+        if self.edg_warp is not None:
             filtered = self.edg_warp._filter_dynamic(int(self.splats["means"].shape[0]))
             if filtered is not None:
                 dyn_indices, _, _, _, dyn_rgb = filtered
@@ -1770,10 +1462,6 @@ class Runner:
             base = cfg.strategy
             edg_strategy = EDGAwareDefaultStrategy(
                 edg_warp=self.edg_warp,
-                max_prune_fraction=cfg.depth_error_prune_max_fraction,
-                max_gaussians=cfg.max_gaussians,
-                edg_dyn_no_prune=cfg.edg_dyn_no_prune,
-                edg_dyn_force_grow=cfg.edg_dyn_force_grow,
                 # Copy every field from the base DefaultStrategy
                 prune_opa=base.prune_opa,
                 grow_grad2d=base.grow_grad2d,
@@ -1807,7 +1495,6 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        self._prune_static_outlier_gaussians()
         self._trim_to_gaussian_budget()
 
         # Compression Strategy
@@ -2028,14 +1715,14 @@ class Runner:
 
     @torch.no_grad()
     def _trim_to_gaussian_budget(self) -> None:
-        """One-time startup trim so the SfM init respects cfg.max_gaussians.
+        """One-time startup trim so the SfM init respects MAX_GAUSSIANS.
 
         Drops the lowest-opacity *static* Gaussians (all dynamic Gaussians kept).
         Densification later refills up to the same budget as points get pruned.
         """
-        cap = int(self.cfg.max_gaussians)
+        cap = MAX_GAUSSIANS
         n_total = int(self.splats["means"].shape[0])
-        if cap <= 0 or n_total <= cap:
+        if n_total <= cap:
             return
         n_remove = n_total - cap
         static_mask = self._static_gaussian_mask(n_total, self.device)  # True = static
@@ -2132,69 +1819,6 @@ class Runner:
         )
         return render_colors[..., 0], render_alphas[..., 0]  # each [C, H, W]
 
-    @torch.no_grad()
-    def _prune_static_outlier_gaussians(self) -> int:
-        cfg = self.cfg
-        if not bool(cfg.static_outlier_prune):
-            return 0
-        points = self.splats["means"].detach()
-        n_total = int(points.shape[0])
-        if n_total < int(cfg.static_outlier_min_points):
-            return 0
-
-        static_mask = self._static_gaussian_mask(n_total, points.device)
-        static_idx = torch.where(static_mask)[0]
-        if static_idx.numel() < int(cfg.static_outlier_min_points):
-            return 0
-
-        static_pts = points[static_idx].detach().cpu().numpy().astype(np.float64)
-        finite = np.isfinite(static_pts).all(axis=1)
-        outlier_local = ~finite
-        finite_pts = static_pts[finite]
-        if finite_pts.shape[0] >= int(cfg.static_outlier_min_points):
-            try:
-                from scipy.spatial import cKDTree
-
-                k_eff = min(int(max(1, cfg.static_outlier_k)), finite_pts.shape[0] - 1)
-                if k_eff > 0:
-                    tree = cKDTree(finite_pts)
-                    try:
-                        dists, _ = tree.query(finite_pts, k=k_eff + 1, workers=-1)
-                    except TypeError:
-                        dists, _ = tree.query(finite_pts, k=k_eff + 1)
-                    mean_knn = np.mean(dists[:, 1:], axis=1)
-                    median = float(np.median(mean_knn))
-                    mad = float(np.median(np.abs(mean_knn - median)))
-                    robust_sigma = 1.4826 * mad
-                    if not np.isfinite(robust_sigma) or robust_sigma <= 1e-12:
-                        robust_sigma = float(np.std(mean_knn))
-                    if np.isfinite(robust_sigma) and robust_sigma > 1e-12:
-                        threshold = median + float(cfg.static_outlier_std_ratio) * robust_sigma
-                        finite_outlier = mean_knn > threshold
-                        outlier_local[np.where(finite)[0]] = finite_outlier
-            except Exception as exc:
-                print(f"[static-outlier] scipy density filter unavailable ({exc}); only removing non-finite points.")
-
-        if not np.any(outlier_local):
-            print(f"[static-outlier] no isolated static Gaussians found among {int(static_idx.numel())} static points.")
-            return 0
-
-        outlier_idx = static_idx[torch.from_numpy(outlier_local).to(device=points.device)]
-        max_fraction = float(cfg.static_outlier_max_fraction)
-        if max_fraction >= 0.0:
-            max_remove = int(np.floor(n_total * max_fraction))
-            if outlier_idx.numel() > max_remove:
-                outlier_idx = outlier_idx[:max_remove]
-        remove_mask = torch.zeros((n_total,), dtype=torch.bool, device=points.device)
-        remove_mask[outlier_idx] = True
-        return self._remove_gaussians(
-            remove_mask,
-            reason=(
-                f"static density k={int(cfg.static_outlier_k)} "
-                f"std_ratio={float(cfg.static_outlier_std_ratio):g}"
-            ),
-        )
-
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
 
@@ -2210,112 +1834,6 @@ class Runner:
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
 
-    @torch.no_grad()
-    def _prune_depth_error_gaussians(self, image_ids, camtoworlds, Ks, width, height, step) -> int:
-        """Prune Gaussians whose rendered depth disagrees with the DA3 monocular depth
-        (x da3_frame_scale) beyond a robust per-frame threshold. DA3 depth is the same
-        monocular supervision used by the depth loss / lift, so this is NOT GT leakage."""
-        cfg = self.cfg
-        if not bool(cfg.depth_error_prune) or not bool(cfg.depth_loss):
-            return 0
-        if step < int(cfg.depth_error_prune_start_iter):
-            return 0
-        every = int(cfg.depth_error_prune_every)
-        if every <= 0 or step % every != 0:
-            return 0
-        if self.da3_depth_maps is None:
-            return 0
-        n_total = int(self.splats["means"].shape[0])
-        max_remove = int(np.floor(n_total * max(0.0, float(cfg.depth_error_prune_max_fraction))))
-        if n_total <= 0 or max_remove <= 0:
-            return 0
-
-        means = self._edg_override_means(image_ids)
-        if means is None:
-            means = self.splats["means"]
-        means = means.detach()
-        candidate_mask = torch.ones((n_total,), dtype=torch.bool, device=means.device)
-        if bool(cfg.depth_error_prune_static_only):
-            candidate_mask &= self._static_gaussian_mask(n_total, means.device)
-
-        T = int(self.da3_depth_maps.shape[0])
-        eps = 1e-6
-        camtoworlds = camtoworlds.detach()
-        Ks = Ks.detach()
-        all_idx, all_err, used_frames = [], [], []
-        for b in range(int(camtoworlds.shape[0])):
-            f = int(image_ids[b].item())
-            if f < 0 or f >= T:
-                continue
-            scale = float(self.da3_frame_scale[f]) if self.da3_frame_scale is not None else 1.0
-            gt = self.da3_depth_maps[f].to(device=means.device, dtype=means.dtype) * scale
-            if gt.shape != (int(height), int(width)):
-                gt = torch.nn.functional.interpolate(
-                    gt[None, None], size=(int(height), int(width)), mode="bilinear", align_corners=False
-                )[0, 0]
-            w2c = torch.linalg.inv(camtoworlds[b])
-            R, t = w2c[:3, :3], w2c[:3, 3]
-            pts = means @ R.T + t.reshape(1, 3)
-            z = pts[:, 2]
-            K = Ks[b]
-            x = K[0, 0] * (pts[:, 0] / z.clamp_min(eps)) + K[0, 2]
-            y = K[1, 1] * (pts[:, 1] / z.clamp_min(eps)) + K[1, 2]
-            xi, yi = torch.round(x).long(), torch.round(y).long()
-            in_view = (
-                candidate_mask & torch.isfinite(z) & (z > float(cfg.eval_depth_min_depth))
-                & (xi >= 0) & (xi < int(width)) & (yi >= 0) & (yi < int(height))
-            )
-            if not bool(in_view.any()):
-                continue
-            idx = torch.where(in_view)[0]
-            g = gt[yi[idx], xi[idx]]
-            valid = torch.isfinite(g) & (g > float(cfg.eval_depth_min_depth))
-            idx, g = idx[valid], g[valid]
-            if idx.numel() < int(cfg.depth_error_prune_min_candidates):
-                continue
-            pred = z[idx]
-            normalizer = torch.median(g).clamp_min(eps)
-            err = torch.abs(pred - g) / normalizer
-            finite = err[torch.isfinite(err)]
-            if finite.numel() < int(cfg.depth_error_prune_min_candidates):
-                continue
-            median = torch.median(finite)
-            mad = torch.median(torch.abs(finite - median))
-            sigma = 1.4826 * mad
-            if not bool(torch.isfinite(sigma)) or float(sigma) <= 1e-12:
-                sigma = finite.std()
-            thr = torch.maximum(
-                median + float(cfg.depth_error_prune_std_ratio) * sigma,
-                torch.tensor(float(cfg.depth_error_prune_min_error), device=means.device, dtype=means.dtype),
-            )
-            bad = torch.isfinite(err) & (err > thr)
-            if bool(bad.any()):
-                all_idx.append(idx[bad])
-                all_err.append(err[bad])
-                used_frames.append(f)
-
-        if not all_idx:
-            return 0
-        prune_idx = torch.cat(all_idx)
-        prune_err = torch.cat(all_err)
-        order = torch.argsort(prune_err, descending=True)
-        seen, selected = set(), []
-        for local in order.tolist():
-            i = int(prune_idx[local].item())
-            if i in seen:
-                continue
-            seen.add(i)
-            selected.append(i)
-            if len(selected) >= max_remove:
-                break
-        if not selected:
-            return 0
-        mask = torch.zeros((n_total,), dtype=torch.bool, device=means.device)
-        mask[torch.tensor(selected, dtype=torch.long, device=means.device)] = True
-        return self._remove_gaussians(
-            mask, reason=f"depth-error(DA3) step={step} frames={used_frames} n={len(selected)}"
-        )
-
     def _edg_override_means(self, frame_idcs: Optional[Tensor]) -> Optional[Tensor]:
         if self.edg_warp is None or frame_idcs is None:
             return None
@@ -2329,14 +1847,6 @@ class Runner:
                 self._edg_warned_multi_frame = True
         return self.edg_warp.warp(self.splats["means"], frame_idx)
 
-    def _edg_override_quats(self, frame_idcs: Optional[Tensor]) -> Optional[Tensor]:
-        if self.edg_warp is None or frame_idcs is None or not self.cfg.edg_warp_quats:
-            return None
-        frame_ids = frame_idcs.detach().flatten()
-        if frame_ids.numel() == 0:
-            return None
-        return self.edg_warp.warp_quats(self.splats["quats"], int(frame_ids[0].item()))
-
     def _edg_overlay_visible(self) -> bool:
         return bool(
             getattr(self, "_edg_show_checkbox", None) is None
@@ -2345,18 +1855,8 @@ class Runner:
 
     @torch.no_grad()
     def _apply_hard_constraints(self) -> None:
-        """Apply hard parameter constraints for training stability."""
-        if "scales" not in self.splats:
-            return
-
-        rmin = float(max(self.cfg.scale_ratio_min, 1e-6))
-        rmax = float(max(self.cfg.scale_ratio_max, rmin))
-        # ratio = max/min is always >= 1; effective cap is max(rmax, 1).
-        ratio_cap = max(rmax, 1.0)
-
-        log_cap = float(math.log(ratio_cap))
-        if log_cap <= 0.0:
-            return
+        """Cap the per-Gaussian anisotropy max(scale)/min(scale) at SCALE_RATIO_MAX (training stability)."""
+        log_cap = float(math.log(SCALE_RATIO_MAX))
 
         s = self.splats["scales"]  # log-scales [N, 3]
         smin = torch.min(s, dim=1, keepdim=True).values
@@ -2383,14 +1883,13 @@ class Runner:
         camera_idcs: Optional[Tensor] = None,
         exposure: Optional[Tensor] = None,
         override_means: Optional[Tensor] = None,
-        override_quats: Optional[Tensor] = None,
         gaussian_subset: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = override_means if override_means is not None else self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = override_quats if override_quats is not None else self.splats["quats"]  # [N, 4]
+        quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
@@ -2507,49 +2006,6 @@ class Runner:
 
         return render_colors, render_alphas, info
 
-    def _scaled_render_inputs(
-        self,
-        Ks: Tensor,
-        width: int,
-        height: int,
-        scale: float,
-        pixels: Optional[Tensor] = None,
-        masks: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, int, int, Optional[Tensor], Optional[Tensor]]:
-        """Downscale render-only inputs for faster previews/evaluation."""
-        scale = float(scale)
-        if scale <= 0.0:
-            raise ValueError(f"render_scale must be > 0, got {scale}")
-        if abs(scale - 1.0) <= 1e-8:
-            return Ks, int(width), int(height), pixels, masks
-
-        new_width = max(1, int(round(int(width) * scale)))
-        new_height = max(1, int(round(int(height) * scale)))
-        sx = float(new_width) / float(max(int(width), 1))
-        sy = float(new_height) / float(max(int(height), 1))
-
-        Ks_scaled = Ks.clone()
-        Ks_scaled[..., 0, :] *= sx
-        Ks_scaled[..., 1, :] *= sy
-
-        pixels_scaled = pixels
-        if pixels is not None:
-            pixels_scaled = F.interpolate(
-                pixels.permute(0, 3, 1, 2),
-                size=(new_height, new_width),
-                mode="area",
-            ).permute(0, 2, 3, 1)
-
-        masks_scaled = masks
-        if masks is not None:
-            masks_scaled = F.interpolate(
-                masks[:, None].float(),
-                size=(new_height, new_width),
-                mode="nearest",
-            )[:, 0].bool()
-
-        return Ks_scaled, new_width, new_height, pixels_scaled, masks_scaled
-
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -2653,7 +2109,6 @@ class Runner:
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            camera_idx = data["camera_idx"].to(device)
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             exposure = (
@@ -2675,7 +2130,6 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             override_means = self._edg_override_means(image_ids)
-            override_quats = self._edg_override_quats(image_ids)
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -2693,7 +2147,6 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
                 override_means=override_means,
-                override_quats=override_quats,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -2705,12 +2158,7 @@ class Runner:
                 colors = colors + bkgd * (1.0 - alphas)
 
             # save image for debugging (GT + render)
-            if (
-                cfg.debug_save_images
-                and world_rank == 0
-                and cfg.debug_save_every > 0
-                and step % cfg.debug_save_every == 0
-            ):
+            if world_rank == 0 and step % DEBUG_SAVE_EVERY == 0:
                 try:
                     # pixels and colors are [1, H, W, 3]
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
@@ -2718,22 +2166,21 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     out_path = f"{self.render_dir}/train_step{step:04d}_rank{self.world_rank}.png"
                     imageio.imwrite(out_path, (canvas * 255).astype(np.uint8))
-                    if depths is not None:
-                        valid_depth = torch.isfinite(depths) & (depths > 0.0)
-                        if bool(valid_depth.any()):
-                            vals = depths[valid_depth]
-                            near = torch.quantile(vals, 0.02)
-                            far = torch.quantile(vals, 0.98)
-                            depth_norm = (depths - near) / (far - near + 1e-10)
-                            depth_norm = torch.clamp(depth_norm, 0.0, 1.0)
-                            depth_norm = torch.where(valid_depth, depth_norm, torch.zeros_like(depth_norm))
-                        else:
-                            depth_norm = torch.zeros_like(depths)
-                        depth_rgb = depth_norm.repeat(1, 1, 1, 3)
-                        depth_canvas = torch.cat([colors, depth_rgb], dim=2).detach().cpu().numpy()
-                        depth_canvas = depth_canvas.reshape(-1, *depth_canvas.shape[2:])
-                        depth_out_path = f"{self.render_dir}/train_step{step:04d}_rank{self.world_rank}_depth.png"
-                        imageio.imwrite(depth_out_path, (depth_canvas * 255).astype(np.uint8))
+                    valid_depth = torch.isfinite(depths) & (depths > 0.0)
+                    if bool(valid_depth.any()):
+                        vals = depths[valid_depth]
+                        near = torch.quantile(vals, 0.02)
+                        far = torch.quantile(vals, 0.98)
+                        depth_norm = (depths - near) / (far - near + 1e-10)
+                        depth_norm = torch.clamp(depth_norm, 0.0, 1.0)
+                        depth_norm = torch.where(valid_depth, depth_norm, torch.zeros_like(depth_norm))
+                    else:
+                        depth_norm = torch.zeros_like(depths)
+                    depth_rgb = depth_norm.repeat(1, 1, 1, 3)
+                    depth_canvas = torch.cat([colors, depth_rgb], dim=2).detach().cpu().numpy()
+                    depth_canvas = depth_canvas.reshape(-1, *depth_canvas.shape[2:])
+                    depth_out_path = f"{self.render_dir}/train_step{step:04d}_rank{self.world_rank}_depth.png"
+                    imageio.imwrite(depth_out_path, (depth_canvas * 255).astype(np.uint8))
                 except Exception:
                     # don't fail training for debug saving errors
                     import traceback
@@ -2768,13 +2215,9 @@ class Runner:
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # align monocular GT depth to metric scale using the solver's
+                # align the step-1 depth (the depth-loss target) to metric scale using the solver's
                 # per-frame scale, then normalized-L1 against the render.
-                scale_t = (
-                    float(self.da3_frame_scale[frame_index])
-                    if self.da3_frame_scale is not None
-                    else 1.0
-                )
+                scale_t = float(self.da3_frame_scale[frame_index])
                 gt_metric = depths_gt * scale_t
                 valid = (
                     torch.isfinite(depths)
@@ -2815,20 +2258,11 @@ class Runner:
                 edg_arap_t, edg_smooth_t = self.edg_warp.edg_regularization_loss(
                     arap_lambda=cfg.edg_arap_lambda,
                     smooth_lambda=cfg.edg_smooth_lambda,
-                    arap_gaps=tuple(cfg.edg_arap_gaps),
-                    arap_eta_len=cfg.edg_arap_eta_len,
                 )
                 loss = loss + edg_arap_t + edg_smooth_t
             if self.edg_warp is not None and cfg.edg_skinning_reg_lambda > 0.0:
                 edg_skinning_reg_t = self.edg_warp.skinning_regularization_loss(cfg.edg_skinning_reg_lambda)
                 loss = loss + edg_skinning_reg_t
-            # Observation anchors (complete_edg_table L_init/L_obs analogues): keep the learned EDG and
-            # the warped dynamic positions near the observation-fitted solve (see Config docstrings).
-            if self.edg_warp is not None and (cfg.edg_obs_lambda > 0.0 or cfg.dyn_obs_lambda > 0.0):
-                _fi = int(image_ids.flatten()[0].item())
-                edg_obs_t, dyn_obs_t = self.edg_warp.observation_anchor_loss(
-                    _fi, cfg.edg_obs_lambda, cfg.dyn_obs_lambda, cfg.dyn_obs_samples)
-                loss = loss + edg_obs_t + dyn_obs_t
 
             # Dynamic/static segmentation losses, all keyed off the per-frame dynamic mask.
             #   seg_dyn_lambda        -- penalize STATIC contribution INSIDE  the mask
@@ -2841,8 +2275,8 @@ class Runner:
             seg_active = (
                 self.seg_mask_dir is not None
                 and self.edg_warp is not None
-                and step >= cfg.seg_dyn_start_iter
-                and step % max(cfg.seg_dyn_every, 1) == 0
+                and step >= SEG_START_ITER
+                and step % SEG_EVERY == 0
             )
             want_static_weight = seg_active and (
                 cfg.seg_dyn_lambda > 0.0 or cfg.dyn_outside_lambda > 0.0
@@ -2950,7 +2384,7 @@ class Runner:
                     pbar.write(
                         f"[EDG-drift] step {step}: pos mean={edg_tracks_dist:.6f} max={edg_tracks_max:.6f} | "
                         f"rot(Frob) mean={edg_rots_dist:.6f} max={edg_rots_max:.6f}"
-                        + ("  (warmup: EDG frozen)" if step < cfg.edg_warmup_steps else "")
+                        + ("  (warmup: EDG frozen)" if step < EDG_WARMUP_STEPS else "")
                     )
                     if edg_skinning_reg_t is not None:
                         self.writer.add_scalar("train/edg_skinning_reg", edg_skinning_reg_t.item(), step)
@@ -2998,11 +2432,12 @@ class Runner:
                     data["edg_warp"] = self.edg_warp.state_dict()
                 ckpt_path = f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 torch.save(data, ckpt_path)
-                if step == max_steps - 1 and cfg.save_final_gaussians:
+                if step == max_steps - 1:
+                    # The last checkpoint also under stable final file names.
                     final_rank_path = f"{self.ckpt_dir}/final_rank{self.world_rank}.pt"
                     torch.save(data, final_rank_path)
                     if world_rank == 0:
-                        final_path = f"{cfg.result_dir}/{cfg.final_gaussians_name}"
+                        final_path = f"{cfg.result_dir}/final_gaussians.pt"
                         torch.save(data, final_path)
                         print(f"Final gaussians saved to {final_path}")
             if (
@@ -3066,7 +2501,7 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # Warm-up: freeze EDG while Gaussian geometry/color stabilizes.
-            if self.edg_warp is not None and step < cfg.edg_warmup_steps:
+            if self.edg_warp is not None and step < EDG_WARMUP_STEPS:
                 if self.edg_warp.edg_tracks.grad is not None:
                     self.edg_warp.edg_tracks.grad.zero_()
                 if self.edg_warp.edg_rots.grad is not None:
@@ -3075,10 +2510,10 @@ class Runner:
                     self.edg_warp.dyn_knn_logits.grad.zero_()
                 if self.edg_warp.dyn_rel is not None and self.edg_warp.dyn_rel.grad is not None:
                     self.edg_warp.dyn_rel.grad.zero_()
-            elif self.edg_warp is not None and cfg.edg_grad_clip > 0.0:
+            elif self.edg_warp is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.edg_warp.trainable_parameters(),
-                    max_norm=float(cfg.edg_grad_clip),
+                    max_norm=EDG_GRAD_CLIP,
                 )
 
             # optimize
@@ -3091,11 +2526,10 @@ class Runner:
             # Hard scale cap for the WHOLE run (log-scale space). The too-big prune only
             # fires before refine_stop_iter; this clamp runs every step so large Gaussians
             # never accumulate and corrupt novel-view depth.
-            if cfg.max_scale3d > 0.0:
-                with torch.no_grad():
-                    self.splats["scales"].clamp_(
-                        max=math.log(float(cfg.max_scale3d) * self.scene_scale)
-                    )
+            with torch.no_grad():
+                self.splats["scales"].clamp_(
+                    max=math.log(MAX_SCALE3D * self.scene_scale)
+                )
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -3137,17 +2571,9 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            # Depth-error prune (DA3-supervised): remove wrong-depth floaters that would
-            # corrupt novel views. Self-gates on cfg.depth_error_prune + schedule.
-            self._prune_depth_error_gaussians(image_ids, camtoworlds, Ks, width, height, step)
-
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                if cfg.eval_render_traj:
-                    self.render_traj(step)
-                if cfg.custom_eval_first_frame:
-                    self.eval_first_frame_pose(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -3185,32 +2611,16 @@ class Runner:
             print(f"[eval] Val set is empty (test_every={cfg.test_every}); skipping evaluation.")
             return
 
-        eval_limit = int(cfg.eval_max_frames)
-        if eval_limit > 0:
-            print(f"Running evaluation on at most {eval_limit} frame(s)...")
-        else:
-            print("Running evaluation...")
-        if float(cfg.render_scale) != 1.0:
-            print(f"[render] eval render_scale={float(cfg.render_scale):.3f}")
+        print("Running evaluation...")
         ellipse_time = 0
         eval_count = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
-            if eval_limit > 0 and eval_count >= eval_limit:
-                break
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
-            Ks, width, height, pixels, masks = self._scaled_render_inputs(
-                Ks=Ks,
-                width=width,
-                height=height,
-                scale=cfg.render_scale,
-                pixels=pixels,
-                masks=masks,
-            )
 
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
@@ -3293,9 +2703,6 @@ class Runner:
                     metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
 
         if world_rank == 0:
-            if eval_count == 0:
-                print("[eval] No frames rendered after applying eval_max_frames; skipping stats.")
-                return
             ellipse_time /= eval_count
 
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
@@ -3334,84 +2741,6 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def eval_target_frame_pose(self, step: int, target_frame: int):
-        """Render all frames using the target camera pose; save frames + video under test/."""
-        cfg = self.cfg
-        device = self.device
-
-        camtoworlds_all = self.parser.camtoworlds
-        if camtoworlds_all is None or len(camtoworlds_all) == 0:
-            print("[EDG] No camera poses available for custom eval.")
-            return
-        target_frame = int(np.clip(target_frame, 0, len(camtoworlds_all) - 1))
-
-        out_dir = Path(cfg.result_dir) / "test" / f"first_frame_eval_{step:04d}"
-        frames_dir = out_dir / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-
-        cam0 = torch.from_numpy(camtoworlds_all[target_frame]).float().to(device)
-        cam0 = cam0[None]
-        target_camera_id = self.parser.camera_ids[target_frame]
-        K = torch.from_numpy(self.parser.Ks_dict[target_camera_id]).float().to(device)
-        width, height = self.parser.imsize_dict[target_camera_id]
-        K_batched, width, height, _, _ = self._scaled_render_inputs(
-            Ks=K[None],
-            width=width,
-            height=height,
-            scale=cfg.render_scale,
-        )
-        K = K_batched[0]
-
-        video_path = out_dir / f"first_frame_eval_{step:04d}.mp4"
-        writer = None if cfg.disable_video else imageio.get_writer(str(video_path), fps=30)
-
-        num_frames = len(camtoworlds_all)
-        if int(cfg.custom_eval_max_frames) > 0:
-            num_frames = min(num_frames, int(cfg.custom_eval_max_frames))
-        if float(cfg.render_scale) != 1.0:
-            print(f"[render] custom eval render_scale={float(cfg.render_scale):.3f}")
-        for idx in tqdm.trange(num_frames, desc="Custom eval (first pose)"):
-            frame_idcs = torch.tensor([idx], device=device, dtype=torch.long)
-            camera_idx = target_frame
-            if hasattr(self.parser, "camera_indices"):
-                try:
-                    camera_idx = int(self.parser.camera_indices[idx])
-                except Exception:
-                    camera_idx = 0
-            camera_idcs = torch.tensor([camera_idx], device=device, dtype=torch.long)
-
-            override_means = self._edg_override_means(frame_idcs)
-
-            colors, _, _ = self.rasterize_splats(
-                camtoworlds=cam0,
-                Ks=K[None],
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB",
-                frame_idcs=frame_idcs,
-                camera_idcs=camera_idcs,
-                image_ids=frame_idcs,
-                override_means=override_means,
-            )
-            colors = torch.clamp(colors, 0.0, 1.0)
-            frame = (colors[0].detach().cpu().numpy() * 255).astype(np.uint8)
-            frame_path = frames_dir / f"frame_{idx:04d}.png"
-            imageio.imwrite(frame_path, frame)
-            if writer is not None:
-                writer.append_data(frame)
-
-        if writer is not None:
-            writer.close()
-        print(f"[EDG] Custom eval saved to {out_dir}")
-        
-    @torch.no_grad()
-    def eval_first_frame_pose(self, step: int):
-        return self.eval_target_frame_pose(step, self.edg_warp.target_frame if self.edg_warp is not None else 0)
-
-    @torch.no_grad()
     def render_traj(self, step: int):
         """Entry for trajectory rendering."""
         if self.cfg.disable_video:
@@ -3441,9 +2770,6 @@ class Runner:
                 f"Render trajectory type not supported: {cfg.render_traj_path}"
             )
 
-        if int(cfg.traj_max_frames) > 0:
-            camtoworlds_all = camtoworlds_all[: int(cfg.traj_max_frames)]
-
         camtoworlds_all = np.concatenate(
             [
                 camtoworlds_all,
@@ -3458,15 +2784,6 @@ class Runner:
         camera_id = self.parser.camera_ids[0]
         K = torch.from_numpy(self.parser.Ks_dict[camera_id]).float().to(device)
         width, height = self.parser.imsize_dict[camera_id]
-        K_batched, width, height, _, _ = self._scaled_render_inputs(
-            Ks=K[None],
-            width=width,
-            height=height,
-            scale=cfg.render_scale,
-        )
-        K = K_batched[0]
-        if float(cfg.render_scale) != 1.0:
-            print(f"[render] trajectory render_scale={float(cfg.render_scale):.3f}")
 
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
@@ -3889,23 +3206,16 @@ _DATASET_CONFIG_FIELDS = (
     "edg_lr_decay_steps", "edg_lr_decay_gamma", "edg_arap_lambda", "edg_smooth_lambda",
     "edg_skinning_reg_lambda", "edg_rel_delta_max", "seg_dyn_lambda", "dyn_flat_color",
     "dyn_outside_lambda", "static_only_region_lambda", "means_lr", "pose_opt", "depth_lambda",
-    "app_opt", "app_opt_reg", "edg_obs_lambda", "dyn_obs_lambda",
+    "app_opt", "app_opt_reg",
     "max_steps", "steps_scaler",
 )
 
 
-def _xm_config_path():
-    env = os.environ.get("XM_CONFIG")
-    if env and os.path.isfile(env):
-        return Path(env)
-    # install/gs.sh puts this file at <repo>/build/gsplat_examples/simple_trainer.py; config.json is at <repo>
-    return Path(__file__).resolve().parents[2] / "config.json"
-
-
 def _apply_dataset_config(cfg):
     """Override whitelisted Config fields from XM4D's config.json."""
-    path = _xm_config_path()
-    merged = json.loads(path.read_text()) if path.exists() else {}
+    # install/gs.sh puts this file at <repo>/build/gsplat_examples/simple_trainer.py; config.json is at <repo>
+    path = Path(__file__).resolve().parents[2] / "config.json"
+    merged = json.loads(path.read_text())
     applied = {}
     for fld in _DATASET_CONFIG_FIELDS:
         if fld in merged:

@@ -1,9 +1,8 @@
 import numpy as np
 from scipy.linalg import eigh, svd
 
-def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
+def recover_XM(Q, R, s, Abar, lam):
     N = s.shape[0]
-    optimal_rank = None
         
     sR = np.zeros((3*N, R.shape[1]))
     for i in range(N):
@@ -98,7 +97,6 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
                 R = U @ D @ Vt                 # now det(R) = +1
 
             R_real[:, 3*i:3*i+3] = R
-            sR_real[:, 3*i:3*i+3] = s_real[i] * R
 
     # Compute ybar_est
     # scale to s = 1
@@ -113,12 +111,6 @@ def recover_XM(Q, R, s, Abar, lam, return_rank: bool = False):
     # Compute final outputs
     t_est = y_est[:, :N]
     p_est = y_est[:, N:]
-    
-    # previous 2 lines changed to:
-    #t_est = y_est[:, 1:N+1]   # Skip the zero column
-    #p_est = y_est[:, N+1:]
 
-    if return_rank:
-        return R_real, s_real, p_est, t_est, optimal_rank
-    return R_real, s_real, p_est, t_est
+    return R_real, s_real, p_est, t_est, optimal_rank
 
