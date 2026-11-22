@@ -18,6 +18,11 @@ GPU solver before any photometric training.
 > preprocessed benchmark inputs, the pinned configs and the runners. This `main` branch is the method code, for running
 > XM4D on your own videos.
 
+> **Hand-object interaction:** please see the
+> [`hoi` branch](https://github.com/ComputationalRobotics/XM4D-release/tree/hoi), which adds a step 0 for videos of
+> hands handling objects: HOI-DETR finds the objects the hands hold, SAM 2.1 masks each one, and WiLoR gives the 3D pose
+> of both hands.
+
 ## Install
 
 Requirements: Linux x86-64, an NVIDIA GPU with a driver that supports CUDA 12.8, conda, git, wget, and a C++ compiler.
