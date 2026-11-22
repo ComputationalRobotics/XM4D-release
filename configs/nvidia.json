@@ -3,7 +3,6 @@
   "no_masks": false,
   "DEBUG": false,
 
-  "STATIC_TRACKER": "tapnext",
   "ALLTRACKER_KEYFRAME": 10,
   "ALLTRACKER_RES": 512,
   "ALLTRACKER_VIS_THRESHOLD": 0.6,
