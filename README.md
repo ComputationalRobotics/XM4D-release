@@ -19,9 +19,9 @@ GPU solver before any photometric training.
 > XM4D on your own videos.
 
 > **Hand-object interaction:** please see the
-> [`hoi` branch](https://github.com/ComputationalRobotics/XM4D-release/tree/hoi), which adds a step 0 for videos of
-> hands handling objects: HOI-DETR finds the objects the hands hold, SAM 2.1 masks each one, and WiLoR gives the 3D pose
-> of both hands.
+> [`hoi` branch](https://github.com/ComputationalRobotics/XM4D-release/tree/hoi), for videos of hands handling rigid
+> objects: it finds the objects the hands hold (HOI-DETR, SAM 2.1) and reconstructs the cameras, the 3D motion of every
+> held object and the 3D joints of both hands (WiLoR).
 
 ## Install
 
