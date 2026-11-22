@@ -54,7 +54,10 @@ set `"scene"` in `config.json` (the folder name, or an absolute path), which hol
 repo ships two example scenes, `datasets/sintel_alley_2` (the default) and `datasets/hoi_ip1073`.
 
 **Step 0: masks of the moving objects.** Open `Python/make_masks_sam3.ipynb` in the `sam3` environment and prompt SAM 3
-for each moving object:
+for each moving object.
+
+<details>
+<summary>Notebook commands</summary>
 
 ```python
 track_points("dog", frame=0, points=[(420, 310)])   # or a text prompt: track_text("people", "person")
@@ -63,7 +66,10 @@ save("dog", "other")                                 # category: "rigid", "human
 merge_masks()                                        # at the end: all objects into <scene>/masks/
 ```
 
-Without a notebook, GMOS finds the moving objects automatically (`--fps`: the frame rate of your frames):
+</details>
+
+**Alternatively, without an interactive window:** GMOS finds the moving objects automatically (`--fps`: the frame rate
+of your frames):
 
 ```bash
 cd Python && conda activate gmos && python make_masks_gmos.py --fps 24
@@ -77,7 +83,8 @@ For a scene without moving objects, set `"no_masks": true` in `config.json`.
 bash run_pipeline.sh
 ```
 
-or one by one, from `Python/`:
+<details>
+<summary>Or one step at a time, from <code>Python/</code></summary>
 
 ```bash
 cd Python
@@ -97,6 +104,8 @@ python complete_edg_table.py         #    completed over every frame -> outputs/
 conda activate XM
 python train_4dgs_edg.py             # 5. 4D Gaussian training data -> outputs/gs_edg_target_0000/
 ```
+
+</details>
 
 **Step 6: 4D Gaussians.** Step 5 prints the command, e.g.:
 
