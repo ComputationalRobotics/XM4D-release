@@ -85,8 +85,7 @@ class _Features:
     """Encoder features of every frame, encoded in batches of S/2 consecutive frames from frame 0 (the last batch
     padded with the last frame), as forward_sliding encodes the new half of a window: the encoder output depends on the
     batch size, not on which frames share the batch, so these are the features forward_sliding computes. A batch is
-    encoded when first needed and dropped once the passes start after it (they only move forward): with max_len the
-    cache holds about max_len + S frames instead of the whole video."""
+    encoded when first needed and dropped once the passes start after it (they only move forward)."""
 
     def __init__(self, encode, T, half):
         self.encode, self.T, self.half, self.batches = encode, T, half, {}
