@@ -18,8 +18,8 @@ GPU solver before any photometric training.
 > preprocessed benchmark inputs, the pinned configs and the runners. This `main` branch is the method code, for running
 > XM4D on your own videos.
 
-> **Hand-object interaction:** please see the
-> [`hoi` branch](https://github.com/ComputationalRobotics/XM4D-release/tree/hoi), for videos of hands handling rigid
+> **Hand-object interaction:** please see
+> [XM4D-Hand](https://github.com/ComputationalRobotics/XM4D-Hand), for videos of hands handling rigid
 > objects: it finds the objects the hands hold (HOI-DETR, SAM 2.1) and reconstructs the cameras, the 3D motion of every
 > held object and the 3D joints of both hands (WiLoR).
 
