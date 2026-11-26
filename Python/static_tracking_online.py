@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run 2D tracking of the static scene for XM datasets with the online TAPNext++ tracker.
+"""Run 2D tracking of the static scene for XM datasets. Tracker (config STATIC_TRACKER): "tapnext" (default; the
+online TAPNext++ tracker) or "alltracker" (AllTracker from keyframes, utils/track_alltracker.py).
 
 Paths come from utils.definitions, the parameters from config.json.
 """
@@ -31,6 +32,10 @@ import utils.definitions
 import utils.dataset_config as dataset_config
 from utils.script_logger import install_script_logger
 
+if utils.definitions.photos:
+    raise SystemExit('static_tracking_online.py tracks the frames of a video; photos ("input": "photos" in '
+                     'config.json) are matched by match_photos.py')
+
 ### S0: CONFIG
 IMAGE_DIR = utils.definitions.video_dir
 MASK_DIR = utils.definitions.mask_dir  # a non-existent path if no masks
@@ -41,8 +46,25 @@ MASK_PATTERN = utils.definitions.mask_pattern
 
 GRID = 50
 
-# 2D tracker: a GRID x GRID grid at frame 0, then at every frame new points wherever no visible point is within
-# ONLINE_RESAMPLE_RADIUS (px @256), tracked online.
+# 2D tracker (STATIC_TRACKER). TAPNext (default): a GRID x GRID grid at frame 0, then at every frame new points
+# wherever no visible point is within ONLINE_RESAMPLE_RADIUS (px @256), tracked online; the flow-consistency trim
+# (move-delete) below runs for TAPNext only.
+# AllTracker: points seeded off the (dilated) moving-object masks, a GRID x GRID grid at frame 0 and then
+# every ALLTRACKER_KEYFRAME frames (and at any frame where fewer than STATIC_ALLTRACKER_MIN_VISIBLE points are visible)
+# an ONLINE_RESAMPLE_GRID grid wherever no tracked point is visible within ONLINE_RESAMPLE_RADIUS (px @256); each
+# keyframe's points are tracked at most STATIC_ALLTRACKER_MAX_LEN frames; visible where AllTracker's visibility x
+# confidence >= STATIC_ALLTRACKER_VIS_THRESHOLD and the point is off the moving objects. At STATIC_ALLTRACKER_RES = 1024
+# (AllTracker's own default) a 1024 x 768 video needs ~24 GB of GPU memory; 512 makes the static tracks less accurate.
+TRACKER = dataset_config.get_str("STATIC_TRACKER", "tapnext").lower()
+if TRACKER not in {"alltracker", "tapnext"}:
+    raise ValueError(f"STATIC_TRACKER must be 'alltracker' or 'tapnext', got '{TRACKER}'")
+AT_KEYFRAME = dataset_config.get_int("ALLTRACKER_KEYFRAME", 10)
+AT_RES = dataset_config.get_int("STATIC_ALLTRACKER_RES", 1024)
+AT_VIS_THRESHOLD = dataset_config.get_float("STATIC_ALLTRACKER_VIS_THRESHOLD", 0.99)
+AT_MAX_LEN = dataset_config.get_int("STATIC_ALLTRACKER_MAX_LEN", 100)
+AT_MIN_VISIBLE = dataset_config.get_int("STATIC_ALLTRACKER_MIN_VISIBLE", 200)
+
+MOVE_DELETE_ENABLED = TRACKER == "tapnext"
 MOVE_WINDOW_SIZE = 10.0
 MOVE_DELETE_FLOW_ERROR_THRESHOLD = dataset_config.get_float(
     "MOVE_DELETE_FLOW_ERROR_THRESHOLD", 10.0
@@ -474,59 +496,83 @@ def track_online_tapnext(
 video_np_256, video_np = load_frames_256(str(IMAGE_DIR), IMAGE_PATTERN)
 H, W = video_np.shape[2], video_np.shape[3]
 
-query_exclude_masks_256 = None
-if Path(MASK_DIR).exists():
-    try:
-        _masks_256 = load_dynamic_masks(
-            str(MASK_DIR),
-            MASK_PATTERN,
-            t_expected=video_np.shape[1],
-            mask_mode="dynamic_positive",
-            target_size=(256, 256),
-        )
-        _masks_256 = np.asarray(_masks_256)
-        query_exclude_masks_256 = _masks_256
-        # Dilate the query-exclusion masks (in 256-grid space) to match the
-        # margin used by the final track filter (MASK_DILATE_PX is defined at
-        # native resolution, so scale it to the 256 grid).
-        dilate_px_256 = max(1, int(round(MASK_DILATE_PX * 256.0 / float(max(H, W)))))
-        query_exclude_masks_256 = dilate_dynamic_masks(query_exclude_masks_256, dilate_px_256)
-        print(
-            f"Dilated query-exclusion masks by {dilate_px_256}px @256 "
-            f"(= {MASK_DILATE_PX}px @native {W}x{H})"
-        )
-    except Exception as e:
-        print(f"Failed to load 256 dynamic masks for query exclusion: {e}")
+if TRACKER == "tapnext":
+    query_exclude_masks_256 = None
+    if Path(MASK_DIR).exists():
+        try:
+            _masks_256 = load_dynamic_masks(
+                str(MASK_DIR),
+                MASK_PATTERN,
+                t_expected=video_np.shape[1],
+                mask_mode="dynamic_positive",
+                target_size=(256, 256),
+            )
+            _masks_256 = np.asarray(_masks_256)
+            query_exclude_masks_256 = _masks_256
+            # Dilate the query-exclusion masks (in 256-grid space) to match the
+            # margin used by the final track filter (MASK_DILATE_PX is defined at
+            # native resolution, so scale it to the 256 grid).
+            dilate_px_256 = max(1, int(round(MASK_DILATE_PX * 256.0 / float(max(H, W)))))
+            query_exclude_masks_256 = dilate_dynamic_masks(query_exclude_masks_256, dilate_px_256)
+            print(
+                f"Dilated query-exclusion masks by {dilate_px_256}px @256 "
+                f"(= {MASK_DILATE_PX}px @native {W}x{H})"
+            )
+        except Exception as e:
+            print(f"Failed to load 256 dynamic masks for query exclusion: {e}")
 
-query_np = make_grid_query_points(GRID)
-if query_exclude_masks_256 is not None:
-    query_np = _exclude_queries_in_dynamic_masks(
+    query_np = make_grid_query_points(GRID)
+    if query_exclude_masks_256 is not None:
+        query_np = _exclude_queries_in_dynamic_masks(
+            query_np,
+            query_exclude_masks_256,
+            swap_xy_for_query=False,
+        )
+
+    video_256 = torch.from_numpy(video_np_256).to(device)
+
+    tracks_xy_256, occluded = track_online_tapnext(
+        video_256,
         query_np,
-        query_exclude_masks_256,
-        swap_xy_for_query=False,
+        device=device,
+        checkpoint=str(CHECKPOINT),
+        resample_grid=ONLINE_RESAMPLE_GRID,
+        resample_margin=ONLINE_RESAMPLE_MARGIN,
+        resample_radius=ONLINE_RESAMPLE_RADIUS,
+        certainty_radius=ONLINE_CERTAINTY_RADIUS,
+        certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
+        exclude_masks_256=query_exclude_masks_256,
+        max_points=ONLINE_MAX_POINTS,
+        fp16=ONLINE_FP16,
     )
 
-video_256 = torch.from_numpy(video_np_256).to(device)
 
-tracks_xy_256, occluded = track_online_tapnext(
-    video_256,
-    query_np,
-    device=device,
-    checkpoint=str(CHECKPOINT),
-    resample_grid=ONLINE_RESAMPLE_GRID,
-    resample_margin=ONLINE_RESAMPLE_MARGIN,
-    resample_radius=ONLINE_RESAMPLE_RADIUS,
-    certainty_radius=ONLINE_CERTAINTY_RADIUS,
-    certainty_threshold=ONLINE_CERTAINTY_THRESHOLD,
-    exclude_masks_256=query_exclude_masks_256,
-    max_points=ONLINE_MAX_POINTS,
-    fp16=ONLINE_FP16,
-)
+    # Map tracks from 256-grid space back to original image space
+    tracks_xy = tracks_xy_256
+    tracks_xy[..., 0] = tracks_xy[..., 0] / 256 * W
+    tracks_xy[..., 1] = tracks_xy[..., 1] / 256 * H
+else:
+    from utils.track_alltracker import grid_seeds, track_keyframes
 
-# Map tracks from 256-grid space back to original image space
-tracks_xy = tracks_xy_256
-tracks_xy[..., 0] = tracks_xy[..., 0] / 256 * W
-tracks_xy[..., 1] = tracks_xy[..., 1] / 256 * H
+    exclude = np.zeros((video_np.shape[1], H, W), bool)                 # moving objects, dilated as below
+    if Path(MASK_DIR).exists():
+        exclude = np.asarray(dilate_dynamic_masks(load_dynamic_masks(
+            str(MASK_DIR), MASK_PATTERN, t_expected=video_np.shape[1], mask_mode="dynamic_positive", target_size=(W, H),
+        ), MASK_DILATE_PX))
+    side = float(max(H, W))
+    radius = ONLINE_RESAMPLE_RADIUS * side / 256.0
+    print(f"AllTracker: {GRID}x{GRID} seeds at frame 0, re-seeding every {AT_KEYFRAME} frames (and below {AT_MIN_VISIBLE} "
+          f"visible points) where no point is visible within {radius:.1f}px, tracks <= {AT_MAX_LEN} frames, {AT_RES}px, "
+          f"visible at vis x conf >= {AT_VIS_THRESHOLD}")
+    trk, vis, _ = track_keyframes(
+        video_np[0],
+        lambda t, covered: grid_seeds(~(exclude[t] > 0), side / (GRID if t == 0 else ONLINE_RESAMPLE_GRID), covered, radius),
+        keyframe=AT_KEYFRAME, res=AT_RES, vis_threshold=AT_VIS_THRESHOLD, max_points=ONLINE_MAX_POINTS,
+        max_len=AT_MAX_LEN, min_visible=AT_MIN_VISIBLE, device=str(device), label="AllTracker (static)",
+    )
+    tracks_xy = trk[None]
+    occluded = ~vis[None]
+    print(f"AllTracker static tracks: {trk.shape[0]}")
 
 # Optional dynamic masks
 dynamic_masks = None
@@ -563,54 +609,57 @@ if DEBUG:
         mask_dir=str(MASK_DIR),
     )
 
+move_delete_deleted_obs_mask = None
+
 # Delete points with abnormally large 2D motion vs nearby points. Applied after the
 # tracks_debug save (which stays unfiltered) and before the solver output below.
-T_md = tracks_xy.shape[2]
-Q_md = tracks_xy.shape[1]
-move_delete_deleted_obs_mask = np.zeros((1, Q_md, T_md), dtype=bool)
-window = float(max(1e-6, MOVE_WINDOW_SIZE))
-flow_error_threshold = float(max(0.0, MOVE_DELETE_FLOW_ERROR_THRESHOLD))
-n_trimmed_obs = 0
-flow_error_by_transition = _compute_flow_error_by_transition(
-    tracks_xy[:, :, :T_md, :],
-    occluded[:, :, :T_md],
-    window=window,
-)
-move_delete_query_mask = np.any(
-    np.isfinite(flow_error_by_transition) & (flow_error_by_transition > flow_error_threshold),
-    axis=1,
-)
-n_move_delete = int(np.sum(move_delete_query_mask))
-if n_move_delete > 0:
-    for q_idx in np.where(move_delete_query_mask)[0]:
-        valid_obs = (
-            (~occluded[0, q_idx, :T_md])
-            & np.isfinite(tracks_xy[0, q_idx, :T_md, :]).all(axis=1)
-        )
-        if not np.any(valid_obs):
-            occluded[0, q_idx, :T_md] = True
-            continue
+if MOVE_DELETE_ENABLED:
+    T_md = tracks_xy.shape[2]
+    Q_md = tracks_xy.shape[1]
+    move_delete_deleted_obs_mask = np.zeros((1, Q_md, T_md), dtype=bool)
+    window = float(max(1e-6, MOVE_WINDOW_SIZE))
+    flow_error_threshold = float(max(0.0, MOVE_DELETE_FLOW_ERROR_THRESHOLD))
+    n_trimmed_obs = 0
+    flow_error_by_transition = _compute_flow_error_by_transition(
+        tracks_xy[:, :, :T_md, :],
+        occluded[:, :, :T_md],
+        window=window,
+    )
+    move_delete_query_mask = np.any(
+        np.isfinite(flow_error_by_transition) & (flow_error_by_transition > flow_error_threshold),
+        axis=1,
+    )
+    n_move_delete = int(np.sum(move_delete_query_mask))
+    if n_move_delete > 0:
+        for q_idx in np.where(move_delete_query_mask)[0]:
+            valid_obs = (
+                (~occluded[0, q_idx, :T_md])
+                & np.isfinite(tracks_xy[0, q_idx, :T_md, :]).all(axis=1)
+            )
+            if not np.any(valid_obs):
+                occluded[0, q_idx, :T_md] = True
+                continue
 
-        bad_transition = np.zeros(T_md, dtype=bool)
-        bad_transition[1:] = (
-            np.isfinite(flow_error_by_transition[q_idx, 1:T_md])
-            & (flow_error_by_transition[q_idx, 1:T_md] > flow_error_threshold)
-        )
-        keep_obs = _select_longest_stable_segment(
-            valid_obs,
-            bad_transition,
-            transition_score=flow_error_by_transition[q_idx, :T_md],
-        )
-        drop_obs = valid_obs & (~keep_obs)
-        if np.any(drop_obs):
-            n_trimmed_obs += int(np.sum(drop_obs))
-            occluded[0, q_idx, drop_obs] = True
-            move_delete_deleted_obs_mask[0, q_idx, drop_obs] = True
-print(
-    f"[move-delete] flagged {n_move_delete} queries; "
-    f"trimmed {n_trimmed_obs} observations "
-    f"(flow error > {flow_error_threshold:.3f}px, window={window:.1f}px)"
-)
+            bad_transition = np.zeros(T_md, dtype=bool)
+            bad_transition[1:] = (
+                np.isfinite(flow_error_by_transition[q_idx, 1:T_md])
+                & (flow_error_by_transition[q_idx, 1:T_md] > flow_error_threshold)
+            )
+            keep_obs = _select_longest_stable_segment(
+                valid_obs,
+                bad_transition,
+                transition_score=flow_error_by_transition[q_idx, :T_md],
+            )
+            drop_obs = valid_obs & (~keep_obs)
+            if np.any(drop_obs):
+                n_trimmed_obs += int(np.sum(drop_obs))
+                occluded[0, q_idx, drop_obs] = True
+                move_delete_deleted_obs_mask[0, q_idx, drop_obs] = True
+    print(
+        f"[move-delete] flagged {n_move_delete} queries; "
+        f"trimmed {n_trimmed_obs} observations "
+        f"(flow error > {flow_error_threshold:.3f}px, window={window:.1f}px)"
+    )
 
 occluded_viz = occluded.copy()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Conda env for step 1, monocular depth (Python/get_depths_clean.py): Depth Anything 3.
+# Conda env for step 1, monocular depth (Python/get_depths_clean.py): Depth Anything 3 (UniDepth: install/unidepth.sh).
 # usage: bash install/da3.sh [env name]      (default env name: da3)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 ENV="${1:-da3}"

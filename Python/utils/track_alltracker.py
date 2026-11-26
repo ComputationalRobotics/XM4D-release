@@ -1,11 +1,12 @@
 """AllTracker (Harley et al., ICCV 2025, github.com/aharley/alltracker) as the 2D tracker of step 2.
 
 Dense tracking from keyframes: at every `keyframe`-th frame, `seed_fn` places new points where no tracked point is
-visible nearby, and that keyframe's points are tracked forward to the end of the video with ONE dense AllTracker
-pass from the keyframe (the flow of every pixel, sampled at the points). A point is visible where AllTracker's
-visibility x confidence >= `vis_threshold`. With `min_new` > 0, a keyframe is skipped while it would add fewer new
-points than `min_new` x the points visible there (each pass costs the same however few points it adds). Frames are
-resized so that the long side is `res` px. `fp16` runs AllTracker under fp16 autocast.
+visible nearby, and that keyframe's points are tracked forward to the end of the video (or `max_len` frames) with ONE
+dense AllTracker pass from the keyframe (the flow of every pixel, sampled at the points). A point is visible where
+AllTracker's visibility x confidence >= `vis_threshold`. With `min_visible` > 0, any frame where fewer points are
+visible also becomes a keyframe. With `min_new` > 0, a keyframe is skipped while it would add fewer new points than
+`min_new` x the points visible there (each pass costs the same however few points it adds). Frames are resized so that
+the long side is `res` px. `fp16` runs AllTracker under fp16 autocast.
 """
 
 import sys
@@ -85,7 +86,8 @@ class _Features:
     """Encoder features of every frame, encoded in batches of S/2 consecutive frames from frame 0 (the last batch
     padded with the last frame), as forward_sliding encodes the new half of a window: the encoder output depends on the
     batch size, not on which frames share the batch, so these are the features forward_sliding computes. A batch is
-    encoded when first needed and dropped once the passes start after it (they only move forward)."""
+    encoded when first needed and dropped once the passes start after it (they only move forward): with max_len the
+    cache holds about max_len + S frames instead of the whole video."""
 
     def __init__(self, encode, T, half):
         self.encode, self.T, self.half, self.batches = encode, T, half, {}
@@ -148,8 +150,8 @@ def _pass(model, video, t0, t1, g, iters, feats, padder, device):
 
 
 @torch.no_grad()
-def track_keyframes(frames, seed_fn, *, keyframe=10, res=512, vis_threshold=0.6, max_points=None,
-                    min_new=0.0, fp16=False, device="cuda", label="AllTracker"):
+def track_keyframes(frames, seed_fn, *, keyframe=10, res=512, vis_threshold=0.6, max_points=None, max_len=None,
+                    min_visible=0, min_new=0.0, fp16=False, device="cuda", label="AllTracker"):
     """frames (T, H, W, 3) uint8 RGB. seed_fn(t, visible_xy (n, 2)) -> new points (m, 2) at frame t, native px.
     Returns tracks (N, T, 2) float32 native px (NaN before each point's keyframe), visible (N, T) bool, query_t (N,)."""
     T, H, W = frames.shape[:3]
@@ -164,7 +166,7 @@ def track_keyframes(frames, seed_fn, *, keyframe=10, res=512, vis_threshold=0.6,
     tracks, vis, qts, n_total = [], [], [], 0
     keyframe = max(1, int(keyframe))
     for t0 in tqdm(range(T), desc=label):
-        if t0 % keyframe:
+        if t0 % keyframe and (min_visible <= 0 or sum(int(v[:, t0].sum()) for v in vis) >= min_visible):
             continue
         cur = [tr[v[:, t0], t0] for tr, v in zip(tracks, vis)]
         cur = np.concatenate(cur) if cur else np.zeros((0, 2))
@@ -176,7 +178,7 @@ def track_keyframes(frames, seed_fn, *, keyframe=10, res=512, vis_threshold=0.6,
         tr = np.full((len(new), T, 2), np.nan, np.float32)
         v = np.zeros((len(new), T), bool)
         tr[:, t0], v[:, t0] = new, True
-        t1 = T
+        t1 = T if not max_len else min(T, t0 + int(max_len) + 1)
         if t0 < t1 - 1:
             q = np.stack([new[:, 0] * sx, new[:, 1] * sy], 1)
             g = torch.as_tensor(np.stack([q[:, 0] / (w - 1) * 2 - 1, q[:, 1] / (h - 1) * 2 - 1], -1),

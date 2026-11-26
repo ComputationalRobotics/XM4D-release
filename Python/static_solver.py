@@ -54,9 +54,9 @@ STATIC_TRACK_DEPTH_GRAD_MAX = dataset_config.get_float(
     "STATIC_TRACK_DEPTH_GRAD_MAX", 2.0
 )
 
-# Intrinsics come from a single source: outputs/depth_anything_3/intrinsics.npy,
-# written by get_depths_clean.py. That file already encodes the GT-vs-DA3 choice, so
-# the solver never re-decides it here -- it just loads and uses that K everywhere.
+# Intrinsics come from a single source, step 1: <depth_dir>/intrinsics.npy for a video, each photo's
+# <depth_dir>/photos/<name>.npz for photos (the model's K, or config.json INTRINSICS), so the solver
+# never re-decides them here -- it just loads and uses that K everywhere.
 
 DA3_SCALE_MIN = 0.25
 DA3_SCALE_MAX = 4.0
@@ -98,7 +98,7 @@ def run_ceres_refine(
     except ModuleNotFoundError as exc:
         if exc.name in {"pyceres", "pycolmap"}:
             print(f"[Ceres] skipped: optional dependency '{exc.name}' is not installed.")
-            return R_real, t_est, p_est
+            return R_real, t_est, p_est, 1.0
         raise
 
     return XM_Ceres_interface(
@@ -117,10 +117,31 @@ def run_ceres_refine(
 
 def _ceres_loss_scale():
     """CERES_LOSS_PX in normalized landmark units (px / median focal), or None without intrinsics.npy."""
+    if utils.definitions.photos:
+        if CERES_LOSS == "trivial":
+            return None
+        return CERES_LOSS_PX / float(np.median([K[0, 0] for K in _photo_intrinsics()[0].values()]))
     K_all = _load_intrinsics_npy(1)
     if K_all is None or CERES_LOSS == "trivial":
         return None
     return CERES_LOSS_PX / float(np.median(K_all[:, 0, 0]))
+
+
+_PHOTO_K = None
+
+
+def _photo_intrinsics():
+    """input "photos": step 1's K and size of every photo that has its depth file: {photo index: K}, {index: (H, W)}."""
+    global _PHOTO_K
+    if _PHOTO_K is None:
+        _PHOTO_K = ({}, {})
+        for i, path in enumerate(utils.definitions.photo_paths()):
+            f = utils.definitions.photo_depth_dir / f"{path.name}.npz"
+            if f.exists():
+                with np.load(f) as z:
+                    _PHOTO_K[0][i] = np.asarray(z["K"], dtype=np.float64)
+                    _PHOTO_K[1][i] = z["depth"].shape
+    return _PHOTO_K
 
 
 def build_sR_real(R_real, s_real, N):
@@ -193,7 +214,7 @@ def _load_intrinsics_npy(t_expected):
     get_depths_clean.py writes this file (Depth Anything 3's intrinsics, or config.json
     INTRINSICS), so the solver just reads it. Returns K_all (T, 3, 3), or None if absent.
     """
-    intrinsics_path = Path(utils.definitions.da3_depth_dir) / "intrinsics.npy"
+    intrinsics_path = Path(utils.definitions.depth_dir) / "intrinsics.npy"
     if not intrinsics_path.exists():
         return None
     K_all = np.load(str(intrinsics_path)).astype(np.float64)
@@ -647,6 +668,85 @@ def lift_2d_tracks_to_solver_input(
     return edges, weights, landmarks
 
 
+def lift_photo_tracks():
+    """input "photos": lift each photo's track observations (match_photos.py) to 3D with that photo's step-1 depth and
+    K (finite positive depth only: the video lift's far-depth and depth-edge checks, STATIC_TRACK_DEPTH_MAX and
+    _GRAD_MAX, are in metres and tuned for videos; the depth models put landmarks from tens to hundreds of metres).
+    Returns edges [track, photo], weights (the depth confidence) and the camera-frame points, as
+    lift_2d_tracks_to_solver_input."""
+    z = np.load(utils.definitions.photo_tracks_path)
+    names = [str(n) for n in z["names"]]
+    if names != [p.name for p in utils.definitions.photo_paths()]:
+        raise RuntimeError(f"{utils.definitions.photo_tracks_path} is for other photos: rerun match_photos.py")
+    frame, track, xy = z["frame"].astype(np.int64), z["track"].astype(np.int64), z["xy"].astype(np.float64)
+    edges_list, weights_list, landmarks_list = [], [], []
+    for t, name in enumerate(names):
+        sel = np.flatnonzero(frame == t)
+        f = utils.definitions.photo_depth_dir / f"{name}.npz"
+        if sel.size == 0:
+            continue
+        if not f.exists():
+            print(f"[track-lift] {name}: no depth ({f}); skipped.")
+            continue
+        with np.load(f) as d:
+            depth, conf, K = d["depth"].astype(np.float64), d["conf"].astype(np.float64), d["K"].astype(np.float64)
+        H, W = depth.shape
+        x, y = xy[sel, 0], xy[sel, 1]
+        xi, yi = np.rint(x).astype(np.int64), np.rint(y).astype(np.int64)
+        inside = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+        sel, x, y, xi, yi = sel[inside], x[inside], y[inside], xi[inside], yi[inside]
+        zv = depth[yi, xi]
+        ok = np.isfinite(zv) & (zv > 0)
+        if not ok.any():
+            continue
+        edges_list.append(np.stack([track[sel[ok]], np.full(int(ok.sum()), t)], axis=1))
+        landmarks_list.append(_unproject(x[ok], y[ok], zv[ok], K))
+        w = conf[yi[ok], xi[ok]]
+        weights_list.append(np.where(np.isfinite(w), w, 1.0)[:, None])
+    if not edges_list:
+        raise RuntimeError("[track-lift] no valid 3D observations were created from the photo tracks.")
+    edges = np.concatenate(edges_list, axis=0)
+    print(f"[track-lift] lifted photo tracks: obs={edges.shape[0]} of {len(frame)}, "
+          f"source={utils.definitions.photo_depth_dir}")
+    return edges, np.concatenate(weights_list, axis=0), np.concatenate(landmarks_list, axis=0)
+
+
+def export_colmap(R, t, p, indices_all, focal_scale):
+    """The cameras and points as a COLMAP text model in outputs/colmap/ (cameras.txt, images.txt, points3D.txt):
+    one PINHOLE camera per solved frame or photo, with step 1's K times the focal refined by Ceres. The points
+    have no colour and no track."""
+    from utils.convertCOLMAP import _rotation_matrix_to_qvec, write_cameras_text, write_images_text, write_points3D_text
+    if utils.definitions.photos:
+        paths = utils.definitions.photo_paths()
+        K_by_frame, hw_by_frame = _photo_intrinsics()
+    else:
+        paths = sorted(Path(image_dir).glob(image_pattern))
+        K_all = _load_intrinsics_npy(len(paths))
+        H, W = cv2.imread(str(paths[0]), cv2.IMREAD_COLOR).shape[:2]
+        K_by_frame = {i: K_all[i] for i in range(min(len(paths), K_all.shape[0]))}
+        hw_by_frame = {i: (H, W) for i in K_by_frame}
+    cameras, images = {}, {}
+    for orig, j in enumerate(np.asarray(indices_all, dtype=np.int64)):
+        if j < 0 or orig not in K_by_frame:
+            continue
+        K = K_by_frame[orig]
+        (h, w), cid = hw_by_frame[orig], len(cameras) + 1
+        cameras[cid] = {"model": "PINHOLE", "width": int(w), "height": int(h),
+                        "params": [float(K[0, 0] * focal_scale), float(K[1, 1] * focal_scale),
+                                   float(K[0, 2]), float(K[1, 2])]}
+        R_c2w, t_c2w = R[:, 3 * j:3 * j + 3], t[:, j]
+        images[cid] = {"id": cid, "qvec": _rotation_matrix_to_qvec(R_c2w.T), "tvec": -R_c2w.T @ t_c2w,
+                       "camera_id": cid, "name": paths[orig].name}
+    points = {i + 1: {"id": i + 1, "xyz": p[:, i].tolist(), "rgb": [128, 128, 128], "error": 0.0}
+              for i in range(p.shape[1])}
+    out = Path(output_path) / "colmap"
+    out.mkdir(parents=True, exist_ok=True)
+    write_cameras_text(cameras, out / "cameras.txt")
+    write_images_text(images, out / "images.txt")
+    write_points3D_text(points, out / "points3D.txt")
+    print(f"[colmap] {len(images)} cameras and {len(points)} points -> {out}")
+
+
 ### S0: CONFIG
 dataset_path = str(utils.definitions.rootpath)
 output_path = str(utils.definitions.output_dir)
@@ -656,19 +756,22 @@ install_script_logger("static_solver", output_path)
 image_dir = utils.definitions.video_dir
 image_pattern = utils.definitions.image_pattern
 
-gt = load_custom_gt(dataset_path)
+if utils.definitions.photos:
+    edges, weights_full, landmarks = lift_photo_tracks()
+else:
+    gt = load_custom_gt(dataset_path)
 
-data = np.load(os.path.join(output_path, 'output_tapnet_da3.npz'))
-print("[track-lift] lifting 2D tracks to 3D observations for solver input.")
-edges, weights_full, landmarks = lift_2d_tracks_to_solver_input(
-    data,
-    gt=gt,
-    image_dir=image_dir,
-    image_pattern=image_pattern,
-    output_path=output_path,
-    depth_max=STATIC_TRACK_DEPTH_MAX,
-    depth_grad_max=STATIC_TRACK_DEPTH_GRAD_MAX,
-)
+    data = np.load(os.path.join(output_path, 'output_tapnet_da3.npz'))
+    print("[track-lift] lifting 2D tracks to 3D observations for solver input.")
+    edges, weights_full, landmarks = lift_2d_tracks_to_solver_input(
+        data,
+        gt=gt,
+        image_dir=image_dir,
+        image_pattern=image_pattern,
+        output_path=output_path,
+        depth_max=STATIC_TRACK_DEPTH_MAX,
+        depth_grad_max=STATIC_TRACK_DEPTH_GRAD_MAX,
+    )
 weights = weights_full[:, 0].astype(np.float64, copy=False)
 
 frame_ids = edges[:, 0].astype(np.int64)
@@ -822,7 +925,7 @@ t_est = np.asarray(t_est, dtype=np.float64)
 landmarks_2D = landmarks[:, :2] / landmarks[:, 2, None]
 nan_mask = np.isnan(landmarks_2D).any(axis=1)
 
-R_real, t_est, p_est = run_ceres_refine(
+R_real, t_est, p_est, focal_scale = run_ceres_refine(
     edges[~nan_mask],
     landmarks_2D[~nan_mask],
     R_real,
@@ -843,12 +946,16 @@ solver_frame_orig = np.full(N, -1, dtype=np.int64)          # original frame of 
 for orig_idx, new_idx in enumerate(np.asarray(indices_all, dtype=np.int64)):
     if 0 <= new_idx < N:
         solver_frame_orig[new_idx] = orig_idx
-da3_frame_scale, da3_frame_scale_loss, da3_frame_scale_stats = estimate_da3_frame_scales_static_chamfer(
-    R_real,
-    t_est,
-    p_est,
-    frame_index=solver_frame_orig,
-)
+if utils.definitions.photos:   # the per-frame depth scale is for videos (dense depth of one camera); photos keep 1
+    da3_frame_scale, da3_frame_scale_loss = np.ones(N), np.full(N, np.nan)
+    da3_frame_scale_stats = {"enabled": False, "reason": "photos"}
+else:
+    da3_frame_scale, da3_frame_scale_loss, da3_frame_scale_stats = estimate_da3_frame_scales_static_chamfer(
+        R_real,
+        t_est,
+        p_est,
+        frame_index=solver_frame_orig,
+    )
 s_real = da3_frame_scale
 
 total_time = time.perf_counter() - total_start
@@ -861,9 +968,8 @@ np.savez(
     s=s_real,
     p=p_est,
     t=t_est,
-    # original-frame -> solved-frame index (-1 for frames dropped by checklandmarks/XM2);
-    # purely additive (already computed above) so downstream (EDG) can scatter the N
-    # solved poses back onto the full T-frame timeline.
+    # original frame (or photo) -> solved camera index (-1 for frames dropped by checklandmarks/XM2): R, s and t are
+    # stored per solved camera; this scatters them back onto every frame.
     indices_all=np.asarray(indices_all, dtype=np.int64),
     total_time=np.array(total_time, dtype=np.float64),
     solve_time=np.array(solver_time, dtype=np.float64),
@@ -876,10 +982,14 @@ np.savez(
     da3_frame_scale=np.asarray(da3_frame_scale, dtype=np.float64),
     da3_frame_scale_loss=np.asarray(da3_frame_scale_loss, dtype=np.float64),
     da3_frame_scale_stats=np.array(da3_frame_scale_stats, dtype=object),
+    # Ceres' refined focal: the K of step 1 times this (1 without CERES_OPTIMIZE_INTRINSICS)
+    focal_scale=np.array(focal_scale, dtype=np.float64),
     ceres_depth_summary=np.array({}, dtype=object),
     depth_bend_summary=np.array({}, dtype=object),
     depth_bend_maps=np.zeros((0, 0, 0), dtype=np.float32),
 )
+
+export_colmap(R_real, t_est, p_est, indices_all, focal_scale)
 
 print('Total time: ', total_time)
 print('Solve time: ', solver_time)

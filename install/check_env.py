@@ -1,10 +1,10 @@
-"""Check the conda environments of XM4D after installing them: for every stage, in its own env, the imports of the
-stage's scripts, the GPU and the model weights. Run it with any Python 3 that has conda on the PATH (e.g. conda's base):
-    python install/check_env.py                 # every stage in its env: sam3 (or gmos), da3, tapnet, XM, gs
+"""Check the conda environments after installing them: for every stage, in its own env, the imports of the stage's
+scripts, the GPU and the model weights. Run it with any Python 3 that has conda on the PATH (e.g. conda's base):
+    python install/check_env.py                 # every stage in its env: da3, tapnet, XM (+ the optional ones)
     python install/check_env.py --env xm4d      # the one-environment install (install/xm4d.sh)
     python install/check_env.py tapnet=mytap    # a stage installed under another env name (bash install/tapnet.sh mytap)
-Step 0 is checked with sam3, with gmos when sam3 is not installed (both when both are), and gives a warning when neither
-is installed. Exits 1 if a stage fails or is missing."""
+The optional stages are checked when their env is installed: step 0 (sam3, or gmos), unidepth (step 1 with UniDepth V2)
+and glomap (step 2 for photos). Exits 1 if a stage fails or a required one is missing."""
 import importlib
 import json
 import os
@@ -21,18 +21,19 @@ MODULES = {
     "da3": ["numpy", "scipy", "PIL", "cv2", "pandas", "torch", "depth_anything_3.api"],
     "tapnet": ["numpy", "PIL", "cv2", "pandas", "tqdm", "torch", "einops", "tapnet.tapnext.tapnext_torch"],
     "XM": ["numpy", "scipy", "cv2", "matplotlib", "pyceres", "pycolmap", "XM"],
-    "gs": ["numpy", "scipy", "cv2", "PIL", "imageio", "yaml", "tqdm", "matplotlib", "sklearn", "piexif", "tyro", "viser",
-           "nerfview", "torchmetrics", "torch", "fused_ssim", "gsplat"],
+    "unidepth": ["numpy", "scipy", "cv2", "PIL", "torch", "unidepth.models"],
 }
 PATHS = {
     "gmos": [ROOT / "deps" / "gmos"],
     "da3": [ROOT / "deps" / "Depth-Anything-3" / "src"],
     "tapnet": [ROOT / "deps" / "tapnet"],
     "XM": [ROOT / "XM" / "build"],
+    "unidepth": [ROOT / "deps" / "UniDepth"],
 }
 TAPNEXT_CKPT = ROOT / "deps" / "tapnet" / "checkpoints" / "tapnextpp_ckpt.pt"
 ALLTRACKER_CKPT = ROOT / "deps" / "alltracker" / "checkpoints" / "alltracker.pth"
-GS_TRAINER = ROOT / "build" / "gsplat_examples" / "simple_trainer.py"
+GLOMAP = ROOT / "build" / "glomap" / "glomap" / "glomap"
+COLMAP = ROOT / "build" / "glomap" / "_deps" / "colmap-build" / "src" / "colmap" / "exe" / "colmap"
 failed = []
 
 
@@ -102,18 +103,14 @@ def alltracker_forward():
     return "AllTracker checkpoint loads and runs"
 
 
-def gsplat_render():
-    import torch
-    from gsplat import rasterization
-    assert GS_TRAINER.exists(), f"missing {GS_TRAINER} (made by install/gs.sh)"
-    n, dev = 64, "cuda"
-    means = torch.rand(n, 3, device=dev) - 0.5 + torch.tensor([0.0, 0.0, 3.0], device=dev)
-    quats = torch.nn.functional.normalize(torch.rand(n, 4, device=dev), dim=-1)
-    img, alpha, _ = rasterization(means, quats, torch.full((n, 3), 0.05, device=dev), torch.full((n,), 0.8, device=dev),
-                                  torch.rand(n, 3, device=dev), torch.eye(4, device=dev)[None],
-                                  torch.tensor([[[64.0, 0, 32], [0, 64.0, 32], [0, 0, 1]]], device=dev), 64, 64)
-    assert torch.isfinite(img).all() and alpha.max() > 0
-    return "trainer in build/gsplat_examples, gsplat CUDA rasterizer runs"
+def glomap_binaries():   # no Python in that env: the binaries find its libraries through their RPATH
+    for exe in (GLOMAP, COLMAP):
+        assert exe.exists(), f"missing {exe}: bash install/glomap.sh"
+    out = subprocess.run([str(COLMAP), "help"], capture_output=True, text=True).stdout
+    assert "with CUDA" in out, f"{COLMAP} does not run, or was built without CUDA: {out.strip()[:200]}"
+    r = subprocess.run([str(GLOMAP), "-h"], capture_output=True, text=True)
+    assert "mapper" in r.stdout + r.stderr, f"{GLOMAP} does not run: {(r.stdout + r.stderr).strip()[:200]}"
+    return "COLMAP (CUDA) and GLOMAP run"
 
 
 def check_stage(stage):   # runs inside the stage's env
@@ -130,8 +127,6 @@ def check_stage(stage):   # runs inside the stage's env
     if stage == "tapnet":
         check("AllTracker", alltracker_forward)
         check("TAPNext++", tapnext_forward)
-    if stage == "gs":
-        check("gsplat", gsplat_render)
     if failed:
         print(f"[check_env] {stage}: NOT ready, {len(failed)} problem(s): {', '.join(failed)}")
         sys.exit(1)
@@ -139,15 +134,15 @@ def check_stage(stage):   # runs inside the stage's env
 
 
 def main():
-    envs = {stage: stage for stage in MODULES}   # stage -> conda env name
+    envs = {stage: stage for stage in [*MODULES, "glomap"]}   # stage -> conda env name
     one_env = None
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
         if a == "--env" and args:
             one_env = args.pop(0)
-            envs.update({stage: one_env for stage in ("sam3", "da3", "tapnet", "XM")})   # GMOS and gs are not in the one env
-        elif a.split("=")[0] in MODULES and "=" in a:
+            envs.update({stage: one_env for stage in ("sam3", "da3", "tapnet", "XM")})   # the others keep their env
+        elif a.split("=")[0] in envs and "=" in a:
             envs[a.split("=")[0]] = a.split("=", 1)[1]
         else:
             sys.exit(__doc__)
@@ -156,8 +151,9 @@ def main():
                                        check=True).stdout)["envs"]
     installed = {Path(p).name for p in listed}
     masks = [stage for stage in ("sam3", "gmos") if envs[stage] in installed]
+    optional = [stage for stage in ("unidepth",) if envs[stage] in installed]
     summary = []
-    for stage in masks + ["da3", "tapnet", "XM", "gs"]:
+    for stage in masks + ["da3", "tapnet", "XM"] + optional:
         if envs[stage] not in installed:
             script = "xm4d" if envs[stage] == one_env else stage
             summary.append(("FAIL", stage, f"env {envs[stage]} is not installed: bash install/{script}.sh"))
@@ -165,13 +161,23 @@ def main():
         r = subprocess.run([conda, "run", "--no-capture-output", "-n", envs[stage], "python", str(Path(__file__).resolve()),
                             "--stage", stage])
         summary.append(("ok" if r.returncode == 0 else "FAIL", stage, f"env {envs[stage]}"))
+    if envs["glomap"] in installed:
+        optional.append("glomap")
+        print(f"[check_env] glomap  (binaries in {ROOT / 'build' / 'glomap'})")
+        check("GLOMAP + COLMAP", glomap_binaries)
+        summary.append(("FAIL" if failed else "ok", "glomap", f"env {envs['glomap']}"))
     print("\n[check_env] summary")
     for status, stage, note in summary:
-        print(f"  {status:<5} {stage:<7} {note}")
+        print(f"  {status:<5} {stage:<8} {note}")
     if not masks:
         print(f"  WARNING step 0: neither sam3 (env {envs['sam3']}) nor gmos (env {envs['gmos']}) is installed, so no "
               "masks can be made.\n          Install one: bash install/sam3.sh, or bash install/gmos.sh where no "
-              "notebook runs.\n          Scenes that already have their masks, or set \"no_masks\", do not need it.")
+              "notebook runs.\n          Photos, videos with their masks already made, or \"no_masks\", do not "
+              "need it.")
+    for stage, use in (("unidepth", '"DEPTH_MODEL": "unidepth"'), ("glomap", '"input": "photos"')):
+        if stage not in optional:
+            print(f"  note  {stage:<8} not installed (env {envs[stage]}); needed only for {use}: "
+                  f"bash install/{stage}.sh")
     if any(status == "FAIL" for status, _, _ in summary):
         sys.exit(1)
     print("[check_env] all stages ready" + ("" if masks else ", except step 0 (see the warning)"))

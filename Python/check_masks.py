@@ -114,6 +114,9 @@ def require_masks():
     if D.active_config.get("no_masks"):
         print("[masks] no_masks in config.json: running without moving-object masks")
         return
+    if D.photos:
+        print("[masks] photos: no moving-object masks")
+        return
     n_img = len(glob.glob(str(D.video_dir / D.image_pattern)))
     if n_img and _object_dirs() and not _foreign_masks():
         merge_masks()   # object folders from make_masks_sam3.ipynb: merge them if that was skipped or is out of date

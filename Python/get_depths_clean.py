@@ -26,6 +26,7 @@ ASPECT_CAP = dataset_config.get_float("DA3_ASPECT_CAP", 0.0)
 PROCESS_RES = 504
 PROCESS_RES_METHOD = "upper_bound_resize"
 SINGLE_INTRINSIC = dataset_config.get_bool("DA3_SINGLE_INTRINSIC", False)
+PHOTO_CHUNK = 120   # photos per Depth Anything 3 inference (input "photos"), as the video chunks
 
 
 def _resize_to_aspect_cap(img_path, cap=ASPECT_CAP):
@@ -347,17 +348,80 @@ def _lidar_filled(scene_dir, da3):
     return out
 
 
+def _known_K(width, height):
+    """config.json INTRINSICS[<scene>] scaled to a frame of this size, or None."""
+    known = (utils.definitions.active_config.get("INTRINSICS") or {}).get(utils.definitions.dataset_name)
+    if not known:
+        return None
+    kx, ky = width / known["width"], height / known["height"]
+    return np.array([[known["fx"] * kx, 0.0, known["cx"] * kx],
+                     [0.0, known["fy"] * ky, known["cy"] * ky],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def run_photos(model) -> None:
+    """input "photos": Depth Anything 3 on the photos as multi-view sets (one photo at a time gives much worse depth).
+    The photos are grouped by orientation (landscape / portrait); each group is resized to its median size, so the
+    photos of a set share one size, and run in sets of PHOTO_CHUNK photos in name order. Each photo's depth and
+    confidence are resized back to its own size and its K scaled back to it, in <depth_dir>/photos/<photo name>.npz.
+    Known intrinsics (config.json INTRINSICS, one camera for every photo) replace Depth Anything 3's."""
+    paths = utils.definitions.photo_paths()
+    if not paths:
+        raise RuntimeError(f"No photos (.jpg, .jpeg, .png) in {utils.definitions.video_dir}")
+    out_dir = utils.definitions.photo_depth_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    groups = {}
+    for path in paths:
+        W, H = Image.open(path).size
+        groups.setdefault(W >= H, []).append((path, W, H))
+    for landscape, items in groups.items():
+        W0 = int(np.median([w for _, w, _ in items]))
+        H0 = int(np.median([h for _, _, h in items]))
+        for c0 in range(0, len(items), PHOTO_CHUNK):
+            chunk = items[c0:c0 + PHOTO_CHUNK]
+            imgs = [Image.open(p).convert("RGB").resize((W0, H0), Image.BILINEAR) for p, _, _ in chunk]
+            pred = model.inference(imgs, use_ray_pose=True, process_res=PROCESS_RES,
+                                   process_res_method=PROCESS_RES_METHOD, ref_view_strategy="middle")
+            for j, (path, W, H) in enumerate(chunk):
+                h, w = pred.depth[j].shape
+                K = np.asarray(pred.intrinsics[j], dtype=np.float64).copy()
+                K[0, :] *= W / float(w)
+                K[1, :] *= H / float(h)
+                # square pixels: the resize to the set's size can stretch one axis, so fx and fy scale back apart;
+                # their geometric mean is the closer focal (IMC ground truth: 1.4-2.7% vs 2-3.6% median error)
+                K[0, 0] = K[1, 1] = float(np.sqrt(K[0, 0] * K[1, 1]))
+                K_known = _known_K(W, H)
+                if K_known is not None:
+                    K = K_known
+                depth = cv2.resize(np.asarray(pred.depth[j], np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+                conf = cv2.resize(np.asarray(pred.conf[j], np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+                np.savez(out_dir / f"{path.name}.npz", depth=depth, conf=conf, K=K)
+            print(f"[depth] {'landscape' if landscape else 'portrait'} photos at {W0}x{H0}: "
+                  f"{c0 + len(chunk)}/{len(items)}", flush=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    print(f"Saved depth, confidence and K of {len(paths)} photos to {out_dir}")
+
+
 def main() -> None:
     # --------------------------------------------------------------
     # CONFIG (no argparse) — follow utils.definitions
     # --------------------------------------------------------------
     dataset_name = utils.definitions.dataset_name
     input_dir = utils.definitions.video_dir
-    output_dir = utils.definitions.da3_depth_dir
+    output_dir = utils.definitions.depth_dir
     image_pattern = utils.definitions.image_pattern
 
+    if utils.definitions.depth_model != "da3":
+        sys.exit(f'[depth] DEPTH_MODEL is "{utils.definitions.depth_model}" in config.json: run '
+                 f'get_depths_{utils.definitions.depth_model}.py instead (this script is Depth Anything 3)')
     output_dir.mkdir(parents=True, exist_ok=True)
     install_script_logger("depth_estimate", utils.definitions.output_dir)
+
+    if utils.definitions.photos:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        run_photos(DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE-1.1").to(device=device))
+        return
 
     images = sorted(glob.glob(str(Path(input_dir) / image_pattern)))
     if len(images) == 0:

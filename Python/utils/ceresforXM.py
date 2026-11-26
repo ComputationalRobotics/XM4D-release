@@ -149,4 +149,5 @@ def XM_Ceres_interface(
     for i in range(N):
         t_est[:, i] = -R_est[:, 3 * i : 3 * i + 3] @ t[i]
 
-    return R_est, t_est, p_est
+    # the refined normalized focal: the K the 2D landmarks were normalized with, times this, is the refined K
+    return R_est, t_est, p_est, float(cam.params[0])

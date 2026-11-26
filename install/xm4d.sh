@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Alternative to the four per-stage envs: ONE conda env for every stage (masks, depth, tracking, XM solver).
-# Python 3.10 and PyTorch 2.9 for all; the per-stage envs stay the reference
-# (see docs/pipeline.md, "One environment instead").
+# Python 3.10 and PyTorch 2.9 for all; the per-stage envs stay the reference. UniDepth V2 and GLOMAP keep their own
+# envs (install/unidepth.sh, install/glomap.sh).
 # usage: bash install/xm4d.sh [env name]      (default env name: xm4d)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 ENV="${1:-xm4d}"

@@ -1,10 +1,9 @@
 # --- Data: never commit (except the example scenes, see the end) ---
 datasets/*
 !datasets/sintel_alley_2/
-!datasets/hoi_ip1073/
-# gsplat example data (360_v2 datasets, images, COLMAP .bin) — ~13 GB, not code
+# third-party code and models, installed by install/*.sh
 deps/
-# the 4D Gaussian trainer, assembled by install/gs.sh from deps/gsplat + gsplat_patch/
+# GLOMAP and COLMAP, built by install/glomap.sh
 build/
 
 # --- Run logs & Python caches ---
@@ -34,11 +33,11 @@ __pycache__/
 *.jpeg
 *.h5
 
-# keep the prebuilt XM solver (.so) — the Python imports it; source is in the XM-code repo
+# keep the prebuilt XM solver (.so) — the Python imports it; its source is XM/
 !XM/build/*.so
+# the data of examples/
+!examples/data/**
 
 # the example scenes ship with the repo (frames + masks), not their pipeline outputs
 !datasets/sintel_alley_2/**
 datasets/sintel_alley_2/outputs/
-!datasets/hoi_ip1073/**
-datasets/hoi_ip1073/outputs/

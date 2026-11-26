@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Conda env for step 2, 2D tracking: TAPNext++ for the static scene (Python/static_tracking_online.py) and AllTracker
-# for the moving objects (Python/dynamic_tracking.py).
+# Conda env for step 2 for videos, 2D tracking of the static scene (Python/static_tracking_online.py): TAPNext++, or
+# AllTracker with config.json "STATIC_TRACKER": "alltracker".
 # usage: bash install/tapnet.sh [env name]      (default env name: tapnet)
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 ENV="${1:-tapnet}"
