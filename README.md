@@ -23,6 +23,11 @@ GPU solver before any photometric training.
 > objects: it finds the objects the hands hold (HOI-DETR, SAM 2.1) and reconstructs the cameras, the 3D motion of every
 > held object and the 3D joints of both hands (WiLoR).
 
+> **Static scenes:** please see the [`static` branch](https://github.com/ComputationalRobotics/XM4D-release/tree/static),
+> the static part of XM4D on its own: the cameras and 3D points of a video of a static scene (Depth Anything 3,
+> TAPNext++, the XM solver), with optional photo collections. It is the updated
+> [XM-code](https://github.com/ComputationalRobotics/XM-code).
+
 ## Install
 
 Requirements: Linux x86-64, an NVIDIA GPU with a driver that supports CUDA 12.8, conda, git, wget, and a C++ compiler.
